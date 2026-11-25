@@ -140,6 +140,34 @@ fn send_err(svm: &mut LiteSVM, ix: Instruction, payer: &Keypair, signers: &[&Key
     assert!(res.is_err(), "Expected rejection for '{}', but tx succeeded!", label);
 }
 
+fn send_err_custom(
+    svm: &mut LiteSVM,
+    ix: Instruction,
+    payer: &Keypair,
+    signers: &[&Keypair],
+    expected_code: u32,
+    label: &str,
+) {
+    svm.expire_blockhash();
+    let bh = svm.latest_blockhash();
+    let msg = Message::new(&[ix], Some(&payer.pubkey()));
+    let tx = Transaction::new(signers, msg, bh);
+    let res = svm.send_transaction(tx);
+    let err = res.expect_err(&format!(
+        "Expected Custom({}) rejection for '{}', but tx SUCCEEDED!",
+        expected_code, label
+    ));
+    let dbg = format!("{:?}", err);
+    let needle = format!("Custom({})", expected_code);
+    assert!(
+        dbg.contains(&needle),
+        "Expected {} for '{}', got: {}",
+        needle,
+        label,
+        dbg
+    );
+}
+
 fn create_prog_acc(svm: &mut LiteSVM, prog_id: &Address, size: usize) -> Address {
     let addr = Keypair::new().pubkey();
     svm.set_account(
@@ -717,6 +745,12 @@ fn main() {
     let scam_oracle = Keypair::new();
     let adl_oracle = Keypair::new();
     let fake_tok_prog = Keypair::new().pubkey();
+    // Load a REAL executable no-op sBPF program (returns Ok(0) on any CPI!) as `fake_tok_prog`!
+    // If `checkDexVaultAndMint` / `checkTokenProg` error were ever dropped, DepositCollateral would
+    // SUCCEED and mint phantom collateral; with the fix, every CPI entry MUST reject with Custom(120).
+    let noop_elf = std::fs::read("../lean-svm/build/noop.so")
+        .expect("Failed to read ../lean-svm/build/noop.so (run lean-svm build first)");
+    svm.add_program(fake_tok_prog, &noop_elf).expect("noop ELF load failed");
 
     for kp in [&payer, &dex_admin, &alice, &bob, &lp, &keeper, &attacker, &btc_oracle, &eth_oracle, &scam_oracle, &adl_oracle] {
         svm.airdrop(&kp.pubkey(), 10_000_000_000).unwrap();
@@ -1029,11 +1063,21 @@ fn main() {
     // 5b. Unclamped oracle jump rejected (+10% > 4%)
     set_slot(&mut svm, 120);
     send_err(&mut svm, ix_update_oracle(prog_id, btc_mkt, btc_oracle.pubkey(), 102_000_000, 0, 0), &payer, &[&payer, &btc_oracle], "Unclamped oracle jump");
-    // 5c. Fake TokenProg rejected on Deposit/Withdraw/Insurance/Liquidate
-    send_err(&mut svm, ix_deposit_collateral(prog_id, dex, alice_pfl, alice.pubkey(), alice_tok, mint, dex_vault, fake_tok_prog, 1000), &payer, &[&payer, &alice], "Deposit with fake tokenProg");
-    send_err(&mut svm, ix_withdraw_collateral(prog_id, dex, bob_pfl, bob.pubkey(), bob_tok, mint, dex_vault, fake_tok_prog, 1000), &payer, &[&payer, &bob], "Withdraw with fake tokenProg");
-    send_err(&mut svm, ix_deposit_insurance(prog_id, dex, btc_mkt, btc_ins, lp.pubkey(), lp_tok, mint, dex_vault, fake_tok_prog, 1000), &payer, &[&payer, &lp], "DepositInsurance with fake tokenProg");
-    send_err(&mut svm, ix_withdraw_insurance(prog_id, dex, btc_mkt, btc_ins, lp.pubkey(), lp_tok, mint, dex_vault, fake_tok_prog, 1000), &payer, &[&payer, &lp], "WithdrawInsurance with fake tokenProg");
+    // 5c. Real executable noop.so TokenProg + wrong mint + wrong vault MUST fail with exact PErr codes!
+    //     (Regression test for Bug A0: executable fake token program returning Ok(0) on CPI!)
+    let fake_mint = Keypair::new().pubkey();
+    let fake_vault = create_tok_acc(&mut svm, &mint, &attacker.pubkey(), 0);
+    let alice_cap_before_a0 = read_u64(&svm, &alice_pfl, 88);
+    send_err_custom(&mut svm, ix_deposit_collateral(prog_id, dex, alice_pfl, alice.pubkey(), alice_tok, mint, dex_vault, fake_tok_prog, 1_000_000_000), &payer, &[&payer, &alice], 120, "Deposit with real executable noop.so tokenProg");
+    assert_eq!(read_u64(&svm, &alice_pfl, 88), alice_cap_before_a0, "Phantom collateral minted via noop.so!");
+    send_err_custom(&mut svm, ix_deposit_collateral(prog_id, dex, alice_pfl, alice.pubkey(), alice_tok, fake_mint, dex_vault, TOKEN_PROGRAM_ID, 1_000), &payer, &[&payer, &alice], 112, "Deposit with wrong mint");
+    send_err_custom(&mut svm, ix_deposit_collateral(prog_id, dex, alice_pfl, alice.pubkey(), alice_tok, mint, fake_vault, TOKEN_PROGRAM_ID, 1_000), &payer, &[&payer, &alice], 113, "Deposit with wrong vaultPda");
+    send_err_custom(&mut svm, ix_withdraw_collateral(prog_id, dex, bob_pfl, bob.pubkey(), bob_tok, mint, dex_vault, fake_tok_prog, 1000), &payer, &[&payer, &bob], 120, "Withdraw with real executable noop.so tokenProg");
+    send_err_custom(&mut svm, ix_withdraw_collateral(prog_id, dex, bob_pfl, bob.pubkey(), bob_tok, fake_mint, dex_vault, TOKEN_PROGRAM_ID, 1000), &payer, &[&payer, &bob], 112, "Withdraw with wrong mint");
+    send_err_custom(&mut svm, ix_withdraw_collateral(prog_id, dex, bob_pfl, bob.pubkey(), bob_tok, mint, fake_vault, TOKEN_PROGRAM_ID, 1000), &payer, &[&payer, &bob], 113, "Withdraw with wrong vaultPda");
+    send_err_custom(&mut svm, ix_deposit_insurance(prog_id, dex, btc_mkt, btc_ins, lp.pubkey(), lp_tok, mint, dex_vault, fake_tok_prog, 1000), &payer, &[&payer, &lp], 120, "DepositInsurance with real executable noop.so tokenProg");
+    send_err_custom(&mut svm, ix_withdraw_insurance(prog_id, dex, btc_mkt, btc_ins, lp.pubkey(), lp_tok, mint, dex_vault, fake_tok_prog, 1000), &payer, &[&payer, &lp], 120, "WithdrawInsurance with real executable noop.so tokenProg");
+    send_err_custom(&mut svm, ix_liquidate(prog_id, dex, btc_mkt, alice_pfl, keeper_tok, mint, dex_vault, fake_tok_prog), &payer, &[&payer], 120, "Liquidate with real executable noop.so tokenProg");
     // 5d. Aliased Trade rejected
     send_err(&mut svm, ix_trade(prog_id, dex, eth_mkt, bob_pfl, bob.pubkey(), bob_pfl, bob.pubkey(), 0, POS_SCALE), &payer, &[&payer, &bob], "Aliased Trade");
     // 5e. WithdrawInsurance while OI > 0 rejected (BTC still has 5 OI!)
