@@ -797,4 +797,45 @@ theorem alice_mule_godmode_rug_zero_haircut_on_bob
       dsimp only [applyContainedLoss, capAvailableForLeg]
       omega
 
+/-! ### Adversarial-Leader Censorship (`T`-Slot Model) Solvency & Anti-Griefing Proofs -/
+
+/-- **K-Slot Censored-Liquidation Zero-Bad-Debt Theorem**:
+    Suppose adversarial validators include `UpdateOracle` on `K` consecutive slots while
+    censoring `Liquidate`, and each step's loss satisfies `stepLoss * 10_000 ≤ N * maxMoveBps`.
+    Whenever the market's risk parameters satisfy `K * maxMoveBps + liqFeeBps ≤ mmBps`,
+    any healthy position (`equity * 10_000 ≥ N * mmBps`) covers ALL `K` cumulative step losses
+    plus the full liquidation fee (`liqFee * 10_000 ≤ N * liqFeeBps`) with **ZERO bad debt**! -/
+theorem censored_oracle_k_steps_zero_bad_debt
+    (K N equity stepLoss liqFee maxMoveBps liqFeeBps mmBps : Nat)
+    (hEnv   : K * maxMoveBps + liqFeeBps ≤ mmBps)
+    (hEq    : N * mmBps ≤ equity * 10_000)
+    (hStep  : stepLoss * 10_000 ≤ N * maxMoveBps)
+    (hFee   : liqFee * 10_000 ≤ N * liqFeeBps) :
+    K * stepLoss + liqFee ≤ equity := by
+  have hKStep : (K * stepLoss) * 10_000 ≤ N * (K * maxMoveBps) := by
+    calc (K * stepLoss) * 10_000
+        = K * (stepLoss * 10_000) := by rw [Nat.mul_assoc]
+      _ ≤ K * (N * maxMoveBps)    := Nat.mul_le_mul_left K hStep
+      _ = N * (K * maxMoveBps)    := by rw [← Nat.mul_assoc, Nat.mul_comm K N, Nat.mul_assoc]
+  have hSum : (K * stepLoss + liqFee) * 10_000 ≤ N * mmBps := by
+    calc (K * stepLoss + liqFee) * 10_000
+        = (K * stepLoss) * 10_000 + liqFee * 10_000 := Nat.add_mul _ _ _
+      _ ≤ N * (K * maxMoveBps) + N * liqFeeBps      := Nat.add_le_add hKStep hFee
+      _ = N * (K * maxMoveBps + liqFeeBps)          := (Nat.mul_add _ _ _).symm
+      _ ≤ N * mmBps                                 := Nat.mul_le_mul_left N hEnv
+  have hTot : (K * stepLoss + liqFee) * 10_000 ≤ equity * 10_000 := Nat.le_trans hSum hEq
+  omega
+
+/-- **Anti-Griefing Wind-Down Liveness Under `T`-Slot Leader Censorship**:
+    Whenever `m.maxStaleness ≥ T` (at least 1 honest leader every `T` slots), censoring oracle
+    cranks for up to `T - 1` slots (`curSlot - m.lastOracleSlot < T`) can **NEVER** satisfy
+    `canPermissionlessWindDown`, blocking premature wind-down griefing! -/
+theorem censored_crank_no_premature_winddown
+    (m : MarketState) (curSlot T : Nat)
+    (hStaleCfg : T ≤ m.maxStaleness)
+    (hAge : curSlot - m.lastOracleSlot < T) :
+    ¬ canPermissionlessWindDown m curSlot := by
+  intro ⟨_, hgt⟩
+  omega
+
 end Percolator.TraceProofs

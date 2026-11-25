@@ -10,7 +10,7 @@ The repository ships a minimal core clearinghouse ([`percolator.so`](Percolator/
 
 | Program | ELF `.so` Size | sBPF Insns | Stack | Heap | Formal Lean 4 Proofs (`0 sorry`, `0` custom axioms) |
 |---|---:|---:|---:|---:|---|
-| **[`Percolator.Program`](Percolator/Program.lean)** (Core DEX) | **65,760 B** | 8,069 | 424 B | 0 B | 64 theorems (`Proofs.lean` + `TraceProofs.lean`) |
+| **[`Percolator.Program`](Percolator/Program.lean)** (Core DEX) | **65,760 B** | 8,069 | 424 B | 0 B | 66 theorems (`Proofs.lean` + `TraceProofs.lean`) |
 | **[`Percolator.Matcher`](Percolator/Matcher.lean)** (LP AMM CPI) | **8,552 B** | 949 | 712 B | 0 B | 4 theorems (`quoteAsk/Bid` bounds & clamp) |
 | **[`Percolator.OracleAdapter`](Percolator/OracleAdapter.lean)** (Pyth/CL/SB + Ratio + EWMA CPI) | **18,504 B** | 2,187 | 552 B | 0 B | 7 theorems (`crank_step_and_funding_within_clamp`, `ringBufferPrevIdx_lt`, `scaleToE6Nat_mono_and_id`, `ratio_crank_within_clamp`, `ewmaBlendNat_bounds`, `ewmaBlendNat_fixed_point`, `ewma_ratio_crank_within_clamp`) |
 
@@ -138,9 +138,40 @@ Key state transitions emit compact structured 5×`u64` logs via Solana's `sol_lo
 
 ---
 
-## 6. Verification & Worst-Case Multi-Leg Benchmarks (LiteSVM / Agave 3.1.3)
+## 6. Atomic Transaction Bundling & `T`-Slot Adversarial-Leader Requirements
 
-See [`INVARIANTS.md`](INVARIANTS.md) for all **75 kernel-checked Lean 4 theorems** (`0 sorry`, `0` custom axioms). All **11 end-to-end suites** in [`svm-runner/src/main.rs`](svm-runner/src/main.rs) pass 100% with **zero vault mocks**:
+Because `percolator-lean` eliminates monolithic $O(N)$ global slabs in favor of $O(1)$ per-leg instructions (`≤ 19.4k CU` worst-case), every actor composes multi-instruction operations inside **one single atomic Solana transaction** (zero multi-slot atomicity required — 1 honest leader every `T` slots is always sufficient).
+
+### Required Atomic Transaction Bundles (by Actor)
+
+| Actor & Operation | Required Atomic Instruction Order (Single Solana Tx) | Worst-Case CU | Legacy Wire Size | Why Order Matters |
+|---|---|---:|---:|---|
+| **Oracle / Crank Bot** *(Anti-Reordering Standard)* | `[OracleAdapter::Crank(m), RefreshLeg(m, lp_portfolio)]` *(repeat per market in same tx)* | **6,715 CU** *(2 mkts)* | **552 B** / 1,232 B | Funds `R_m` from losing LP counterparties in the **same tx** that moves mark price, leaving zero slot/ordering window for adversarial leaders to prematurely liquidate hedged spreads before `R_m` fills. |
+| **Trader — Open / Increase** | `[RefreshLeg(m_i, taker)... , RefreshLeg(m_j, maker)... , Trade(mode=0)]` *(refresh winning legs BEFORE losing legs)* | **19,361 CU** *(16 legs)* | **865 B** / 1,232 B | Satisfies same-slot freshness (`lastRefreshSlot == curSlot`) on all open legs of both parties; refreshing winners first credits `pfl.capital` before losers debit it. |
+| **Trader — Atomic Flip** | `[RefreshLeg... , Trade(mode=1, close), Trade(mode=0, open)]` | **~5,600 CU** *(1 leg)* | **≤ 793 B** | Atomic long↔short flip in 1 tx without a dedicated flip instruction. |
+| **Trader — Withdraw Collateral** | `[RefreshLeg(m_i, trader)... , WithdrawCollateral]` *(0 `RefreshLeg`s if flat)* | **11,135 CU** *(8 legs)* | **793 B** / 1,232 B | Enforces fresh margins across all open legs before withdrawing (`flat_portfolio_unconditionally_withdrawable` skips refresh when flat). |
+| **Trader — Position Hand-Off** | `[RefreshLeg(m_j, buyer)... , Trade(mode=2 or 3)]` | **9,944 / 10,651 CU** *(8 legs)* | **793 B** / 1,232 B | Transfers raw basis Long→Long or Short→Short with bit-for-bit invariant OI & ADL. |
+| **Liquidation Keeper — Fallback (`mode=0`)** | `[RefreshLeg(other_m_i, victim)... , Liquidate(target_m, victim, mode=0)]` | **9,869 CU** *(8 legs)* | **690 B** / 1,232 B | Satisfies `checkAllLegsFreshLoop` (A1) so hedged winning legs are credited before judging `target_m` insolvent; omit `RefreshLeg(target_m)` so `Liquidate` itself captures `shortfall` for `I_m` draw. |
+| **Liquidation Keeper — Takeover (`mode=1`)** | `[RefreshLeg(other_m_i, victim)... , RefreshLeg(m_j, taker)... , Liquidate(target_m, victim, mode=1)]` | **17,221 CU** *(16 legs)* | **876 B** / 1,232 B | Zero-ADL counterparty takeover (works even during active partial ADL). |
+| **Stale-Market Escape (Zero Freeze Window)** | `[StartWindDown(stale_m), RefreshLeg(stale_m, trader), RefreshLeg(other_m_i, trader)... , Withdraw/Trade/Liquidate]` | **~3,500–12,000 CU** | **≤ 850 B** | Proven zero freeze window (`no_stale_market_freeze_liveness`): on the exact first slot `age > maxStaleness`, anyone can wind down and immediately refresh in 1 atomic tx. |
+| **Wind-Down Drain** | `[ForceClosePair(m, pflL, pflS)...]` *(pack up to ~40 pairs/block)*, then `[ClearDeadLeg...]` → `ResolveMarket` | **2,717 CU** / pair | — | Strictly terminates to `OI = 0` (`forceClosePair_terminates_and_sound`, `proportionalRawReduction_preserves_oi_le_raw`). |
+
+### Recommended Market Parameters Under `T`-Slot Adversarial-Leader Censorship
+
+Assume adversarial validators can censor/reorder for `T - 1` consecutive slots and at least **1 honest leader** appears every `T` slots:
+
+| Parameter | Required Bound | Guarantee |
+|---|---|---|
+| `Market.maxStaleness` | **`> T`** *(recommended `150–300` slots = 1–2 min)* | Blocks adversarial leaders from grief-triggering permissionless `StartWindDown` during `T - 1` censored slots (`censored_crank_no_premature_winddown`). |
+| `OracleAdapter.maxFeedAge` | **`> T`** slots *(or `> 0.4·T` secs for Pyth)* | Ensures the honest leader on slot `T` can always crank a fresh feed (or carry `ewmaPrice` under `FLAG_HYBRID_AH`). |
+| `K · maxMoveBps + liqFeeBps` | **`≤ mmBps`** *(e.g. `maxMoveBps=100`, `mmBps=500`, `liqFeeBps=100` → **`K = 4`**)* | Guarantees **0 bad debt** even if adversarial leaders include `UpdateOracle` on `K` consecutive slots while censoring `Liquidate` (`censored_oracle_k_steps_zero_bad_debt`). |
+| `Matcher.spreadBps` | **`≥ maxMoveBps`** *(for passive on-chain LPs)* | Eliminates profitable 1-slot stale-mark front-running against passive LPs when a validator reorders `Trade` before `UpdateOracle`. |
+
+---
+
+## 7. Verification & Worst-Case Multi-Leg Benchmarks (LiteSVM / Agave 3.1.3)
+
+See [`INVARIANTS.md`](INVARIANTS.md) for all **77 kernel-checked Lean 4 theorems** (`0 sorry`, `0` custom axioms). All **11 end-to-end suites** in [`svm-runner/src/main.rs`](svm-runner/src/main.rs) pass 100% with **zero vault mocks**:
 
 ### Worst-Case 8-Leg (`MAX_LEGS = 8`) & Double-8-Leg (16-Leg) CU and Wire-MTU Stress Benchmarks (Suite 11)
 
@@ -171,15 +202,16 @@ Every worst-case actor path (users, cranks, and liquidation keepers) executes in
 9. **Suite 9 — External Multi-Program CPI Composition**:
    - `oracle_adapter.so` (`18,504 B`): verifies **Pyth V2 (`PriceUpdateV2`, 2,442 CU)** with `VerificationLevel::Full` & `feed_id` pinning, **Chainlink OCR2 (`Transmissions`, 2,400 CU)** with ring-buffer wraparound, **Switchboard On-Demand (`PullFeedAccountData`, 3,344 CU)** with 128-bit `PRECISION=18` scaling, **2-Leg Composite Ratio (`Pyth/Chainlink`, 2,699 CU)**, **EWMA Smoothing + Hybrid After-Hours (`live 2,716 CU / AH 2,593 CU / PushEwmaMark 366 CU`)** on a 2-leg `STOXX/SOL` ratio with stale-equity carry, bounded per-slot after-hours mark updates, and live market-open recovery, spoofed feed-owner rejection, and 4-slot smooth auto-clamped convergence (`$100 → $115`).
    - `matcher.so` (`8,552 B`, `open 4,355 CU`, `close 3,949 CU`, `withdrawLp 3,859 CU`): PDA-owned LP portfolio executes single-signer taker opens & closes with exact spread earned by LP and PDA-signed LP withdrawals.
+   - **Suite 9C — Atomic Crank+LP Bundle & `K=4` Censored Liquidation (`6,715 CU, 552 B` / `3,319 CU`)**: Executes `[Crank(SOL), RefreshLeg(SOL, LP), Crank(ETH), RefreshLeg(ETH, LP)]` in one atomic tx, keeping a hedged spread immune to premature-liquidation reordering; verifies `K = 4` consecutive adverse `-1%` oracle slots without interleaved liquidations still liquidates with `shortfall == 0` and `I_SOL` untouched.
 10. **Suite 10 — Core Hardening & Fair Partial Takeover (`4,473 CU`)**: Rejects unbounded `exitWindow`/`maxStaleness`, nonzero `warmupSlots`, and `Trade(mode=1)` spread draining below `totalMm`; verifies partial takeover with gradual deficit fee (`< maxFee`) and zero ADL on innocent counterparties.
 11. **Suite 11 — Worst-Case 8-Leg CU/MTU Exhaustion + Anti-Selective-Liquidation + Post-ADL Recovery + Position Hand-Off**: Full 8-market, double-8-leg stress test verifying every role above, rejecting selective single-leg liquidation on an 8-leg hedged spread, verifying same-side Long→Long & Short→Short hand-off, post-ADL opens, post-ADL double-8-leg takeover, and full 8-market CPI/wind-down sweeps with zero invariant violations.
 
 ---
 
-## 7. Build & Reproduce
+## 8. Build & Reproduce
 
 ```bash
-# Run full Lean 4 kernel proof verification (75 theorems, 0 sorry, 0 custom axioms),
+# Run full Lean 4 kernel proof verification (77 theorems, 0 sorry, 0 custom axioms),
 # compile all 3 sBPF .so binaries, and execute all 11 LiteSVM suites:
 ./scripts/build-and-test.sh
 ```

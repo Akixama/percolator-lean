@@ -2021,9 +2021,138 @@ fn main() {
     let all_mkts4 = vec![btc_mkt, eth_mkt, scam_mkt, comp_mkt, comp_mkt2];
     let all_pfls4 = vec![alice_pfl, bob_pfl, attacker_pfl, t2_pfl, dust_pfl, lp_pfl, taker_pfl];
     assert_dex_invariants(&svm, &dex, &dex_vault, &all_mkts4, &all_pfls4, "post-suite9-external-cpi");
+
+    // 9C: Atomic [UpdateOracle/Crank + RefreshLeg(LP)] Anti-Reordering Bundle + K=4 Censored Envelope!
+    //     1) Verifies atomic [Crank(SOL), RefreshLeg(SOL, LP), Crank(ETH), RefreshLeg(ETH, LP)]
+    //        funds R_SOL in the SAME tx that moves the price, defeating adversarial-leader
+    //        premature-liquidation reordering of a tight hedged spread!
+    //     2) Verifies K=4 consecutive adverse oracle steps (maxMove=1%, mm=5%, liqFee=1%) with
+    //        ZERO interleaved liquidations still liquidates with shortfall == 0 & I_m untouched!
+    let (cu_crank_bundle, wire_crank_bundle, cu_k4_liq) = {
+        let b_dex = create_prog_acc(&mut svm, &prog_id, DEX_SIZE);
+        let (b_vault, b_bump) = derive_dex_vault(&prog_id, &b_dex);
+        send_ok(&mut svm, ix_init_dex(prog_id, b_dex, dex_admin.pubkey(), mint, b_vault, fee_vault, TOKEN_PROGRAM_ID, SYSTEM_PROGRAM_ID, b_bump, 6, 0, SPL_TOKEN_RENT_MIN), &payer, &[&payer, &dex_admin]);
+        let b_sol_mkt = create_prog_acc(&mut svm, &prog_id, MKT_SIZE);
+        let b_eth_mkt = create_prog_acc(&mut svm, &prog_id, MKT_SIZE);
+        let b_sol_adp = create_prog_acc(&mut svm, &adapter_prog, 352);
+        let b_eth_adp = create_prog_acc(&mut svm, &adapter_prog, 352);
+        let (b_sol_pda, b_sol_bump) = Address::find_program_address(&[b"orac", b_sol_adp.as_ref()], &adapter_prog);
+        let (b_eth_pda, b_eth_bump) = Address::find_program_address(&[b"orac", b_eth_adp.as_ref()], &adapter_prog);
+        let b_sol_feed = Keypair::new().pubkey();
+        let b_eth_feed = Keypair::new().pubkey();
+        let write_custom = |svm: &mut LiteSVM, faddr: Address, price: u64, slot: u64| {
+            let mut d = vec![0u8; 32];
+            d[0..4].copy_from_slice(&0x44454546u32.to_le_bytes());
+            d[8..16].copy_from_slice(&price.to_le_bytes());
+            d[16..24].copy_from_slice(&10_000u64.to_le_bytes());
+            d[24..32].copy_from_slice(&slot.to_le_bytes());
+            svm.set_account(faddr, Account { lamports: 10_000_000, data: d, owner: SYSTEM_PROGRAM_ID, executable: false, rent_epoch: 0 }).unwrap();
+        };
+        let b_sl0 = get_slot(&svm) + 1;
+        set_slot(&mut svm, b_sl0);
+        write_custom(&mut svm, b_sol_feed, 100 * POS_SCALE, b_sl0);
+        write_custom(&mut svm, b_eth_feed, 100 * POS_SCALE, b_sl0);
+        // maxMoveBps=100 (1%/slot), mmBps=500 (5%), liqFeeBps=100 (1%), maxStaleness=150 -> K=4 safe!
+        send_ok(&mut svm, ix_create_market(prog_id, b_dex, b_sol_mkt, mint, b_sol_pda, lp.pubkey(), lp_tok, fee_vault, 100 * POS_SCALE, 20, 150, 0, 1000, 500, 100, 0, 100, 2500, 1_000_000 * POS_SCALE), &payer, &[&payer, &lp]);
+        send_ok(&mut svm, ix_create_market(prog_id, b_dex, b_eth_mkt, mint, b_eth_pda, lp.pubkey(), lp_tok, fee_vault, 100 * POS_SCALE, 20, 150, 0, 1000, 500, 100, 0, 100, 2500, 1_000_000 * POS_SCALE), &payer, &[&payer, &lp]);
+        let b_sol_ins = create_prog_acc(&mut svm, &prog_id, INS_SIZE);
+        send_ok(&mut svm, ix_deposit_insurance(prog_id, b_dex, b_sol_mkt, b_sol_ins, lp.pubkey(), lp_tok, mint, b_vault, TOKEN_PROGRAM_ID, 500 * POS_SCALE), &payer, &[&payer, &lp]);
+        for (adp, mkt, fd, bump) in [(b_sol_adp, b_sol_mkt, b_sol_feed, b_sol_bump), (b_eth_adp, b_eth_mkt, b_eth_feed, b_eth_bump)] {
+            let mut d = vec![0u8; 28];
+            d[0] = 0; d[1] = bump;
+            d[4..12].copy_from_slice(&150u64.to_le_bytes());
+            d[12..20].copy_from_slice(&100u64.to_le_bytes());
+            send_ok(&mut svm, Instruction { program_id: adapter_prog, accounts: vec![
+                AccountMeta::new(adp, false), AccountMeta::new_readonly(lp.pubkey(), true),
+                AccountMeta::new_readonly(prog_id, false), AccountMeta::new_readonly(mkt, false),
+                AccountMeta::new_readonly(fd, false),
+            ], data: d }, &payer, &[&payer, &lp]);
+        }
+
+        // Hedged trader holds Long 10 SOL + Short 10 ETH ($200 IM, $100 MM) on $200 capital vs LP;
+        // then withdraws $100? No, keep tight: Open Long 5 SOL + Short 5 ETH ($100 IM, $50 MM) on $100 cap,
+        // PLUS a 2nd unhedged trader on SOL right at MM ($50 cap, Long 10 SOL? IM=$100 so open Long 5 SOL
+        // with $50 cap after IM=50 -> price drops to MM=$25, then K=4 consecutive -1% steps!).
+        let h_kp = Keypair::new(); let lp_kp = Keypair::new(); let u_kp = Keypair::new();
+        let h_tok = create_tok_acc(&mut svm, &mint, &h_kp.pubkey(), 1_000 * POS_SCALE);
+        let lp_b_tok = create_tok_acc(&mut svm, &mint, &lp_kp.pubkey(), 5_000 * POS_SCALE);
+        let u_tok = create_tok_acc(&mut svm, &mint, &u_kp.pubkey(), 1_000 * POS_SCALE);
+        let h_pfl = create_prog_acc(&mut svm, &prog_id, PFL_SIZE);
+        let lp_b_pfl = create_prog_acc(&mut svm, &prog_id, PFL_SIZE);
+        let u_pfl = create_prog_acc(&mut svm, &prog_id, PFL_SIZE);
+        for (p, k, t, amt) in [(h_pfl, &h_kp, h_tok, 100 * POS_SCALE), (lp_b_pfl, &lp_kp, lp_b_tok, 2_000 * POS_SCALE), (u_pfl, &u_kp, u_tok, 100 * POS_SCALE)] {
+            send_ok(&mut svm, ix_init_portfolio(prog_id, b_dex, p, k.pubkey()), &payer, &[&payer, k]);
+            send_ok(&mut svm, ix_deposit_collateral(prog_id, b_dex, p, k.pubkey(), t, mint, b_vault, TOKEN_PROGRAM_ID, amt), &payer, &[&payer, k]);
+        }
+        send_ok(&mut svm, ix_trade(prog_id, b_dex, b_sol_mkt, h_pfl, h_kp.pubkey(), lp_b_pfl, lp_kp.pubkey(), 0, 5 * POS_SCALE), &payer, &[&payer, &h_kp, &lp_kp]);
+        send_ok(&mut svm, ix_trade(prog_id, b_dex, b_eth_mkt, lp_b_pfl, lp_kp.pubkey(), h_pfl, h_kp.pubkey(), 0, 5 * POS_SCALE), &payer, &[&payer, &lp_kp, &h_kp]);
+        // Unhedged trader U: Long 10 SOL ($1,000 notional, IM=$100, MM=$50) on $100 capital!
+        send_ok(&mut svm, ix_trade(prog_id, b_dex, b_sol_mkt, u_pfl, u_kp.pubkey(), lp_b_pfl, lp_kp.pubkey(), 0, 10 * POS_SCALE), &payer, &[&payer, &u_kp, &lp_kp]);
+
+        // Atomic Crank+LP Bundle on slot +1: both SOL and ETH jump +1% ($100 -> $101)!
+        // Crank bot atomically executes [Crank(SOL), RefreshLeg(SOL, LP), Crank(ETH), RefreshLeg(ETH, LP)]
+        // in ONE Solana tx so R_SOL is funded IMMEDIATELY in the same tx!
+        set_slot(&mut svm, b_sl0 + 1);
+        write_custom(&mut svm, b_sol_feed, 101 * POS_SCALE, b_sl0 + 1);
+        write_custom(&mut svm, b_eth_feed, 101 * POS_SCALE, b_sl0 + 1);
+        let ix_b_crank = |adp: Address, mkt: Address, fd: Address, pda: Address| Instruction {
+            program_id: adapter_prog,
+            accounts: vec![
+                AccountMeta::new_readonly(adp, false), AccountMeta::new(mkt, false),
+                AccountMeta::new_readonly(fd, false), AccountMeta::new_readonly(pda, false),
+                AccountMeta::new_readonly(prog_id, false),
+            ],
+            data: vec![1],
+        };
+        let (cu_bndl, wire_bndl) = send_ixs_ok_measured(
+            &mut svm,
+            &[
+                ix_b_crank(b_sol_adp, b_sol_mkt, b_sol_feed, b_sol_pda),
+                ix_refresh_leg(prog_id, b_dex, b_sol_mkt, lp_b_pfl, false),
+                ix_b_crank(b_eth_adp, b_eth_mkt, b_eth_feed, b_eth_pda),
+                ix_refresh_leg(prog_id, b_dex, b_eth_mkt, lp_b_pfl, false),
+            ],
+            &payer,
+            &[&payer],
+        );
+        // Hedged trader's SOL gain (+$5) immediately covers ETH loss (-$5) -> capital == $100,
+        // and adversarial keeper liquidation attempt on ETH is REJECTED!
+        send_ixs_ok(&mut svm, &[
+            ix_refresh_leg(prog_id, b_dex, b_sol_mkt, h_pfl, false),
+            ix_refresh_leg(prog_id, b_dex, b_eth_mkt, h_pfl, false),
+        ], &payer, &[&payer]);
+        assert_eq!(read_u64(&svm, &h_pfl, 88), 100 * POS_SCALE, "Atomic Crank+LP bundle preserved exact $100 hedged capital!");
+        send_err(&mut svm, ix_liquidate(prog_id, b_dex, b_eth_mkt, h_pfl, keeper_tok, mint, b_vault, TOKEN_PROGRAM_ID), &payer, &[&payer], "Hedged trader cannot be liquidated after atomic Crank+LP bundle");
+
+        // Now test K=4 consecutive censored liquidation slots on unhedged U (Long 10 SOL)!
+        // First push SOL down 5% ($101 -> ~$95) so U sits right near MM ($50 capital vs ~$47.5 MM),
+        // then run K=4 consecutive -1% oracle slots WITHOUT liquidating U, then liquidate on honest slot!
+        let mut p_sol = 101 * POS_SCALE;
+        for st in 2..=6u64 {
+            set_slot(&mut svm, b_sl0 + st);
+            p_sol = (p_sol * 99) / 100;
+            write_custom(&mut svm, b_sol_feed, p_sol, b_sl0 + st);
+            send_ok(&mut svm, ix_b_crank(b_sol_adp, b_sol_mkt, b_sol_feed, b_sol_pda), &payer, &[&payer]);
+        }
+        // Refresh U right at MM boundary (~$51 capital vs ~$48 MM): still healthy!
+        send_ok(&mut svm, ix_refresh_leg(prog_id, b_dex, b_sol_mkt, u_pfl, false), &payer, &[&payer]);
+        let ins_before_k4 = read_u64(&svm, &b_sol_mkt, 224);
+        // K=4 consecutive censored oracle slots (-1%/slot, ZERO liquidations!)
+        for st in 7..=10u64 {
+            set_slot(&mut svm, b_sl0 + st);
+            p_sol = (p_sol * 99) / 100;
+            write_custom(&mut svm, b_sol_feed, p_sol, b_sl0 + st);
+            send_ok(&mut svm, ix_b_crank(b_sol_adp, b_sol_mkt, b_sol_feed, b_sol_pda), &payer, &[&payer]);
+        }
+        // Honest leader arrives on slot +10 and liquidates U: ZERO bad debt & I_SOL bit-for-bit untouched!
+        let cu_k4 = send_ok(&mut svm, ix_liquidate(prog_id, b_dex, b_sol_mkt, u_pfl, keeper_tok, mint, b_vault, TOKEN_PROGRAM_ID), &payer, &[&payer]);
+        assert_eq!(read_u64(&svm, &b_sol_mkt, 224), ins_before_k4, "K=4 censored oracle slots produced ZERO bad debt (I_SOL untouched)!");
+        assert_dex_invariants(&svm, &b_dex, &b_vault, &[b_sol_mkt, b_eth_mkt], &[h_pfl, lp_b_pfl, u_pfl], "post-9C-atomic-bundle-and-k4");
+        (cu_bndl, wire_bndl, cu_k4)
+    };
     println!(
-        "[PASS] Suite 9: External CPI Composition — oracle_adapter.so ({} B, crank={} CU) + matcher.so ({} B, open={} CU, close={} CU, wdrLp={} CU)!",
-        adapter_elf.len(), cu_crank, matcher_elf.len(), cu_fill_open, cu_fill_close, cu_wdr_lp
+        "[PASS] Suite 9: External CPI (adapter={} B crank={} CU, matcher={} B open/close/wdr={}/{}/{} CU) + Atomic Crank+LP Bundle ({} CU, {} B) + K=4 Censored Liq ({} CU, 0 bad debt)!",
+        adapter_elf.len(), cu_crank, matcher_elf.len(), cu_fill_open, cu_fill_close, cu_wdr_lp, cu_crank_bundle, wire_crank_bundle, cu_k4_liq
     );
 
     // =========================================================================
