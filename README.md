@@ -5,14 +5,14 @@
 It achieves **full cross-margin capital efficiency on healthy markets** (hedged spreads net 1:1 with zero warmup drag) while maintaining **machine-checked per-market risk isolation**: permissionlessly created or adversarial markets cannot drain other markets, untouched users, or other markets' insurance pools.
 
 The repository ships a minimal core clearinghouse ([`percolator.so`](Percolator/Program.lean)) plus two tiny, formally verified composable external programs that integrate via CPI without bloating the core:
-- **[`Percolator.Matcher`](Percolator/Matcher.lean)** (`8,744 B`) — permissionless passive-LP AMM / spread matcher enabling single-signer taker opens & closes against resting PDA-owned LP portfolios.
-- **[`Percolator.OracleAdapter`](Percolator/OracleAdapter.lean)** (`20,920 B`) — permissionless on-chain oracle bridge natively parsing **Pyth Pull (`PriceUpdateV2`)**, **Chainlink OCR2 (`Transmissions`)**, **Switchboard On-Demand (`PullFeedAccountData`, 128-bit `PRECISION=18`)**, custom feeds, **2-leg composite ratios** (`base / quote`, e.g. `STOXX/SOL`), and **EWMA smoothing + Hybrid After-Hours mode** (carrying `ewmaPrice` while cash markets are closed, still repricing 24/7 against a live quote feed, plus optional per-slot bounded `PushEwmaMark`), with pinned feed owners/IDs, confidence & staleness checks, smooth multi-slot auto-clamped convergence, and on-chain premium funding.
+- **[`Percolator.Matcher`](Percolator/Matcher.lean)** (`8,552 B`) — permissionless passive-LP AMM / spread matcher enabling single-signer taker opens & closes against resting PDA-owned LP portfolios.
+- **[`Percolator.OracleAdapter`](Percolator/OracleAdapter.lean)** (`18,504 B`) — permissionless on-chain oracle bridge natively parsing **Pyth Pull (`PriceUpdateV2`)**, **Chainlink OCR2 (`Transmissions`)**, **Switchboard On-Demand (`PullFeedAccountData`, 128-bit `PRECISION=18`)**, custom feeds, **2-leg composite ratios** (`base / quote`, e.g. `STOXX/SOL`), and **EWMA smoothing + Hybrid After-Hours mode** (carrying `ewmaPrice` while cash markets are closed, still repricing 24/7 against a live quote feed, plus optional per-slot bounded `PushEwmaMark`), with pinned feed owners/IDs, confidence & staleness checks, smooth multi-slot auto-clamped convergence, and on-chain premium funding.
 
 | Program | ELF `.so` Size | sBPF Insns | Stack | Heap | Formal Lean 4 Proofs (`0 sorry`, `0` custom axioms) |
 |---|---:|---:|---:|---:|---|
-| **[`Percolator.Program`](Percolator/Program.lean)** (Core DEX) | **73,224 B** | 9,002 | 552 B | 0 B | 64 theorems (`Proofs.lean` + `TraceProofs.lean`) |
-| **[`Percolator.Matcher`](Percolator/Matcher.lean)** (LP AMM CPI) | **8,744 B** | 973 | 712 B | 0 B | 4 theorems (`quoteAsk/Bid` bounds & clamp) |
-| **[`Percolator.OracleAdapter`](Percolator/OracleAdapter.lean)** (Pyth/CL/SB + Ratio + EWMA CPI) | **20,920 B** | 2,489 | 568 B | 0 B | 7 theorems (`crank_step_and_funding_within_clamp`, `ringBufferPrevIdx_lt`, `scaleToE6Nat_mono_and_id`, `ratio_crank_within_clamp`, `ewmaBlendNat_bounds`, `ewmaBlendNat_fixed_point`, `ewma_ratio_crank_within_clamp`) |
+| **[`Percolator.Program`](Percolator/Program.lean)** (Core DEX) | **65,760 B** | 8,069 | 424 B | 0 B | 64 theorems (`Proofs.lean` + `TraceProofs.lean`) |
+| **[`Percolator.Matcher`](Percolator/Matcher.lean)** (LP AMM CPI) | **8,552 B** | 949 | 712 B | 0 B | 4 theorems (`quoteAsk/Bid` bounds & clamp) |
+| **[`Percolator.OracleAdapter`](Percolator/OracleAdapter.lean)** (Pyth/CL/SB + Ratio + EWMA CPI) | **18,504 B** | 2,187 | 552 B | 0 B | 7 theorems (`crank_step_and_funding_within_clamp`, `ringBufferPrevIdx_lt`, `scaleToE6Nat_mono_and_id`, `ratio_crank_within_clamp`, `ewmaBlendNat_bounds`, `ewmaBlendNat_fixed_point`, `ewma_ratio_crank_within_clamp`) |
 
 ---
 
@@ -20,15 +20,15 @@ The repository ships a minimal core clearinghouse ([`percolator.so`](Percolator/
 
 ```
 ┌─────────────────────────────────┐     ┌──────────────────────────────────┐
-│  Percolator.Matcher (8,744 B)   │     │ Percolator.OracleAdapter         │
-│  • Passive LP AMM / Spreads     │     │ (20,920 B)                       │
+│  Percolator.Matcher (8,552 B)   │     │ Percolator.OracleAdapter         │
+│  • Passive LP AMM / Spreads     │     │ (18,504 B)                       │
 │  • Single-Signer Taker Fill     │     │ • Pyth V2 / Chainlink / SB 128b  │
 │  • PDA-Owned LP Portfolio       │     │ • 2-Leg Ratios + EWMA/AfterHours │
 └───────────────┬─────────────────┘     └───────────────┬──────────────────┘
                 │ CPI (invoke_signed)                   │ CPI (invoke_signed)
                 ▼  InitPortfolio / Trade / Withdraw     ▼  UpdateOracle
 ┌──────────────────────────────────────────────────────────────────────────┐
-│                percolator-lean Core (73,224 B · 20 ops · 0 heap)         │
+│                percolator-lean Core (65,760 B · 20 ops · 0 heap)         │
 │  • Realizable Shared Cross-Margin      • On-Chain PDA Vault Creation     │
 │  • Per-Market Isolated R_m / I_m / A_m • Exact C + I + R + S = V         │
 │  • Fair Partial Takeover & Hand-Off    • Post-ADL Monotone Recovery      │
@@ -144,34 +144,34 @@ See [`INVARIANTS.md`](INVARIANTS.md) for all **75 kernel-checked Lean 4 theorems
 
 ### Worst-Case 8-Leg (`MAX_LEGS = 8`) & Double-8-Leg (16-Leg) CU and Wire-MTU Stress Benchmarks (Suite 11)
 
-Every worst-case actor path (users, cranks, and liquidation keepers) executes in **one single legacy Solana transaction** (`≤ 876 B / 1,232 B` UDP MTU, zero LUT required) at **≤ 10.5% of Solana's 200,000 default CU budget** (~66× below Solana's 1.4M max tx CU limit):
+Every worst-case actor path (users, cranks, and liquidation keepers) executes in **one single legacy Solana transaction** (`≤ 876 B / 1,232 B` UDP MTU, zero LUT required) at **≤ 9.7% of Solana's 200,000 default CU budget** (~72× below Solana's 1.4M max tx CU limit):
 
 | Role & Worst-Case Transaction | Compute Units | % of 200k Default CU | Legacy Wire Size | % of 1,232 B MTU |
 |---|---:|---:|---:|---:|
-| **User — 8-Leg Atomic Withdraw** `[8× RefreshLeg + WithdrawCollateral]` | **12,039 CU** | 6.0% | **793 B** | 64.4% |
-| **User — Double-8-Leg Trade** `[16× RefreshLeg + Trade]` (both parties at 8 legs) | **21,047 CU** | 10.5% | **865 B** | 70.2% |
-| **User — Position Hand-Off** `[7× RefreshLeg + Trade(mode=2 / mode=3)]` | **10,947 / 11,872 CU** | 5.5% / 5.9% | **793 B** | 64.4% |
-| **User — Post-ADL Open** `[15× RefreshLeg + Trade(mode=0)]` | **20,982 CU** | 10.5% | **857 B** | 69.6% |
-| **Liquidation Keeper — 8-Leg Fallback** `[7× RefreshLeg + Liquidate(mode=0)]` | **11,124 CU** | 5.6% | **690 B** | 56.0% |
-| **Liquidation Keeper — Double-8-Leg Post-ADL Takeover** `[14× RefreshLeg + Liquidate(mode=1)]` | **18,828 CU** | 9.4% | **876 B** | 71.1% |
-| **Crank — 8-Market Oracle Batch** `[8× UpdateOracle]` (1 tx) | **4,976 CU** | 2.5% | **702 B** | 57.0% |
-| **Crank — Native Oracle Parsers (CPI)** (Pyth V2 / Chainlink OCR2 / Switchboard 128b / Ratio / EWMA live / AH / Push) | **2,525 / 2,478 / 3,425 / 2,797 / 2,816 / 2,686 / 377 CU** | 0.2%–1.7% | — | — |
-| **Crank — 8-Market CPI & Wind-Down** (`OracleAdapter` max/8×, `ForceClosePair`, `ResolveMarket`) | **2,396** (19,147 total) / **2,948** / **429 CU** | 1.2%–1.5% | — | — |
+| **User — 8-Leg Atomic Withdraw** `[8× RefreshLeg + WithdrawCollateral]` | **11,135 CU** | 5.6% | **793 B** | 64.4% |
+| **User — Double-8-Leg Trade** `[16× RefreshLeg + Trade]` (both parties at 8 legs) | **19,361 CU** | 9.7% | **865 B** | 70.2% |
+| **User — Position Hand-Off** `[7× RefreshLeg + Trade(mode=2 / mode=3)]` | **9,944 / 10,651 CU** | 5.0% / 5.3% | **793 B** | 64.4% |
+| **User — Post-ADL Open** `[15× RefreshLeg + Trade(mode=0)]` | **19,169 CU** | 9.6% | **857 B** | 69.6% |
+| **Liquidation Keeper — 8-Leg Fallback** `[7× RefreshLeg + Liquidate(mode=0)]` | **9,869 CU** | 4.9% | **690 B** | 56.0% |
+| **Liquidation Keeper — Double-8-Leg Post-ADL Takeover** `[14× RefreshLeg + Liquidate(mode=1)]` | **17,221 CU** | 8.6% | **876 B** | 71.1% |
+| **Crank — 8-Market Oracle Batch** `[8× UpdateOracle]` (1 tx) | **4,704 CU** | 2.4% | **702 B** | 57.0% |
+| **Crank — Native Oracle Parsers (CPI)** (Pyth V2 / Chainlink OCR2 / Switchboard 128b / Ratio / EWMA live / AH / Push) | **2,442 / 2,400 / 3,344 / 2,699 / 2,716 / 2,593 / 366 CU** | 0.2%–1.7% | — | — |
+| **Crank — 8-Market CPI & Wind-Down** (`OracleAdapter` max/8×, `ForceClosePair`, `ResolveMarket`) | **2,322** (18,555 total) / **2,717** / **396 CU** | 1.2%–1.4% | — | — |
 
 ### Full 11-Suite Verification Summary
 
 1. **Suite 1 — On-Chain `InitDex` PDA Vault Creation (`5,303 CU`)**: Creates real SPL Token `DexVault` PDA on-chain despite 1-lamport pre-funding griefing; rejects real executable `noop.so` as `tokenProg`, fake `sysProg`, and wrong PDA bump.
 2. **Suite 2 — Multi-Market Creation (`1,965 CU`)**: Rejects solvency-envelope violations; creates isolated `BTC`, `ETH`, `SCAM` markets.
-3. **Suite 3 — Cross-Margin Capital Efficiency (`trade 2,808 CU`, `refresh 1,162 CU`, `oracle 625 CU`)**: Long $500 BTC + Short $500 ETH on $100 shared capital survives a 7.84% parallel drop via atomic `[RefreshLeg(ETH), RefreshLeg(BTC)]` with `$100` intact and zero liquidation; verifies stale-leg withdrawal rejection and atomic withdrawal (`4,189 CU`).
-4. **Suite 4 — Anti-Reverse-Contagion + God-Mode `RUG/USD` 12× Shielding Immunity (`liq 3,599 CU`)**: Rejects bare `Liquidate(SCAM)` while `BTC` leg is stale; atomic `[RefreshLeg(BTC), Liquidate(SCAM)]` leaves Alice with exact `capital == BTC_MM`, `I_BTC`/`I_ETH` untouched; plus **Suite 4B** runs both Long-`RUG` and Short-`RUG` 12× god-mode oracle pump shielding attacks verifying `solLeg.reservedMm == $50`, `I_SOL` untouched, and Bob1/Bob2 paid **100.00% (`+$40`)** with zero haircut.
+3. **Suite 3 — Cross-Margin Capital Efficiency (`trade 2,627 CU`, `refresh 1,080 CU`, `oracle 590 CU`)**: Long $500 BTC + Short $500 ETH on $100 shared capital survives a 7.84% parallel drop via atomic `[RefreshLeg(ETH), RefreshLeg(BTC)]` with `$100` intact and zero liquidation; verifies stale-leg withdrawal rejection and atomic withdrawal (`4,043 CU`).
+4. **Suite 4 — Anti-Reverse-Contagion + God-Mode `RUG/USD` 12× Shielding Immunity (`liq 3,015 CU`)**: Rejects bare `Liquidate(SCAM)` while `BTC` leg is stale; atomic `[RefreshLeg(BTC), Liquidate(SCAM)]` leaves Alice with exact `capital == BTC_MM`, `I_BTC`/`I_ETH` untouched; plus **Suite 4B** runs both Long-`RUG` and Short-`RUG` 12× god-mode oracle pump shielding attacks verifying `solLeg.reservedMm == $50`, `I_SOL` untouched, and Bob1/Bob2 paid **100.00% (`+$40`)** with zero haircut.
 5. **Suite 5 — Runtime Security Regressions**: Rejects same-slot oracle spam, unclamped jumps, **real executable `noop.so` passed as `tokenProgram` across all 5 SPL CPI handlers (`Custom(120)`)**, wrong `mint` (`Custom(112)`), wrong `vaultPda` (`Custom(113)`), aliased trades, and live-OI insurance withdrawals.
 6. **Suite 6 — Post-ADL Recovery, Full Lifecycle, Event Logs & Rent Reclaim (`clearDeadLeg 1,054 CU`, `closeAccount 248 CU`)**: Full ADL → `ClearDeadLeg` → `WindDown` → `ForceClosePair` → `Resolve` → `Tombstone` → `CloseAccount` reclaiming 100% rent across Portfolio, InsReceipt, and Market while verifying structured `sol_log_64_` events.
 7. **Suite 7 — Core Composability & Donated-Insurance Tombstone**: Bounded `execPrice` spread transfer (rejects out-of-band), `oracleAuth`/`marketAdmin` rotation, `minMm` dust floor rejection, and permissionless insurance donation cleanly sweeping orphan donated insurance to `totalSurplus` on `ResolveMarket` + tombstoning.
 8. **Suite 8 — 1,000-Step Stateful Fuzzer**: 474 valid randomized cross-margin transactions checking exact `C_tot + I_tot + R_tot + S_tot == V == SPL_balance` and all per-market/per-portfolio invariants after every tx — 0 violations.
 9. **Suite 9 — External Multi-Program CPI Composition**:
-   - `oracle_adapter.so` (`20,920 B`): verifies **Pyth V2 (`PriceUpdateV2`, 2,525 CU)** with `VerificationLevel::Full` & `feed_id` pinning, **Chainlink OCR2 (`Transmissions`, 2,478 CU)** with ring-buffer wraparound, **Switchboard On-Demand (`PullFeedAccountData`, 3,425 CU)** with 128-bit `PRECISION=18` scaling, **2-Leg Composite Ratio (`Pyth/Chainlink`, 2,797 CU)**, **EWMA Smoothing + Hybrid After-Hours (`live 2,816 CU / AH 2,686 CU / PushEwmaMark 377 CU`)** on a 2-leg `STOXX/SOL` ratio with stale-equity carry, bounded per-slot after-hours mark updates, and live market-open recovery, spoofed feed-owner rejection, and 4-slot smooth auto-clamped convergence (`$100 → $115`).
-   - `matcher.so` (`8,744 B`, `open 4,553 CU`, `close 4,023 CU`, `withdrawLp 3,924 CU`): PDA-owned LP portfolio executes single-signer taker opens & closes with exact spread earned by LP and PDA-signed LP withdrawals.
-10. **Suite 10 — Core Hardening & Fair Partial Takeover (`4,815 CU`)**: Rejects unbounded `exitWindow`/`maxStaleness`, nonzero `warmupSlots`, and `Trade(mode=1)` spread draining below `totalMm`; verifies partial takeover with gradual deficit fee (`< maxFee`) and zero ADL on innocent counterparties.
+   - `oracle_adapter.so` (`18,504 B`): verifies **Pyth V2 (`PriceUpdateV2`, 2,442 CU)** with `VerificationLevel::Full` & `feed_id` pinning, **Chainlink OCR2 (`Transmissions`, 2,400 CU)** with ring-buffer wraparound, **Switchboard On-Demand (`PullFeedAccountData`, 3,344 CU)** with 128-bit `PRECISION=18` scaling, **2-Leg Composite Ratio (`Pyth/Chainlink`, 2,699 CU)**, **EWMA Smoothing + Hybrid After-Hours (`live 2,716 CU / AH 2,593 CU / PushEwmaMark 366 CU`)** on a 2-leg `STOXX/SOL` ratio with stale-equity carry, bounded per-slot after-hours mark updates, and live market-open recovery, spoofed feed-owner rejection, and 4-slot smooth auto-clamped convergence (`$100 → $115`).
+   - `matcher.so` (`8,552 B`, `open 4,355 CU`, `close 3,949 CU`, `withdrawLp 3,859 CU`): PDA-owned LP portfolio executes single-signer taker opens & closes with exact spread earned by LP and PDA-signed LP withdrawals.
+10. **Suite 10 — Core Hardening & Fair Partial Takeover (`4,473 CU`)**: Rejects unbounded `exitWindow`/`maxStaleness`, nonzero `warmupSlots`, and `Trade(mode=1)` spread draining below `totalMm`; verifies partial takeover with gradual deficit fee (`< maxFee`) and zero ADL on innocent counterparties.
 11. **Suite 11 — Worst-Case 8-Leg CU/MTU Exhaustion + Anti-Selective-Liquidation + Post-ADL Recovery + Position Hand-Off**: Full 8-market, double-8-leg stress test verifying every role above, rejecting selective single-leg liquidation on an 8-leg hedged spread, verifying same-side Long→Long & Short→Short hand-off, post-ADL opens, post-ADL double-8-leg takeover, and full 8-market CPI/wind-down sweeps with zero invariant violations.
 
 ---
