@@ -11,12 +11,16 @@ use solana_transaction::Transaction;
 const TOKEN_PROGRAM_ID: Address =
     Address::from_str_const("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
 
-// Exact layout offsets matching Percolator/Layout.lean
-const PROT_SIZE: usize = 88;
-const MKT_SIZE: usize = 392;
-const POS_SIZE: usize = 152;
-const PFL_SIZE: usize = 88;
+// Exact v2 layout constants matching Percolator/Layout.lean
+const DEX_SIZE: usize = 200;
+const MKT_SIZE: usize = 344;
+const PFL_SIZE: usize = 880;
 const INS_SIZE: usize = 88;
+const MAX_LEGS: usize = 8;
+const LEG_HEADER: usize = 112;
+const LEG_STRIDE: usize = 96;
+const POS_SCALE: u64 = 1_000_000;
+const ADL_ONE: u64 = 1_000_000_000;
 
 fn make_spl_mint(decimals: u8, supply: u64, mint_auth: &Address) -> Vec<u8> {
     let mut data = vec![0u8; 82];
@@ -24,7 +28,7 @@ fn make_spl_mint(decimals: u8, supply: u64, mint_auth: &Address) -> Vec<u8> {
     data[4..36].copy_from_slice(mint_auth.as_ref());
     data[36..44].copy_from_slice(&supply.to_le_bytes());
     data[44] = decimals;
-    data[45] = 1; // is_initialized
+    data[45] = 1;
     data
 }
 
@@ -33,7 +37,7 @@ fn make_spl_token_account(mint: &Address, owner: &Address, amount: u64) -> Vec<u
     data[0..32].copy_from_slice(mint.as_ref());
     data[32..64].copy_from_slice(owner.as_ref());
     data[64..72].copy_from_slice(&amount.to_le_bytes());
-    data[108] = 1; // AccountState::Initialized
+    data[108] = 1; // Initialized
     data
 }
 
@@ -59,13 +63,32 @@ fn set_slot(svm: &mut LiteSVM, slot: u64) {
     svm.expire_blockhash();
 }
 
-fn send_ok(svm: &mut LiteSVM, ix: Instruction, payer: &Keypair, signers: &[&Keypair]) -> u64 {
+fn get_slot(svm: &LiteSVM) -> u64 {
+    let clock: Clock = svm.get_sysvar();
+    clock.slot
+}
+
+fn send_ixs_ok(svm: &mut LiteSVM, ixs: &[Instruction], payer: &Keypair, signers: &[&Keypair]) -> u64 {
     svm.expire_blockhash();
     let bh = svm.latest_blockhash();
-    let msg = Message::new(&[ix], Some(&payer.pubkey()));
+    let msg = Message::new(ixs, Some(&payer.pubkey()));
     let tx = Transaction::new(signers, msg, bh);
     let res = svm.send_transaction(tx).unwrap_or_else(|e| panic!("Expected OK, got {:?}", e));
     res.compute_units_consumed
+}
+
+fn send_ok(svm: &mut LiteSVM, ix: Instruction, payer: &Keypair, signers: &[&Keypair]) -> u64 {
+    send_ixs_ok(svm, &[ix], payer, signers)
+}
+
+fn send_ixs_try(svm: &mut LiteSVM, ixs: &[Instruction], payer: &Keypair, signers: &[&Keypair]) -> Result<u64, String> {
+    svm.expire_blockhash();
+    let bh = svm.latest_blockhash();
+    let msg = Message::new(ixs, Some(&payer.pubkey()));
+    let tx = Transaction::new(signers, msg, bh);
+    svm.send_transaction(tx)
+        .map(|r| r.compute_units_consumed)
+        .map_err(|e| format!("{:?}", e))
 }
 
 fn send_err(svm: &mut LiteSVM, ix: Instruction, payer: &Keypair, signers: &[&Keypair], label: &str) {
@@ -78,8 +101,7 @@ fn send_err(svm: &mut LiteSVM, ix: Instruction, payer: &Keypair, signers: &[&Key
 }
 
 fn create_prog_acc(svm: &mut LiteSVM, prog_id: &Address, size: usize) -> Address {
-    let kp = Keypair::new();
-    let addr = kp.pubkey();
+    let addr = Keypair::new().pubkey();
     svm.set_account(
         addr,
         Account {
@@ -95,8 +117,7 @@ fn create_prog_acc(svm: &mut LiteSVM, prog_id: &Address, size: usize) -> Address
 }
 
 fn create_tok_acc(svm: &mut LiteSVM, mint: &Address, owner: &Address, amount: u64) -> Address {
-    let kp = Keypair::new();
-    let addr = kp.pubkey();
+    let addr = Keypair::new().pubkey();
     svm.set_account(
         addr,
         Account {
@@ -111,14 +132,8 @@ fn create_tok_acc(svm: &mut LiteSVM, mint: &Address, owner: &Address, amount: u6
     addr
 }
 
-fn create_pda_vault(
-    svm: &mut LiteSVM,
-    prog_id: &Address,
-    tag: &[u8; 4],
-    seed_key: &Address,
-    mint: &Address,
-) -> (Address, u8) {
-    let (pda, bump) = Address::find_program_address(&[tag, seed_key.as_ref()], prog_id);
+fn create_dex_vault(svm: &mut LiteSVM, prog_id: &Address, dex: &Address, mint: &Address) -> (Address, u8) {
+    let (pda, bump) = Address::find_program_address(&[b"dvlt", dex.as_ref()], prog_id);
     svm.set_account(
         pda,
         Account {
@@ -133,49 +148,133 @@ fn create_pda_vault(
     (pda, bump)
 }
 
-fn assert_vault_conserved(svm: &LiteSVM, mkt: &Address, mkt_vault: &Address, label: &str) {
-    let v = read_u64(svm, mkt, 248);
-    let c = read_u64(svm, mkt, 256);
-    let i = read_u64(svm, mkt, 264);
-    let s = read_u64(svm, mkt, 272);
-    let spl = token_amount(svm, mkt_vault);
-    assert_eq!(v, spl, "[{}] vaultBalance ({}) != real SPL balance ({})", label, v, spl);
-    assert!(
-        c.saturating_add(i).saturating_add(s) <= v,
-        "[{}] Vault conservation violated: C({}) + I({}) + S({}) > V({})",
-        label, c, i, s, v
+/// Global + per-market + per-portfolio EXACT invariant verifier!
+fn assert_dex_invariants(
+    svm: &LiteSVM,
+    dex: &Address,
+    dex_vault: &Address,
+    markets: &[Address],
+    portfolios: &[Address],
+    label: &str,
+) {
+    let v = read_u64(svm, dex, 160);
+    let c_tot = read_u64(svm, dex, 168);
+    let i_tot = read_u64(svm, dex, 176);
+    let r_tot = read_u64(svm, dex, 184);
+    let s_tot = read_u64(svm, dex, 192);
+    let spl = token_amount(svm, dex_vault);
+
+    assert_eq!(v, spl, "[{}] Dex.vaultBalance ({}) != SPL balance ({})", label, v, spl);
+    assert_eq!(
+        c_tot as u128 + i_tot as u128 + r_tot as u128 + s_tot as u128,
+        v as u128,
+        "[{}] EXACT stock equality violated: C({}) + I({}) + R({}) + S({}) != V({})",
+        label, c_tot, i_tot, r_tot, s_tot, v
     );
+
+    let mut sum_i: u64 = 0;
+    let mut sum_r: u64 = 0;
+    let mut sum_s: u64 = 0;
+    for m in markets {
+        let r_m = read_u64(svm, m, 216);
+        let i_m = read_u64(svm, m, 224);
+        let s_m = read_u64(svm, m, 232);
+        let oi_l = read_u64(svm, m, 256);
+        let oi_s = read_u64(svm, m, 264);
+        let raw_l = read_u64(svm, m, 272);
+        let raw_s = read_u64(svm, m, 280);
+        let adl_l = read_u64(svm, m, 288);
+        let adl_s = read_u64(svm, m, 296);
+        let max_oi = read_u64(svm, m, 208);
+
+        assert_eq!(oi_l, oi_s, "[{}] Market OI imbalanced: {} != {}", label, oi_l, oi_s);
+        assert!(oi_l <= max_oi, "[{}] Market OI {} > maxOi {}", label, oi_l, max_oi);
+        assert!(oi_l <= raw_l, "[{}] oiLong {} > rawBasisLong {}", label, oi_l, raw_l);
+        assert!(oi_s <= raw_s, "[{}] oiShort {} > rawBasisShort {}", label, oi_s, raw_s);
+        assert!(adl_l <= ADL_ONE, "[{}] adlLong {} > ADL_ONE", label, adl_l);
+        assert!(adl_s <= ADL_ONE, "[{}] adlShort {} > ADL_ONE", label, adl_s);
+        sum_i += i_m;
+        sum_r += r_m;
+        sum_s += s_m;
+    }
+    assert_eq!(sum_i, i_tot, "[{}] Σ m.insurance ({}) != Dex.totalInsurance ({})", label, sum_i, i_tot);
+    assert_eq!(sum_r, r_tot, "[{}] Σ m.realizedPool ({}) != Dex.totalResidual ({})", label, sum_r, r_tot);
+    assert_eq!(sum_s, s_tot, "[{}] Σ m.feeSurplus ({}) != Dex.totalSurplus ({})", label, sum_s, s_tot);
+
+    let mut sum_c: u64 = 0;
+    for p in portfolios {
+        let cap = read_u64(svm, p, 88);
+        let tot_mm = read_u64(svm, p, 96);
+        let tot_im = read_u64(svm, p, 104);
+        let leg_cnt = read_u8(svm, p, 4);
+        let mut calc_mm: u64 = 0;
+        let mut calc_im: u64 = 0;
+        let mut calc_cnt: u8 = 0;
+        for idx in 0..MAX_LEGS {
+            let base = LEG_HEADER + idx * LEG_STRIDE;
+            if read_u8(svm, p, base) != 0 {
+                calc_cnt += 1;
+                calc_mm += read_u64(svm, p, base + 72);
+                calc_im += read_u64(svm, p, base + 80);
+            }
+        }
+        assert_eq!(calc_mm, tot_mm, "[{}] Portfolio totalMm mismatch: calc {} != stored {}", label, calc_mm, tot_mm);
+        assert_eq!(calc_im, tot_im, "[{}] Portfolio totalIm mismatch: calc {} != stored {}", label, calc_im, tot_im);
+        assert_eq!(calc_cnt, leg_cnt, "[{}] Portfolio legCount mismatch: calc {} != stored {}", label, calc_cnt, leg_cnt);
+        sum_c += cap;
+    }
+    assert_eq!(sum_c, c_tot, "[{}] Σ pfl.capital ({}) != Dex.totalCapital ({})", label, sum_c, c_tot);
+}
+
+// ============================================================================
+// Instruction Builders (19 Unified v2 Instructions)
+// ============================================================================
+
+fn ix_init_dex(
+    prog: Address, dex: Address, admin: Address, mint: Address,
+    vault_pda: Address, fee_vault: Address, tok_prog: Address,
+    bump: u8, decimals: u8, create_fee: u64,
+) -> Instruction {
+    let mut data = vec![0u8; 12];
+    data[0] = 0;
+    data[1] = bump;
+    data[2] = decimals;
+    data[4..12].copy_from_slice(&create_fee.to_le_bytes());
+    Instruction {
+        program_id: prog,
+        accounts: vec![
+            AccountMeta::new(dex, false),
+            AccountMeta::new_readonly(admin, true),
+            AccountMeta::new_readonly(mint, false),
+            AccountMeta::new_readonly(vault_pda, false),
+            AccountMeta::new_readonly(fee_vault, false),
+            AccountMeta::new_readonly(tok_prog, false),
+        ],
+        data,
+    }
+}
+
+fn ix_update_create_fee(prog: Address, dex: Address, admin: Address, new_fee: u64) -> Instruction {
+    let mut data = vec![0u8; 9];
+    data[0] = 1;
+    data[1..9].copy_from_slice(&new_fee.to_le_bytes());
+    Instruction {
+        program_id: prog,
+        accounts: vec![AccountMeta::new(dex, false), AccountMeta::new_readonly(admin, true)],
+        data,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
 fn ix_create_market(
-    prog_id: Address,
-    prot: Address,
-    mkt: Address,
-    mint: Address,
-    vault_pda: Address,
-    oracle_auth: Address,
-    creator: Address,
-    creator_tok: Address,
-    fee_vault: Address,
-    bump: u8,
-    decimals: u8,
-    init_price: u64,
-    exit_window: u64,
-    max_staleness: u64,
-    warmup_slots: u64,
-    im_bps: u64,
-    mm_bps: u64,
-    liq_fee_bps: u64,
-    trade_fee_bps: u64,
-    max_move_bps: u64,
-    max_ins_draw_bps: u64,
-    max_oi: u64,
+    prog: Address, dex: Address, mkt: Address, mint: Address, oracle_auth: Address,
+    creator: Address, creator_tok: Address, fee_vault: Address,
+    init_price: u64, exit_window: u64, max_staleness: u64, warmup_slots: u64,
+    im_bps: u64, mm_bps: u64, liq_fee_bps: u64, trade_fee_bps: u64,
+    max_move_bps: u64, max_ins_draw_bps: u64, max_oi: u64,
 ) -> Instruction {
     let mut data = vec![0u8; 92];
-    data[0] = 2; // IxOp.createMarket
-    data[1] = bump;
-    data[2] = decimals;
+    data[0] = 2;
     data[4..12].copy_from_slice(&init_price.to_le_bytes());
     data[12..20].copy_from_slice(&exit_window.to_le_bytes());
     data[20..28].copy_from_slice(&max_staleness.to_le_bytes());
@@ -188,12 +287,11 @@ fn ix_create_market(
     data[76..84].copy_from_slice(&max_ins_draw_bps.to_le_bytes());
     data[84..92].copy_from_slice(&max_oi.to_le_bytes());
     Instruction {
-        program_id: prog_id,
+        program_id: prog,
         accounts: vec![
-            AccountMeta::new(prot, false),
+            AccountMeta::new(dex, false),
             AccountMeta::new(mkt, false),
             AccountMeta::new_readonly(mint, false),
-            AccountMeta::new_readonly(vault_pda, false),
             AccountMeta::new_readonly(oracle_auth, false),
             AccountMeta::new_readonly(creator, true),
             AccountMeta::new(creator_tok, false),
@@ -204,13 +302,288 @@ fn ix_create_market(
     }
 }
 
+fn ix_burn_market_admin(prog: Address, mkt: Address, admin: Address) -> Instruction {
+    Instruction {
+        program_id: prog,
+        accounts: vec![AccountMeta::new(mkt, false), AccountMeta::new_readonly(admin, true)],
+        data: vec![3],
+    }
+}
+
+fn ix_update_oracle(prog: Address, mkt: Address, oracle_auth: Address, new_price: u64, fund_sign: u8, fund_e6: u64) -> Instruction {
+    let mut data = vec![0u8; 18];
+    data[0] = 4;
+    data[1..9].copy_from_slice(&new_price.to_le_bytes());
+    data[9] = fund_sign;
+    data[10..18].copy_from_slice(&fund_e6.to_le_bytes());
+    Instruction {
+        program_id: prog,
+        accounts: vec![AccountMeta::new(mkt, false), AccountMeta::new_readonly(oracle_auth, true)],
+        data,
+    }
+}
+
+fn ix_init_portfolio(prog: Address, dex: Address, pfl: Address, owner: Address) -> Instruction {
+    Instruction {
+        program_id: prog,
+        accounts: vec![
+            AccountMeta::new(dex, false),
+            AccountMeta::new(pfl, false),
+            AccountMeta::new_readonly(owner, true),
+        ],
+        data: vec![5],
+    }
+}
+
+fn ix_deposit_collateral(
+    prog: Address, dex: Address, pfl: Address, owner: Address,
+    owner_tok: Address, mint: Address, vault_pda: Address, tok_prog: Address, amount: u64,
+) -> Instruction {
+    let mut data = vec![0u8; 9];
+    data[0] = 6;
+    data[1..9].copy_from_slice(&amount.to_le_bytes());
+    Instruction {
+        program_id: prog,
+        accounts: vec![
+            AccountMeta::new(dex, false),
+            AccountMeta::new(pfl, false),
+            AccountMeta::new_readonly(owner, true),
+            AccountMeta::new(owner_tok, false),
+            AccountMeta::new_readonly(mint, false),
+            AccountMeta::new(vault_pda, false),
+            AccountMeta::new_readonly(tok_prog, false),
+        ],
+        data,
+    }
+}
+
+fn ix_withdraw_collateral(
+    prog: Address, dex: Address, pfl: Address, owner: Address,
+    dest_tok: Address, mint: Address, vault_pda: Address, tok_prog: Address, amount: u64,
+) -> Instruction {
+    let mut data = vec![0u8; 9];
+    data[0] = 7;
+    data[1..9].copy_from_slice(&amount.to_le_bytes());
+    Instruction {
+        program_id: prog,
+        accounts: vec![
+            AccountMeta::new(dex, false),
+            AccountMeta::new(pfl, false),
+            AccountMeta::new_readonly(owner, true),
+            AccountMeta::new(dest_tok, false),
+            AccountMeta::new_readonly(mint, false),
+            AccountMeta::new(vault_pda, false),
+            AccountMeta::new_readonly(tok_prog, false),
+        ],
+        data,
+    }
+}
+
+fn ix_deposit_insurance(
+    prog: Address, dex: Address, mkt: Address, receipt: Address, lp: Address,
+    lp_tok: Address, mint: Address, vault_pda: Address, tok_prog: Address, amount: u64,
+) -> Instruction {
+    let mut data = vec![0u8; 9];
+    data[0] = 8;
+    data[1..9].copy_from_slice(&amount.to_le_bytes());
+    Instruction {
+        program_id: prog,
+        accounts: vec![
+            AccountMeta::new(dex, false),
+            AccountMeta::new(mkt, false),
+            AccountMeta::new(receipt, false),
+            AccountMeta::new_readonly(lp, true),
+            AccountMeta::new(lp_tok, false),
+            AccountMeta::new_readonly(mint, false),
+            AccountMeta::new(vault_pda, false),
+            AccountMeta::new_readonly(tok_prog, false),
+        ],
+        data,
+    }
+}
+
+fn ix_withdraw_insurance(
+    prog: Address, dex: Address, mkt: Address, receipt: Address, lp: Address,
+    dest_tok: Address, mint: Address, vault_pda: Address, tok_prog: Address, burn_shares: u64,
+) -> Instruction {
+    let mut data = vec![0u8; 9];
+    data[0] = 9;
+    data[1..9].copy_from_slice(&burn_shares.to_le_bytes());
+    Instruction {
+        program_id: prog,
+        accounts: vec![
+            AccountMeta::new(dex, false),
+            AccountMeta::new(mkt, false),
+            AccountMeta::new(receipt, false),
+            AccountMeta::new_readonly(lp, true),
+            AccountMeta::new(dest_tok, false),
+            AccountMeta::new_readonly(mint, false),
+            AccountMeta::new(vault_pda, false),
+            AccountMeta::new_readonly(tok_prog, false),
+        ],
+        data,
+    }
+}
+
+fn ix_refresh_leg(prog: Address, dex: Address, mkt: Address, pfl: Address, force_haircut: bool) -> Instruction {
+    Instruction {
+        program_id: prog,
+        accounts: vec![
+            AccountMeta::new(dex, false),
+            AccountMeta::new(mkt, false),
+            AccountMeta::new(pfl, false),
+        ],
+        data: vec![10, if force_haircut { 1 } else { 0 }],
+    }
+}
+
+fn ix_trade(
+    prog: Address, dex: Address, mkt: Address,
+    pfl_l: Address, owner_l: Address, pfl_s: Address, owner_s: Address,
+    mode: u8, qty: u64,
+) -> Instruction {
+    let mut data = vec![0u8; 10];
+    data[0] = 11;
+    data[1] = mode;
+    data[2..10].copy_from_slice(&qty.to_le_bytes());
+    Instruction {
+        program_id: prog,
+        accounts: vec![
+            AccountMeta::new(dex, false),
+            AccountMeta::new(mkt, false),
+            AccountMeta::new(pfl_l, false),
+            AccountMeta::new_readonly(owner_l, true),
+            AccountMeta::new(pfl_s, false),
+            AccountMeta::new_readonly(owner_s, true),
+        ],
+        data,
+    }
+}
+
+fn ix_liquidate(
+    prog: Address, dex: Address, mkt: Address, pfl: Address,
+    liq_tok: Address, mint: Address, vault_pda: Address, tok_prog: Address,
+) -> Instruction {
+    Instruction {
+        program_id: prog,
+        accounts: vec![
+            AccountMeta::new(dex, false),
+            AccountMeta::new(mkt, false),
+            AccountMeta::new(pfl, false),
+            AccountMeta::new(liq_tok, false),
+            AccountMeta::new_readonly(mint, false),
+            AccountMeta::new(vault_pda, false),
+            AccountMeta::new_readonly(tok_prog, false),
+        ],
+        data: vec![12],
+    }
+}
+
+fn ix_clear_dead_leg(prog: Address, dex: Address, mkt: Address, pfl: Address) -> Instruction {
+    Instruction {
+        program_id: prog,
+        accounts: vec![
+            AccountMeta::new(dex, false),
+            AccountMeta::new(mkt, false),
+            AccountMeta::new(pfl, false),
+        ],
+        data: vec![13],
+    }
+}
+
+fn ix_start_wind_down(prog: Address, mkt: Address, caller: Address) -> Instruction {
+    Instruction {
+        program_id: prog,
+        accounts: vec![AccountMeta::new(mkt, false), AccountMeta::new_readonly(caller, true)],
+        data: vec![14],
+    }
+}
+
+fn ix_force_close_pair(prog: Address, dex: Address, mkt: Address, pfl_l: Address, pfl_s: Address) -> Instruction {
+    Instruction {
+        program_id: prog,
+        accounts: vec![
+            AccountMeta::new(dex, false),
+            AccountMeta::new(mkt, false),
+            AccountMeta::new(pfl_l, false),
+            AccountMeta::new(pfl_s, false),
+        ],
+        data: vec![15],
+    }
+}
+
+fn ix_resolve_market(prog: Address, mkt: Address) -> Instruction {
+    Instruction {
+        program_id: prog,
+        accounts: vec![AccountMeta::new(mkt, false)],
+        data: vec![16],
+    }
+}
+
+fn ix_claim_resolved(prog: Address, dex: Address, mkt: Address, pfl: Address) -> Instruction {
+    Instruction {
+        program_id: prog,
+        accounts: vec![
+            AccountMeta::new(dex, false),
+            AccountMeta::new(mkt, false),
+            AccountMeta::new(pfl, false),
+        ],
+        data: vec![17],
+    }
+}
+
+fn ix_tombstone_market(prog: Address, mkt: Address) -> Instruction {
+    Instruction {
+        program_id: prog,
+        accounts: vec![AccountMeta::new(mkt, false)],
+        data: vec![18],
+    }
+}
+
+/// Build `RefreshLeg` instructions for every active open leg of `pfl` in `markets_by_id`.
+fn refresh_open_legs_ixs(
+    svm: &LiteSVM,
+    prog: Address,
+    dex: Address,
+    pfl: Address,
+    markets: &[(u64, Address)],
+) -> Vec<Instruction> {
+    let mut ixs = Vec::new();
+    for idx in 0..MAX_LEGS {
+        let base = LEG_HEADER + idx * LEG_STRIDE;
+        if read_u8(svm, &pfl, base) != 0 && read_u8(svm, &pfl, base + 1) != 0 {
+            let mid = read_u64(svm, &pfl, base + 8);
+            if let Some((_, mkt)) = markets.iter().find(|(id, _)| *id == mid) {
+                ixs.push(ix_refresh_leg(prog, dex, *mkt, pfl, false));
+            }
+        }
+    }
+    ixs
+}
+
+/// Deterministic xorshift64 PRNG for reproducible 1,000-step stateful fuzzing.
+struct Rng(u64);
+impl Rng {
+    fn next(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.0 = x;
+        x
+    }
+    fn range(&mut self, n: u64) -> u64 {
+        if n == 0 { 0 } else { self.next() % n }
+    }
+}
+
 fn main() {
     let so_path = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "build/percolator.so".to_string());
     let elf = std::fs::read(&so_path).unwrap_or_else(|e| panic!("Failed to read {}: {}", so_path, e));
     println!("==================================================================================");
-    println!("  percolator-lean — Unified Lean 4 -> sBPF Perps DEX Verification Suite");
+    println!("  percolator-lean v2 — Realizable Shared Cross-Margin Perps DEX Verification Suite");
     println!("  Binary: {} ({} bytes, 0 heap, 0 engine/prog split)", so_path, elf.len());
     println!("==================================================================================");
 
@@ -220,18 +593,19 @@ fn main() {
     set_slot(&mut svm, 100);
 
     let payer = Keypair::new();
-    let prot_admin = Keypair::new();
+    let dex_admin = Keypair::new();
     let alice = Keypair::new();
     let bob = Keypair::new();
     let lp = Keypair::new();
     let keeper = Keypair::new();
     let attacker = Keypair::new();
-    let sockpuppet = Keypair::new();
     let btc_oracle = Keypair::new();
     let eth_oracle = Keypair::new();
     let scam_oracle = Keypair::new();
+    let adl_oracle = Keypair::new();
+    let fake_tok_prog = Keypair::new().pubkey();
 
-    for kp in [&payer, &prot_admin, &alice, &bob, &lp, &keeper, &attacker, &sockpuppet, &btc_oracle, &eth_oracle, &scam_oracle] {
+    for kp in [&payer, &dex_admin, &alice, &bob, &lp, &keeper, &attacker, &btc_oracle, &eth_oracle, &scam_oracle, &adl_oracle] {
         svm.airdrop(&kp.pubkey(), 10_000_000_000).unwrap();
     }
 
@@ -241,7 +615,7 @@ fn main() {
         mint,
         Account {
             lamports: 10_000_000,
-            data: make_spl_mint(6, 1_000_000_000_000, &prot_admin.pubkey()),
+            data: make_spl_mint(6, 10_000_000_000_000, &dex_admin.pubkey()),
             owner: TOKEN_PROGRAM_ID,
             executable: false,
             rent_epoch: 0,
@@ -249,737 +623,558 @@ fn main() {
     )
     .unwrap();
 
-    let fee_vault = create_tok_acc(&mut svm, &mint, &prot_admin.pubkey(), 0);
-    let alice_tok = create_tok_acc(&mut svm, &mint, &alice.pubkey(), 100_000_000);     // 100 USDC
-    let bob_tok   = create_tok_acc(&mut svm, &mint, &bob.pubkey(), 100_000_000);       // 100 USDC
-    let lp_tok    = create_tok_acc(&mut svm, &mint, &lp.pubkey(), 50_000_000);         // 50 USDC
-    let keep_tok  = create_tok_acc(&mut svm, &mint, &keeper.pubkey(), 0);
-    let atk_tok   = create_tok_acc(&mut svm, &mint, &attacker.pubkey(), 20_000_000);   // 20 USDC
-    let sock_tok  = create_tok_acc(&mut svm, &mint, &sockpuppet.pubkey(), 20_000_000); // 20 USDC
+    let fee_vault = create_tok_acc(&mut svm, &mint, &dex_admin.pubkey(), 0);
+    let alice_tok = create_tok_acc(&mut svm, &mint, &alice.pubkey(), 10_000_000_000);
+    let bob_tok = create_tok_acc(&mut svm, &mint, &bob.pubkey(), 10_000_000_000);
+    let lp_tok = create_tok_acc(&mut svm, &mint, &lp.pubkey(), 10_000_000_000);
+    let keeper_tok = create_tok_acc(&mut svm, &mint, &keeper.pubkey(), 0);
+    let attacker_tok = create_tok_acc(&mut svm, &mint, &attacker.pubkey(), 10_000_000_000);
 
-    // -------------------------------------------------------------------------
-    // 1. InitProtocol + Admin Containment Check
-    // -------------------------------------------------------------------------
-    let prot = create_prog_acc(&mut svm, &prog_id, PROT_SIZE);
-    let mut init_data = vec![0u8; 9];
-    init_data[0] = 0;
-    init_data[1..9].copy_from_slice(&1_000_000u64.to_le_bytes()); // 1 USDC create fee
-    let cu_init = send_ok(
-        &mut svm,
-        Instruction {
-            program_id: prog_id,
-            accounts: vec![
-                AccountMeta::new(prot, false),
-                AccountMeta::new_readonly(prot_admin.pubkey(), true),
-                AccountMeta::new_readonly(fee_vault, false),
-            ],
-            data: init_data,
-        },
-        &payer,
-        &[&payer, &prot_admin],
-    );
-    // Unauthorized UpdateCreateFee must reject
-    let mut bad_fee = vec![1u8; 9];
-    bad_fee[1..9].copy_from_slice(&0u64.to_le_bytes());
+    // =========================================================================
+    // SUITE 1: InitDex + Cryptographic PDA & SPL Vault Hardening Checks
+    // =========================================================================
+    let dex = create_prog_acc(&mut svm, &prog_id, DEX_SIZE);
+    let (dex_vault, dex_bump) = create_dex_vault(&mut svm, &prog_id, &dex, &mint);
+
+    // 1a. Reject fake Token Program ID
     send_err(
         &mut svm,
-        Instruction {
-            program_id: prog_id,
-            accounts: vec![
-                AccountMeta::new(prot, false),
-                AccountMeta::new_readonly(attacker.pubkey(), true),
-            ],
-            data: bad_fee,
-        },
+        ix_init_dex(prog_id, dex, dex_admin.pubkey(), mint, dex_vault, fee_vault, fake_tok_prog, dex_bump, 6, 1_000_000),
         &payer,
-        &[&payer, &attacker],
-        "unauthorized UpdateCreateFee",
+        &[&payer, &dex_admin],
+        "InitDex with fake tokenProg",
     );
-    println!("[PASS] 1. InitProtocol & Admin Auth       | CUs = {}", cu_init);
+    // 1b. Reject wrong PDA bump
+    send_err(
+        &mut svm,
+        ix_init_dex(prog_id, dex, dex_admin.pubkey(), mint, dex_vault, fee_vault, TOKEN_PROGRAM_ID, dex_bump.wrapping_sub(1), 6, 1_000_000),
+        &payer,
+        &[&payer, &dex_admin],
+        "InitDex with wrong PDA bump",
+    );
+    // 1c. Reject non-empty vault
+    let mut dirty_vault = make_spl_token_account(&mint, &dex_vault, 1);
+    svm.set_account(dex_vault, Account { lamports: 10_000_000, data: dirty_vault.clone(), owner: TOKEN_PROGRAM_ID, executable: false, rent_epoch: 0 }).unwrap();
+    send_err(
+        &mut svm,
+        ix_init_dex(prog_id, dex, dex_admin.pubkey(), mint, dex_vault, fee_vault, TOKEN_PROGRAM_ID, dex_bump, 6, 1_000_000),
+        &payer,
+        &[&payer, &dex_admin],
+        "InitDex with non-zero vault balance",
+    );
+    // 1d. Reject vault with delegate set
+    dirty_vault = make_spl_token_account(&mint, &dex_vault, 0);
+    dirty_vault[72..76].copy_from_slice(&1u32.to_le_bytes()); // delegate = Some(...)
+    svm.set_account(dex_vault, Account { lamports: 10_000_000, data: dirty_vault, owner: TOKEN_PROGRAM_ID, executable: false, rent_epoch: 0 }).unwrap();
+    send_err(
+        &mut svm,
+        ix_init_dex(prog_id, dex, dex_admin.pubkey(), mint, dex_vault, fee_vault, TOKEN_PROGRAM_ID, dex_bump, 6, 1_000_000),
+        &payer,
+        &[&payer, &dex_admin],
+        "InitDex with delegated vault",
+    );
+    // 1e. Reject vault with close_authority set
+    let mut close_vault = make_spl_token_account(&mint, &dex_vault, 0);
+    close_vault[129..133].copy_from_slice(&1u32.to_le_bytes()); // close_authority = Some(...)
+    svm.set_account(dex_vault, Account { lamports: 10_000_000, data: close_vault, owner: TOKEN_PROGRAM_ID, executable: false, rent_epoch: 0 }).unwrap();
+    send_err(
+        &mut svm,
+        ix_init_dex(prog_id, dex, dex_admin.pubkey(), mint, dex_vault, fee_vault, TOKEN_PROGRAM_ID, dex_bump, 6, 1_000_000),
+        &payer,
+        &[&payer, &dex_admin],
+        "InitDex with close_authority set",
+    );
 
-    // -------------------------------------------------------------------------
-    // 2. Permissionless Market Creation + Solvency Envelope Rejection
-    // -------------------------------------------------------------------------
+    // Restore clean vault and InitDex cleanly!
+    svm.set_account(
+        dex_vault,
+        Account { lamports: 10_000_000, data: make_spl_token_account(&mint, &dex_vault, 0), owner: TOKEN_PROGRAM_ID, executable: false, rent_epoch: 0 },
+    )
+    .unwrap();
+    let cu_init_dex = send_ok(
+        &mut svm,
+        ix_init_dex(prog_id, dex, dex_admin.pubkey(), mint, dex_vault, fee_vault, TOKEN_PROGRAM_ID, dex_bump, 6, 1_000_000),
+        &payer,
+        &[&payer, &dex_admin],
+    );
+    assert_dex_invariants(&svm, &dex, &dex_vault, &[], &[], "post-initDex");
+    println!("[PASS] Suite 1: InitDex + Cryptographic PDA/SPL/TokenProg Hardening ({} CU)", cu_init_dex);
+
+    // =========================================================================
+    // SUITE 2: Permissionless Multi-Market Creation + Solvency Envelope
+    // =========================================================================
     let btc_mkt = create_prog_acc(&mut svm, &prog_id, MKT_SIZE);
-    let (btc_vault, btc_bump) = create_pda_vault(&mut svm, &prog_id, b"mvlt", &btc_mkt, &mint);
     let eth_mkt = create_prog_acc(&mut svm, &prog_id, MKT_SIZE);
-    let (eth_vault, eth_bump) = create_pda_vault(&mut svm, &prog_id, b"mvlt", &eth_mkt, &mint);
+    let scam_mkt = create_prog_acc(&mut svm, &prog_id, MKT_SIZE);
+    let bad_mkt = create_prog_acc(&mut svm, &prog_id, MKT_SIZE);
 
-    // Invalid solvency envelope: maxMoveBps(400) + liqFeeBps(200) = 600 > mmBps(500) -> MUST REJECT!
+    // Reject invalid solvency envelope (maxMove 500 + liqFee 100 > mmBps 500)
     send_err(
         &mut svm,
-        ix_create_market(
-            prog_id, prot, btc_mkt, mint, btc_vault, btc_oracle.pubkey(),
-            alice.pubkey(), alice_tok, fee_vault, btc_bump, 6,
-            100_000_000, 20, 50, 10, 1000, 500, 200, 10, 400, 5000, 10_000_000_000,
-        ),
+        ix_create_market(prog_id, dex, bad_mkt, mint, btc_oracle.pubkey(), alice.pubkey(), alice_tok, fee_vault,
+            100 * POS_SCALE, 20, 50, 0, 1000, 500, 100, 0, 500, 2500, 1_000_000 * POS_SCALE),
         &payer,
         &[&payer, &alice],
-        "invalid solvency envelope (maxMove + liqFee > mmBps)",
+        "CreateMarket violating solvency envelope",
     );
 
-    // Valid BTC-PERP ($100.00, IM=10%, MM=5%, liqFee=1%, maxMove=4% -> 4%+1%<=5%, warmup=10 slots)
-    let cu_create = send_ok(
+    let cu_create_mkt = send_ok(
         &mut svm,
-        ix_create_market(
-            prog_id, prot, btc_mkt, mint, btc_vault, btc_oracle.pubkey(),
-            alice.pubkey(), alice_tok, fee_vault, btc_bump, 6,
-            100_000_000, 20, 50, 10, 1000, 500, 100, 10, 400, 5000, 10_000_000_000,
-        ),
+        ix_create_market(prog_id, dex, btc_mkt, mint, btc_oracle.pubkey(), alice.pubkey(), alice_tok, fee_vault,
+            100 * POS_SCALE, 20, 50, 0, 1000, 500, 100, 0, 400, 2500, 1_000_000 * POS_SCALE),
         &payer,
         &[&payer, &alice],
     );
-    assert_eq!(read_u64(&svm, &btc_mkt, 8), 1); // market_id == 1
-    assert_eq!(token_amount(&svm, &fee_vault), 1_000_000);
-
-    // Valid ETH-PERP ($50.00)
     send_ok(
         &mut svm,
-        ix_create_market(
-            prog_id, prot, eth_mkt, mint, eth_vault, eth_oracle.pubkey(),
-            bob.pubkey(), bob_tok, fee_vault, eth_bump, 6,
-            50_000_000, 20, 50, 10, 1000, 500, 100, 10, 400, 5000, 10_000_000_000,
-        ),
+        ix_create_market(prog_id, dex, eth_mkt, mint, eth_oracle.pubkey(), bob.pubkey(), bob_tok, fee_vault,
+            100 * POS_SCALE, 20, 50, 0, 1000, 500, 100, 0, 400, 2500, 1_000_000 * POS_SCALE),
         &payer,
         &[&payer, &bob],
     );
-    assert_eq!(read_u64(&svm, &eth_mkt, 8), 2); // market_id == 2
-    println!("[PASS] 2. Permissionless CreateMarket     | CUs = {} (BTC=id1, ETH=id2, envelope enforced)", cu_create);
-
-    // -------------------------------------------------------------------------
-    // 3. Isolated Insurance Pool Deposit (BTC + ETH)
-    // -------------------------------------------------------------------------
-    let btc_ins_rec = create_prog_acc(&mut svm, &prog_id, INS_SIZE);
-    let eth_ins_rec = create_prog_acc(&mut svm, &prog_id, INS_SIZE);
-    let mut dep_ins = vec![12u8; 9];
-    dep_ins[1..9].copy_from_slice(&20_000_000u64.to_le_bytes()); // 20 USDC into BTC insurance
-    let cu_dep_ins = send_ok(
-        &mut svm,
-        Instruction {
-            program_id: prog_id,
-            accounts: vec![
-                AccountMeta::new(btc_mkt, false),
-                AccountMeta::new(btc_ins_rec, false),
-                AccountMeta::new_readonly(lp.pubkey(), true),
-                AccountMeta::new_readonly(mint, false),
-                AccountMeta::new(lp_tok, false),
-                AccountMeta::new(btc_vault, false),
-                AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),
-            ],
-            data: dep_ins.clone(),
-        },
-        &payer,
-        &[&payer, &lp],
-    );
     send_ok(
         &mut svm,
-        Instruction {
-            program_id: prog_id,
-            accounts: vec![
-                AccountMeta::new(eth_mkt, false),
-                AccountMeta::new(eth_ins_rec, false),
-                AccountMeta::new_readonly(lp.pubkey(), true),
-                AccountMeta::new_readonly(mint, false),
-                AccountMeta::new(lp_tok, false),
-                AccountMeta::new(eth_vault, false),
-                AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),
-            ],
-            data: dep_ins,
-        },
-        &payer,
-        &[&payer, &lp],
-    );
-    assert_vault_conserved(&svm, &btc_mkt, &btc_vault, "after BTC ins deposit");
-    assert_vault_conserved(&svm, &eth_mkt, &eth_vault, "after ETH ins deposit");
-    println!("[PASS] 3. Isolated Insurance Deposits     | CUs = {} (BTC=20 USDC, ETH=20 USDC)", cu_dep_ins);
-
-    // -------------------------------------------------------------------------
-    // 4. Cross-Market Portfolios + Positions + Margin Allocation + Atomic Rebalance
-    // -------------------------------------------------------------------------
-    let alice_pfl = create_prog_acc(&mut svm, &prog_id, PFL_SIZE);
-    let (alice_pvlt, alice_pbump) = create_pda_vault(&mut svm, &prog_id, b"pvlt", &alice_pfl, &mint);
-    let bob_pfl = create_prog_acc(&mut svm, &prog_id, PFL_SIZE);
-    let (bob_pvlt, bob_pbump) = create_pda_vault(&mut svm, &prog_id, b"pvlt", &bob_pfl, &mint);
-
-    for (pfl, bump, owner, tok) in [
-        (alice_pfl, alice_pbump, &alice, alice_tok),
-        (bob_pfl, bob_pbump, &bob, bob_tok),
-    ] {
-        send_ok(
-            &mut svm,
-            Instruction {
-                program_id: prog_id,
-                accounts: vec![
-                    AccountMeta::new(pfl, false),
-                    AccountMeta::new_readonly(owner.pubkey(), true),
-                    AccountMeta::new_readonly(mint, false),
-                ],
-                data: vec![5, bump, 6],
-            },
-            &payer,
-            &[&payer, owner],
-        );
-        let pvlt = if pfl == alice_pfl { alice_pvlt } else { bob_pvlt };
-        let mut dep = vec![6u8; 9];
-        dep[1..9].copy_from_slice(&50_000_000u64.to_le_bytes()); // 50 USDC to portfolio
-        send_ok(
-            &mut svm,
-            Instruction {
-                program_id: prog_id,
-                accounts: vec![
-                    AccountMeta::new(pfl, false),
-                    AccountMeta::new_readonly(owner.pubkey(), true),
-                    AccountMeta::new_readonly(mint, false),
-                    AccountMeta::new(tok, false),
-                    AccountMeta::new(pvlt, false),
-                    AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),
-                ],
-                data: dep,
-            },
-            &payer,
-            &[&payer, owner],
-        );
-    }
-
-    let alice_btc = create_prog_acc(&mut svm, &prog_id, POS_SIZE);
-    let bob_btc   = create_prog_acc(&mut svm, &prog_id, POS_SIZE);
-    let alice_eth = create_prog_acc(&mut svm, &prog_id, POS_SIZE);
-    let bob_eth   = create_prog_acc(&mut svm, &prog_id, POS_SIZE);
-
-    for (mkt, pos, owner) in [
-        (btc_mkt, alice_btc, &alice),
-        (btc_mkt, bob_btc, &bob),
-        (eth_mkt, alice_eth, &alice),
-        (eth_mkt, bob_eth, &bob),
-    ] {
-        send_ok(
-            &mut svm,
-            Instruction {
-                program_id: prog_id,
-                accounts: vec![
-                    AccountMeta::new(mkt, false),
-                    AccountMeta::new(pos, false),
-                    AccountMeta::new_readonly(owner.pubkey(), true),
-                ],
-                data: vec![8],
-            },
-            &payer,
-            &[&payer, owner],
-        );
-    }
-
-    // Allocate 30 USDC to Alice BTC, 12 USDC to Bob BTC, 10 USDC to Bob ETH
-    let alloc_ix = |mkt, pos, pfl, pvlt, mvlt, owner: &Keypair, amt: u64| {
-        let mut d = vec![9u8; 9];
-        d[1..9].copy_from_slice(&amt.to_le_bytes());
-        Instruction {
-            program_id: prog_id,
-            accounts: vec![
-                AccountMeta::new(mkt, false),
-                AccountMeta::new(pos, false),
-                AccountMeta::new(pfl, false),
-                AccountMeta::new_readonly(owner.pubkey(), true),
-                AccountMeta::new_readonly(mint, false),
-                AccountMeta::new(pvlt, false),
-                AccountMeta::new(mvlt, false),
-                AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),
-            ],
-            data: d,
-        }
-    };
-    let cu_alloc = send_ok(&mut svm, alloc_ix(btc_mkt, alice_btc, alice_pfl, alice_pvlt, btc_vault, &alice, 30_000_000), &payer, &[&payer, &alice]);
-    send_ok(&mut svm, alloc_ix(btc_mkt, bob_btc, bob_pfl, bob_pvlt, btc_vault, &bob, 12_000_000), &payer, &[&payer, &bob]);
-    send_ok(&mut svm, alloc_ix(eth_mkt, bob_eth, bob_pfl, bob_pvlt, eth_vault, &bob, 10_000_000), &payer, &[&payer, &bob]);
-
-    // Atomic cross-market RebalanceMargin: move 10 USDC directly BTC-PERP -> ETH-PERP for Alice!
-    let mut reb_data = vec![11u8; 9];
-    reb_data[1..9].copy_from_slice(&10_000_000u64.to_le_bytes());
-    // First test aliased market rejection (mkt1 == mkt2)
-    send_err(
-        &mut svm,
-        Instruction {
-            program_id: prog_id,
-            accounts: vec![
-                AccountMeta::new(btc_mkt, false),
-                AccountMeta::new(alice_btc, false),
-                AccountMeta::new(btc_mkt, false),
-                AccountMeta::new(alice_eth, false),
-                AccountMeta::new_readonly(alice.pubkey(), true),
-                AccountMeta::new_readonly(mint, false),
-                AccountMeta::new(btc_vault, false),
-                AccountMeta::new(eth_vault, false),
-                AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),
-            ],
-            data: reb_data.clone(),
-        },
-        &payer,
-        &[&payer, &alice],
-        "aliased RebalanceMargin",
-    );
-    let cu_rebal = send_ok(
-        &mut svm,
-        Instruction {
-            program_id: prog_id,
-            accounts: vec![
-                AccountMeta::new(btc_mkt, false),
-                AccountMeta::new(alice_btc, false),
-                AccountMeta::new(eth_mkt, false),
-                AccountMeta::new(alice_eth, false),
-                AccountMeta::new_readonly(alice.pubkey(), true),
-                AccountMeta::new_readonly(mint, false),
-                AccountMeta::new(btc_vault, false),
-                AccountMeta::new(eth_vault, false),
-                AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),
-            ],
-            data: reb_data,
-        },
-        &payer,
-        &[&payer, &alice],
-    );
-    assert_eq!(read_u64(&svm, &alice_btc, 96), 20_000_000);
-    assert_eq!(read_u64(&svm, &alice_eth, 96), 10_000_000);
-    assert_vault_conserved(&svm, &btc_mkt, &btc_vault, "after rebalance BTC");
-    assert_vault_conserved(&svm, &eth_mkt, &eth_vault, "after rebalance ETH");
-    println!("[PASS] 4. Cross-Market Alloc & Rebalance  | Alloc={} CU, Rebalance(BTC->ETH)={} CU", cu_alloc, cu_rebal);
-
-    // -------------------------------------------------------------------------
-    // 5. Bilateral Matched Trades (BTC & ETH) + Aliasing Rejection + Insurance Lock
-    // -------------------------------------------------------------------------
-    let trade_ix = |mkt, pos_l, pos_s, own_l: &Keypair, own_s: &Keypair, qty: u64, px: u64, mode: u8| {
-        let mut d = vec![0u8; 18];
-        d[0] = 14;
-        d[1..9].copy_from_slice(&qty.to_le_bytes());
-        d[9..17].copy_from_slice(&px.to_le_bytes());
-        d[17] = mode;
-        Instruction {
-            program_id: prog_id,
-            accounts: vec![
-                AccountMeta::new(mkt, false),
-                AccountMeta::new(pos_l, false),
-                AccountMeta::new(pos_s, false),
-                AccountMeta::new_readonly(own_l.pubkey(), true),
-                AccountMeta::new_readonly(own_s.pubkey(), true),
-            ],
-            data: d,
-        }
-    };
-    // Aliased self-trade on same Position account MUST reject!
-    send_err(
-        &mut svm,
-        trade_ix(btc_mkt, alice_btc, alice_btc, &alice, &alice, 1_000_000, 100_000_000, 0),
-        &payer,
-        &[&payer, &alice],
-        "aliased Trade (posLong == posShort)",
-    );
-
-    // Alice Long 1.0 BTC vs Bob Short 1.0 BTC at $100 (notional $100, IM $10, MM $5; Bob has $12!)
-    let cu_trade = send_ok(
-        &mut svm,
-        trade_ix(btc_mkt, alice_btc, bob_btc, &alice, &bob, 1_000_000, 100_000_000, 0),
-        &payer,
-        &[&payer, &alice, &bob],
-    );
-    assert_eq!(read_u64(&svm, &btc_mkt, 296), 1_000_000); // oiLong
-    assert_eq!(read_u64(&svm, &btc_mkt, 304), 1_000_000); // oiShort
-    assert_eq!(read_u64(&svm, &btc_mkt, 264), 20_200_000); // insurance grew by 2 * 0.10 USDC trade fees!
-
-    // Alice Long 1.0 ETH vs Bob Short 1.0 ETH at $50
-    send_ok(
-        &mut svm,
-        trade_ix(eth_mkt, alice_eth, bob_eth, &alice, &bob, 1_000_000, 50_000_000, 0),
-        &payer,
-        &[&payer, &alice, &bob],
-    );
-
-    // LP trying to withdraw BTC insurance while OI > 0 MUST REJECT!
-    let mut wd_ins = vec![13u8; 9];
-    wd_ins[1..9].copy_from_slice(&1_000_000u64.to_le_bytes());
-    send_err(
-        &mut svm,
-        Instruction {
-            program_id: prog_id,
-            accounts: vec![
-                AccountMeta::new(btc_mkt, false),
-                AccountMeta::new(btc_ins_rec, false),
-                AccountMeta::new_readonly(lp.pubkey(), true),
-                AccountMeta::new_readonly(mint, false),
-                AccountMeta::new(btc_vault, false),
-                AccountMeta::new(lp_tok, false),
-                AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),
-            ],
-            data: wd_ins,
-        },
-        &payer,
-        &[&payer, &lp],
-        "WithdrawInsurance while OI > 0",
-    );
-    println!("[PASS] 5. Bilateral Trade & OI Coherence  | CUs = {} (OI balanced, fees->ins, ins locked)", cu_trade);
-
-    // -------------------------------------------------------------------------
-    // 6. ADVERSARIAL: Malicious Permissionless Market 3 ("SCAM-PERP") Contagion Test!
-    // -------------------------------------------------------------------------
-    let btc_snap_before = svm.get_account(&btc_mkt).unwrap().data.clone();
-    let eth_snap_before = svm.get_account(&eth_mkt).unwrap().data.clone();
-    let alice_btc_before = svm.get_account(&alice_btc).unwrap().data.clone();
-
-    let scam_mkt = create_prog_acc(&mut svm, &prog_id, MKT_SIZE);
-    let (scam_vault, scam_bump) = create_pda_vault(&mut svm, &prog_id, b"mvlt", &scam_mkt, &mint);
-    send_ok(
-        &mut svm,
-        ix_create_market(
-            prog_id, prot, scam_mkt, mint, scam_vault, scam_oracle.pubkey(),
-            attacker.pubkey(), atk_tok, fee_vault, scam_bump, 6,
-            10_000_000, 10, 20, 5, 1000, 500, 100, 0, 400, 5000, 100_000_000_000,
-        ),
+        ix_create_market(prog_id, dex, scam_mkt, mint, scam_oracle.pubkey(), attacker.pubkey(), attacker_tok, fee_vault,
+            100 * POS_SCALE, 20, 50, 0, 1000, 500, 100, 0, 400, 2500, 1_000_000 * POS_SCALE),
         &payer,
         &[&payer, &attacker],
     );
-    // Attacker & sockpuppet trade on SCAM-PERP and pump oracle wildly (clamped steps)
-    let atk_pfl = create_prog_acc(&mut svm, &prog_id, PFL_SIZE);
-    let (atk_pvlt, atk_pbump) = create_pda_vault(&mut svm, &prog_id, b"pvlt", &atk_pfl, &mint);
-    let sock_pfl = create_prog_acc(&mut svm, &prog_id, PFL_SIZE);
-    let (sock_pvlt, sock_pbump) = create_pda_vault(&mut svm, &prog_id, b"pvlt", &sock_pfl, &mint);
-    for (pfl, bump, pvlt, own, tok) in [
-        (atk_pfl, atk_pbump, atk_pvlt, &attacker, atk_tok),
-        (sock_pfl, sock_pbump, sock_pvlt, &sockpuppet, sock_tok),
-    ] {
-        send_ok(&mut svm, Instruction {
-            program_id: prog_id,
-            accounts: vec![AccountMeta::new(pfl, false), AccountMeta::new_readonly(own.pubkey(), true), AccountMeta::new_readonly(mint, false)],
-            data: vec![5, bump, 6],
-        }, &payer, &[&payer, own]);
-        let mut d = vec![6u8; 9]; d[1..9].copy_from_slice(&5_000_000u64.to_le_bytes());
-        send_ok(&mut svm, Instruction {
-            program_id: prog_id,
-            accounts: vec![
-                AccountMeta::new(pfl, false), AccountMeta::new_readonly(own.pubkey(), true),
-                AccountMeta::new_readonly(mint, false), AccountMeta::new(tok, false),
-                AccountMeta::new(pvlt, false), AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),
-            ],
-            data: d,
-        }, &payer, &[&payer, own]);
-    }
-    let atk_pos = create_prog_acc(&mut svm, &prog_id, POS_SIZE);
-    let sock_pos = create_prog_acc(&mut svm, &prog_id, POS_SIZE);
-    for (pos, own) in [(atk_pos, &attacker), (sock_pos, &sockpuppet)] {
-        send_ok(&mut svm, Instruction {
-            program_id: prog_id,
-            accounts: vec![AccountMeta::new(scam_mkt, false), AccountMeta::new(pos, false), AccountMeta::new_readonly(own.pubkey(), true)],
-            data: vec![8],
-        }, &payer, &[&payer, own]);
-    }
-    send_ok(&mut svm, alloc_ix(scam_mkt, atk_pos, atk_pfl, atk_pvlt, scam_vault, &attacker, 2_000_000), &payer, &[&payer, &attacker]);
-    send_ok(&mut svm, alloc_ix(scam_mkt, sock_pos, sock_pfl, sock_pvlt, scam_vault, &sockpuppet, 2_000_000), &payer, &[&payer, &sockpuppet]);
-    send_ok(&mut svm, trade_ix(scam_mkt, atk_pos, sock_pos, &attacker, &sockpuppet, 1_000_000, 10_000_000, 0), &payer, &[&payer, &attacker, &sockpuppet]);
+    assert_eq!(token_amount(&svm, &fee_vault), 3_000_000);
 
-    // Pump scam oracle 5 steps -> sockpuppet goes totally bankrupt!
-    let mut px = 10_000_000u64;
-    for _ in 0..5 {
-        px = px + (px * 400) / 10_000;
-        let mut od = vec![0u8; 18];
-        od[0] = 4; od[1..9].copy_from_slice(&px.to_le_bytes());
-        send_ok(&mut svm, Instruction {
-            program_id: prog_id,
-            accounts: vec![AccountMeta::new(scam_mkt, false), AccountMeta::new_readonly(scam_oracle.pubkey(), true)],
-            data: od,
-        }, &payer, &[&payer, &scam_oracle]);
-    }
-    // Liquidate bankrupt sockpuppet on SCAM-PERP!
-    send_ok(&mut svm, Instruction {
-        program_id: prog_id,
-        accounts: vec![
-            AccountMeta::new(scam_mkt, false), AccountMeta::new(sock_pos, false),
-            AccountMeta::new(keep_tok, false), AccountMeta::new_readonly(mint, false),
-            AccountMeta::new(scam_vault, false), AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),
-            AccountMeta::new_readonly(keeper.pubkey(), true),
+    // UpdateCreateFee affects ZERO markets/portfolios
+    send_ok(&mut svm, ix_update_create_fee(prog_id, dex, dex_admin.pubkey(), 0), &payer, &[&payer, &dex_admin]);
+
+    // Deposit isolated insurance to BTC ($1000), ETH ($500), SCAM ($100)
+    let btc_ins = create_prog_acc(&mut svm, &prog_id, INS_SIZE);
+    let eth_ins = create_prog_acc(&mut svm, &prog_id, INS_SIZE);
+    let scam_ins = create_prog_acc(&mut svm, &prog_id, INS_SIZE);
+    send_ok(&mut svm, ix_deposit_insurance(prog_id, dex, btc_mkt, btc_ins, lp.pubkey(), lp_tok, mint, dex_vault, TOKEN_PROGRAM_ID, 1_000 * POS_SCALE), &payer, &[&payer, &lp]);
+    send_ok(&mut svm, ix_deposit_insurance(prog_id, dex, eth_mkt, eth_ins, lp.pubkey(), lp_tok, mint, dex_vault, TOKEN_PROGRAM_ID, 500 * POS_SCALE), &payer, &[&payer, &lp]);
+    send_ok(&mut svm, ix_deposit_insurance(prog_id, dex, scam_mkt, scam_ins, lp.pubkey(), lp_tok, mint, dex_vault, TOKEN_PROGRAM_ID, 100 * POS_SCALE), &payer, &[&payer, &lp]);
+
+    let all_mkts = vec![btc_mkt, eth_mkt, scam_mkt];
+    assert_dex_invariants(&svm, &dex, &dex_vault, &all_mkts, &[], "post-markets");
+    println!("[PASS] Suite 2: Multi-Market Creation + Solvency Envelope + Isolated Insurance ({} CU)", cu_create_mkt);
+
+    // =========================================================================
+    // SUITE 3: Hyperliquid Cross-Margin Capital Efficiency (Hedged Spread!)
+    //   Alice puts up $100 shared capital, opens Long $500 BTC + Short $500 ETH
+    //   (10x gross leverage, IM = $50 + $50 = $100).
+    //   Both BTC & ETH drop ~7.84% over 2 slots -> atomic [RefreshLeg(ETH), RefreshLeg(BTC)]
+    //   nets +$39.20 ETH profit directly against -$39.20 BTC loss -> $100 capital, 0 liquidation!
+    // =========================================================================
+    let alice_pfl = create_prog_acc(&mut svm, &prog_id, PFL_SIZE);
+    let bob_pfl = create_prog_acc(&mut svm, &prog_id, PFL_SIZE);
+    let attacker_pfl = create_prog_acc(&mut svm, &prog_id, PFL_SIZE);
+    send_ok(&mut svm, ix_init_portfolio(prog_id, dex, alice_pfl, alice.pubkey()), &payer, &[&payer, &alice]);
+    send_ok(&mut svm, ix_init_portfolio(prog_id, dex, bob_pfl, bob.pubkey()), &payer, &[&payer, &bob]);
+    send_ok(&mut svm, ix_init_portfolio(prog_id, dex, attacker_pfl, attacker.pubkey()), &payer, &[&payer, &attacker]);
+    let all_pfls = vec![alice_pfl, bob_pfl, attacker_pfl];
+
+    let cu_dep = send_ok(&mut svm, ix_deposit_collateral(prog_id, dex, alice_pfl, alice.pubkey(), alice_tok, mint, dex_vault, TOKEN_PROGRAM_ID, 100 * POS_SCALE), &payer, &[&payer, &alice]);
+    send_ok(&mut svm, ix_deposit_collateral(prog_id, dex, bob_pfl, bob.pubkey(), bob_tok, mint, dex_vault, TOKEN_PROGRAM_ID, 1_000 * POS_SCALE), &payer, &[&payer, &bob]);
+    send_ok(&mut svm, ix_deposit_collateral(prog_id, dex, attacker_pfl, attacker.pubkey(), attacker_tok, mint, dex_vault, TOKEN_PROGRAM_ID, 500 * POS_SCALE), &payer, &[&payer, &attacker]);
+
+    // Alice opens Long 5 BTC ($500) + Short 5 ETH ($500) on $100 capital!
+    let cu_trade = send_ok(&mut svm, ix_trade(prog_id, dex, btc_mkt, alice_pfl, alice.pubkey(), bob_pfl, bob.pubkey(), 0, 5 * POS_SCALE), &payer, &[&payer, &alice, &bob]);
+    send_ok(&mut svm, ix_trade(prog_id, dex, eth_mkt, bob_pfl, bob.pubkey(), alice_pfl, alice.pubkey(), 0, 5 * POS_SCALE), &payer, &[&payer, &bob, &alice]);
+    assert_eq!(read_u64(&svm, &alice_pfl, 88), 100 * POS_SCALE);
+    assert_eq!(read_u64(&svm, &alice_pfl, 104), 100 * POS_SCALE); // totalIm == $100!
+    assert_eq!(read_u64(&svm, &alice_pfl, 96), 50 * POS_SCALE);   // totalMm == $50!
+    assert_dex_invariants(&svm, &dex, &dex_vault, &all_mkts, &all_pfls, "post-spread-open");
+
+    // Slot 101: Both BTC and ETH drop 4% ($100 -> $96)
+    set_slot(&mut svm, 101);
+    let cu_oracle = send_ok(&mut svm, ix_update_oracle(prog_id, btc_mkt, btc_oracle.pubkey(), 96 * POS_SCALE, 0, 0), &payer, &[&payer, &btc_oracle]);
+    send_ok(&mut svm, ix_update_oracle(prog_id, eth_mkt, eth_oracle.pubkey(), 96 * POS_SCALE, 0, 0), &payer, &[&payer, &eth_oracle]);
+    // Bob (ETH loser) refreshes ETH -> credits R_ETH += $20
+    let cu_refresh = send_ok(&mut svm, ix_refresh_leg(prog_id, dex, eth_mkt, bob_pfl, false), &payer, &[&payer]);
+    // Alice atomically runs [RefreshLeg(ETH), RefreshLeg(BTC)] in ONE tx!
+    send_ixs_ok(
+        &mut svm,
+        &[
+            ix_refresh_leg(prog_id, dex, eth_mkt, alice_pfl, false),
+            ix_refresh_leg(prog_id, dex, btc_mkt, alice_pfl, false),
         ],
-        data: vec![16],
-    }, &payer, &[&payer, &keeper]);
+        &payer,
+        &[&payer],
+    );
+    assert_eq!(read_u64(&svm, &alice_pfl, 88), 100 * POS_SCALE, "Alice hedged spread capital must remain EXACTLY $100!");
+    send_err(&mut svm, ix_liquidate(prog_id, dex, btc_mkt, alice_pfl, keeper_tok, mint, dex_vault, TOKEN_PROGRAM_ID), &payer, &[&payer], "Healthy hedged Alice cannot be liquidated");
 
-    // ASSERT ABSOLUTE ZERO CONTAGION ON BTC-PERP & ETH-PERP!
-    assert_eq!(svm.get_account(&btc_mkt).unwrap().data, btc_snap_before, "BTC market mutated by SCAM-PERP!");
-    assert_eq!(svm.get_account(&eth_mkt).unwrap().data, eth_snap_before, "ETH market mutated by SCAM-PERP!");
-    assert_eq!(svm.get_account(&alice_btc).unwrap().data, alice_btc_before, "Alice BTC mutated by SCAM-PERP!");
-    assert_vault_conserved(&svm, &scam_mkt, &scam_vault, "SCAM-PERP conserved even after bankruptcy");
-    println!("[PASS] 6. Zero Cross-Market Contagion     | SCAM-PERP bankruptcy left BTC/ETH/Alice byte-identical!");
+    // Slot 102: Both BTC and ETH drop another 4% ($96 -> $92.16)
+    set_slot(&mut svm, 102);
+    send_ok(&mut svm, ix_update_oracle(prog_id, btc_mkt, btc_oracle.pubkey(), 92_160_000, 0, 0), &payer, &[&payer, &btc_oracle]);
+    send_ok(&mut svm, ix_update_oracle(prog_id, eth_mkt, eth_oracle.pubkey(), 92_160_000, 0, 0), &payer, &[&payer, &eth_oracle]);
+    send_ok(&mut svm, ix_refresh_leg(prog_id, dex, eth_mkt, bob_pfl, false), &payer, &[&payer]);
+    send_ixs_ok(
+        &mut svm,
+        &[
+            ix_refresh_leg(prog_id, dex, eth_mkt, alice_pfl, false),
+            ix_refresh_leg(prog_id, dex, btc_mkt, alice_pfl, false),
+        ],
+        &payer,
+        &[&payer],
+    );
+    assert_eq!(read_u64(&svm, &alice_pfl, 88), 100 * POS_SCALE, "Alice hedged spread survives 7.84% drop with $100 capital!");
 
-    // -------------------------------------------------------------------------
-    // 7. Oracle Clamp + 2-Bucket PnL Warmup + Permissionless Liquidation + ADL
-    // -------------------------------------------------------------------------
-    let upd_oracle = |mkt, auth: &Keypair, new_px: u64, fsign: u8, fe6: u64| {
-        let mut od = vec![0u8; 18];
-        od[0] = 4;
-        od[1..9].copy_from_slice(&new_px.to_le_bytes());
-        od[9] = fsign;
-        od[10..18].copy_from_slice(&fe6.to_le_bytes());
-        Instruction {
-            program_id: prog_id,
-            accounts: vec![AccountMeta::new(mkt, false), AccountMeta::new_readonly(auth.pubkey(), true)],
-            data: od,
-        }
-    };
-    // Unclamped jump $100 -> $110 (+10% > 4% maxMoveBps) MUST REJECT!
-    send_err(&mut svm, upd_oracle(btc_mkt, &btc_oracle, 110_000_000, 0, 0), &payer, &[&payer, &btc_oracle], "unclamped oracle jump");
-
-    // Step 1: $100 -> $104 (+4%, clamped OK!) -> Bob still has $7.90 >= $5.20 MM -> Liquidate MUST REJECT!
-    let cu_oracle = send_ok(&mut svm, upd_oracle(btc_mkt, &btc_oracle, 104_000_000, 0, 0), &payer, &[&payer, &btc_oracle]);
+    // Verify same-slot freshness on WithdrawCollateral!
+    set_slot(&mut svm, 103);
     send_err(
         &mut svm,
-        Instruction {
-            program_id: prog_id,
-            accounts: vec![
-                AccountMeta::new(btc_mkt, false), AccountMeta::new(bob_btc, false),
-                AccountMeta::new(keep_tok, false), AccountMeta::new_readonly(mint, false),
-                AccountMeta::new(btc_vault, false), AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),
-                AccountMeta::new_readonly(keeper.pubkey(), true),
-            ],
-            data: vec![16],
-        },
+        ix_withdraw_collateral(prog_id, dex, alice_pfl, alice.pubkey(), alice_tok, mint, dex_vault, TOKEN_PROGRAM_ID, 5 * POS_SCALE),
         &payer,
-        &[&payer, &keeper],
-        "liquidating healthy position after 1 clamped step",
+        &[&payer, &alice],
+        "WithdrawCollateral with stale legs must fail",
+    );
+    // Atomic [RefreshLeg(BTC), RefreshLeg(ETH), WithdrawCollateral($5)] SUCCEEDS!
+    let cu_wdr = send_ixs_ok(
+        &mut svm,
+        &[
+            ix_refresh_leg(prog_id, dex, btc_mkt, alice_pfl, false),
+            ix_refresh_leg(prog_id, dex, eth_mkt, alice_pfl, false),
+            ix_withdraw_collateral(prog_id, dex, alice_pfl, alice.pubkey(), alice_tok, mint, dex_vault, TOKEN_PROGRAM_ID, 5 * POS_SCALE),
+        ],
+        &payer,
+        &[&payer, &alice],
+    );
+    assert_eq!(read_u64(&svm, &alice_pfl, 88), 95 * POS_SCALE);
+    assert_dex_invariants(&svm, &dex, &dex_vault, &all_mkts, &all_pfls, "post-hyperliquid-spread");
+    println!(
+        "[PASS] Suite 3: Hyperliquid Hedged Spread + Same-Slot Freshness (dep={} CU, trade={} CU, oracle={} CU, refresh={} CU, atomic-wdr={} CU)",
+        cu_dep, cu_trade, cu_oracle, cu_refresh, cu_wdr
     );
 
-    // Step 2: $104 -> $108 (+3.84% <= 4%) -> Bob equity drops to ~$3.90 < $5.40 MM -> Liquidate SUCCEEDS with 0 bad debt!
-    send_ok(&mut svm, upd_oracle(btc_mkt, &btc_oracle, 108_000_000, 0, 0), &payer, &[&payer, &btc_oracle]);
-    let ins_before_liq = read_u64(&svm, &btc_mkt, 264);
+    // =========================================================================
+    // SUITE 4: Anti-Reverse-Contagion + Fake-PnL Isolation!
+    //   Alice closes ETH, adds $15 so capital = $110, holds Long 5 BTC (MM=$23.04)
+    //   and opens Short 2 SCAM ($200 notional, MM=$10, IM=$20) vs Attacker.
+    //   Attacker pumps SCAM +4% for 15 consecutive slots ($100 -> $180+)!
+    //   Keeper liquidates Alice's SCAM leg:
+    //   - SCAM loss + liqFee NEVER touches Alice's BTC MM ($23.04)!
+    //   - After SCAM liquidation, Alice's BTC leg is STILL 100% HEALTHY!
+    //   - I_BTC and I_ETH are BIT-FOR-BIT UNCHANGED!
+    // =========================================================================
+    // Close Alice's ETH leg cleanly so Alice has Long 5 BTC only
+    send_ok(&mut svm, ix_trade(prog_id, dex, eth_mkt, bob_pfl, bob.pubkey(), alice_pfl, alice.pubkey(), 1, 5 * POS_SCALE), &payer, &[&payer, &bob, &alice]);
+    // Also refresh Bob's BTC leg so Bob collects his BTC profit cleanly
+    send_ok(&mut svm, ix_refresh_leg(prog_id, dex, btc_mkt, bob_pfl, false), &payer, &[&payer]);
+    // Alice opens Short 2 SCAM ($200) against Attacker (Long 2 SCAM)
+    send_ok(&mut svm, ix_trade(prog_id, dex, scam_mkt, attacker_pfl, attacker.pubkey(), alice_pfl, alice.pubkey(), 0, 2 * POS_SCALE), &payer, &[&payer, &attacker, &alice]);
+
+    let btc_ins_before = read_u64(&svm, &btc_mkt, 224);
+    let eth_ins_before = read_u64(&svm, &eth_mkt, 224);
+    let alice_btc_mm = read_u64(&svm, &alice_pfl, LEG_HEADER + 72); // slot 0 = BTC leg!
+    assert!(alice_btc_mm >= 23_000_000, "Alice BTC MM expected ~$23.04, got {}", alice_btc_mm);
+
+    // Attacker pumps SCAM +4% per slot for 15 slots ($100 -> ~$180.09, loss ~$160 > Alice's $95 capital!)
+    let mut scam_p = 100 * POS_SCALE;
+    for step in 1..=15 {
+        set_slot(&mut svm, 103 + step);
+        scam_p = (scam_p * 104) / 100;
+        send_ok(&mut svm, ix_update_oracle(prog_id, scam_mkt, scam_oracle.pubkey(), scam_p, 0, 0), &payer, &[&payer, &scam_oracle]);
+    }
+    // Keeper liquidates Alice's blown-up SCAM leg!
     let cu_liq = send_ok(
         &mut svm,
-        Instruction {
-            program_id: prog_id,
-            accounts: vec![
-                AccountMeta::new(btc_mkt, false), AccountMeta::new(bob_btc, false),
-                AccountMeta::new(keep_tok, false), AccountMeta::new_readonly(mint, false),
-                AccountMeta::new(btc_vault, false), AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),
-                AccountMeta::new_readonly(keeper.pubkey(), true),
-            ],
-            data: vec![16],
-        },
+        ix_liquidate(prog_id, dex, scam_mkt, alice_pfl, keeper_tok, mint, dex_vault, TOKEN_PROGRAM_ID),
         &payer,
-        &[&payer, &keeper],
+        &[&payer],
     );
-    // Solvency envelope verified: ZERO bad debt, ZERO insurance spent!
-    assert_eq!(read_u64(&svm, &btc_mkt, 264), ins_before_liq, "Insurance should not be touched on solvent liquidation!");
-    assert_eq!(read_u64(&svm, &btc_mkt, 296), 0); // oiLong == 0
-    assert_eq!(read_u64(&svm, &btc_mkt, 304), 0); // oiShort == 0
-    assert!(token_amount(&svm, &keep_tok) > 0, "Keeper should receive bounded liq fee");
-    assert_vault_conserved(&svm, &btc_mkt, &btc_vault, "after BTC liquidation");
-
-    // 2-Bucket Warmup Anti-Flash Check on Alice's +$8 BTC profit:
-    // At slot 100 (epoch 10), Alice settles -> profit enters pnlCurr, NOT pnlMature!
-    let alice_cap_before = read_u64(&svm, &alice_btc, 96);
-    let cu_settle = send_ok(
-        &mut svm,
-        Instruction {
-            program_id: prog_id,
-            accounts: vec![
-                AccountMeta::new(btc_mkt, false),
-                AccountMeta::new(alice_btc, false),
-                AccountMeta::new_readonly(alice.pubkey(), true),
-            ],
-            data: vec![15],
-        },
-        &payer,
-        &[&payer, &alice],
+    let alice_cap_after = read_u64(&svm, &alice_pfl, 88);
+    let alice_mm_after = read_u64(&svm, &alice_pfl, 96);
+    assert!(
+        alice_cap_after >= alice_btc_mm && alice_cap_after >= alice_mm_after,
+        "ANTI-REVERSE-CONTAGION VIOLATED: Alice capital ({}) < BTC MM ({})!",
+        alice_cap_after, alice_mm_after
     );
-    assert_eq!(read_u64(&svm, &alice_btc, 96), alice_cap_before, "Flash realization in same epoch must NOT credit capital!");
-    assert_eq!(read_u64(&svm, &alice_btc, 136), 8_000_000, "Profit must sit in pnlCurr");
+    assert_eq!(read_u64(&svm, &btc_mkt, 224), btc_ins_before, "I_BTC must be bit-for-bit untouched!");
+    assert_eq!(read_u64(&svm, &eth_mkt, 224), eth_ins_before, "I_ETH must be bit-for-bit untouched!");
 
-    // Advance Clock to slot 120 (epoch 12 = e0 + 2): now Alice's +$8 matures & realizes into senior capital!
+    // Verify Alice's BTC leg is STILL healthy and cannot be liquidated!
+    set_slot(&mut svm, 119);
+    send_ok(&mut svm, ix_update_oracle(prog_id, btc_mkt, btc_oracle.pubkey(), 92_160_000, 0, 0), &payer, &[&payer, &btc_oracle]);
+    send_err(&mut svm, ix_liquidate(prog_id, dex, btc_mkt, alice_pfl, keeper_tok, mint, dex_vault, TOKEN_PROGRAM_ID), &payer, &[&payer], "Alice BTC leg must survive SCAM explosion!");
+
+    // Attacker tries to claim fake paper profits on SCAM via ClearDeadLeg + RefreshLeg(forceHaircut=true)
+    // Attacker's extraction is strictly bounded by R_SCAM (Alice's seized SCAM margin + capped 25% of I_SCAM)!
+    let scam_r_before = read_u64(&svm, &scam_mkt, 216);
+    let attacker_cap_before = read_u64(&svm, &attacker_pfl, 88);
+    send_ok(&mut svm, ix_clear_dead_leg(prog_id, dex, scam_mkt, attacker_pfl), &payer, &[&payer]);
+    send_ok(&mut svm, ix_refresh_leg(prog_id, dex, scam_mkt, attacker_pfl, true), &payer, &[&payer]);
+    let attacker_gain = read_u64(&svm, &attacker_pfl, 88) - attacker_cap_before;
+    assert!(attacker_gain <= scam_r_before, "Attacker extracted {} > R_SCAM ({})!", attacker_gain, scam_r_before);
+    assert_eq!(read_u64(&svm, &btc_mkt, 224), btc_ins_before, "I_BTC still untouched after Attacker claim!");
+    assert_dex_invariants(&svm, &dex, &dex_vault, &all_mkts, &all_pfls, "post-scam-containment");
+    println!(
+        "[PASS] Suite 4: Anti-Reverse-Contagion + Fake-PnL Containment (liq={} CU, Alice survived with cap={} >= BTC_MM={}, Attacker capped at {} <= R_SCAM={})",
+        cu_liq, alice_cap_after, alice_mm_after, attacker_gain, scam_r_before
+    );
+
+    // =========================================================================
+    // SUITE 5: Security Regression Tests (All 5 Hardened Attack Vectors)
+    // =========================================================================
+    // 5a. Same-slot UpdateOracle spam rejected (slot 119 already updated BTC!)
+    send_err(&mut svm, ix_update_oracle(prog_id, btc_mkt, btc_oracle.pubkey(), 93_000_000, 0, 0), &payer, &[&payer, &btc_oracle], "Same-slot UpdateOracle spam");
+    // 5b. Unclamped oracle jump rejected (+10% > 4%)
     set_slot(&mut svm, 120);
-    let cu_realize = send_ok(
-        &mut svm,
-        Instruction {
-            program_id: prog_id,
-            accounts: vec![
-                AccountMeta::new(btc_mkt, false),
-                AccountMeta::new(alice_btc, false),
-                AccountMeta::new_readonly(alice.pubkey(), true),
-            ],
-            data: vec![15],
-        },
-        &payer,
-        &[&payer, &alice],
-    );
-    assert_eq!(read_u64(&svm, &alice_btc, 96), alice_cap_before + 8_000_000, "Mature PnL realized 1:1 from Bob's loss!");
-    assert_vault_conserved(&svm, &btc_mkt, &btc_vault, "after Alice PnL realization");
-    println!("[PASS] 7. Oracle/Liq/Warmup/Haircut       | Oracle={} CU, Liq={} CU, Settle={} CU, Realize={} CU (0 ins spent!)", cu_oracle, cu_liq, cu_settle, cu_realize);
+    send_err(&mut svm, ix_update_oracle(prog_id, btc_mkt, btc_oracle.pubkey(), 102_000_000, 0, 0), &payer, &[&payer, &btc_oracle], "Unclamped oracle jump");
+    // 5c. Fake TokenProg rejected on Deposit/Withdraw/Insurance/Liquidate
+    send_err(&mut svm, ix_deposit_collateral(prog_id, dex, alice_pfl, alice.pubkey(), alice_tok, mint, dex_vault, fake_tok_prog, 1000), &payer, &[&payer, &alice], "Deposit with fake tokenProg");
+    send_err(&mut svm, ix_withdraw_collateral(prog_id, dex, bob_pfl, bob.pubkey(), bob_tok, mint, dex_vault, fake_tok_prog, 1000), &payer, &[&payer, &bob], "Withdraw with fake tokenProg");
+    send_err(&mut svm, ix_deposit_insurance(prog_id, dex, btc_mkt, btc_ins, lp.pubkey(), lp_tok, mint, dex_vault, fake_tok_prog, 1000), &payer, &[&payer, &lp], "DepositInsurance with fake tokenProg");
+    send_err(&mut svm, ix_withdraw_insurance(prog_id, dex, btc_mkt, btc_ins, lp.pubkey(), lp_tok, mint, dex_vault, fake_tok_prog, 1000), &payer, &[&payer, &lp], "WithdrawInsurance with fake tokenProg");
+    // 5d. Aliased Trade rejected
+    send_err(&mut svm, ix_trade(prog_id, dex, eth_mkt, bob_pfl, bob.pubkey(), bob_pfl, bob.pubkey(), 0, POS_SCALE), &payer, &[&payer, &bob], "Aliased Trade");
+    // 5e. WithdrawInsurance while OI > 0 rejected (BTC still has 5 OI!)
+    send_err(&mut svm, ix_withdraw_insurance(prog_id, dex, btc_mkt, btc_ins, lp.pubkey(), lp_tok, mint, dex_vault, TOKEN_PROGRAM_ID, 1000), &payer, &[&payer, &lp], "WithdrawInsurance with OI > 0");
+    println!("[PASS] Suite 5: All 5 Runtime Security Regression Tests Rejected Cleanly!");
 
-    // -------------------------------------------------------------------------
-    // 8. Admin Burn + Stale-Oracle Permissionless WindDown + Exit Window + ForceClose + Resolve + Tombstone
-    // -------------------------------------------------------------------------
-    // Burn ETH market admin (Bob) -> permanently adminless!
+    // =========================================================================
+    // SUITE 6: Post-ADL ClearDeadLeg + Full WindDown -> ForceClosePair ->
+    //          ResolveMarket -> ClaimResolved -> WithdrawInsurance -> Tombstone!
+    // =========================================================================
+    let adl_mkt = create_prog_acc(&mut svm, &prog_id, MKT_SIZE);
+    let adl_ins = create_prog_acc(&mut svm, &prog_id, INS_SIZE);
     send_ok(
         &mut svm,
-        Instruction {
-            program_id: prog_id,
-            accounts: vec![
-                AccountMeta::new(eth_mkt, false),
-                AccountMeta::new_readonly(bob.pubkey(), true),
-            ],
-            data: vec![3],
-        },
-        &payer,
-        &[&payer, &bob],
-    );
-    // Old admin trying to StartWindDown while oracle is fresh (slot 120 < 100 + 50) MUST REJECT!
-    send_err(
-        &mut svm,
-        Instruction {
-            program_id: prog_id,
-            accounts: vec![
-                AccountMeta::new(eth_mkt, false),
-                AccountMeta::new_readonly(bob.pubkey(), true),
-            ],
-            data: vec![17],
-        },
-        &payer,
-        &[&payer, &bob],
-        "burned admin StartWindDown on fresh oracle",
-    );
-
-    // Advance Clock past maxStaleness (100 + 50 = 150 -> slot 160): ANYONE (keeper) can StartWindDown!
-    set_slot(&mut svm, 160);
-    send_ok(
-        &mut svm,
-        Instruction {
-            program_id: prog_id,
-            accounts: vec![
-                AccountMeta::new(eth_mkt, false),
-                AccountMeta::new_readonly(keeper.pubkey(), true),
-            ],
-            data: vec![17],
-        },
-        &payer,
-        &[&payer, &keeper],
-    );
-
-    // ForceClosePair BEFORE exitWindow (160 + 20 = 180) MUST REJECT (anti-admin-rug)!
-    send_err(
-        &mut svm,
-        Instruction {
-            program_id: prog_id,
-            accounts: vec![
-                AccountMeta::new(eth_mkt, false),
-                AccountMeta::new(alice_eth, false),
-                AccountMeta::new(bob_eth, false),
-            ],
-            data: vec![18],
-        },
-        &payer,
-        &[&payer],
-        "ForceClosePair before exitWindow",
-    );
-
-    // Advance Clock past exitWindow (slot 185): permissionless ForceClosePair defeats close-griefing DoS!
-    set_slot(&mut svm, 185);
-    let cu_fc = send_ok(
-        &mut svm,
-        Instruction {
-            program_id: prog_id,
-            accounts: vec![
-                AccountMeta::new(eth_mkt, false),
-                AccountMeta::new(alice_eth, false),
-                AccountMeta::new(bob_eth, false),
-            ],
-            data: vec![18],
-        },
-        &payer,
-        &[&payer],
-    );
-    assert_eq!(read_u64(&svm, &eth_mkt, 296), 0);
-    assert_eq!(read_u64(&svm, &eth_mkt, 304), 0);
-
-    // Permissionless ResolveMarket freezes order-independent snapshot!
-    let cu_res = send_ok(
-        &mut svm,
-        Instruction {
-            program_id: prog_id,
-            accounts: vec![AccountMeta::new(eth_mkt, false)],
-            data: vec![19],
-        },
-        &payer,
-        &[&payer],
-    );
-
-    // ClaimResolved for Alice & Bob (even permissionlessly delivered to owner's own token account!)
-    let claim_ix = |pos, own_tok| Instruction {
-        program_id: prog_id,
-        accounts: vec![
-            AccountMeta::new(eth_mkt, false),
-            AccountMeta::new(pos, false),
-            AccountMeta::new(own_tok, false),
-            AccountMeta::new_readonly(mint, false),
-            AccountMeta::new(eth_vault, false),
-            AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),
-            AccountMeta::new_readonly(keeper.pubkey(), true),
-        ],
-        data: vec![20],
-    };
-    let cu_claim = send_ok(&mut svm, claim_ix(alice_eth, alice_tok), &payer, &[&payer, &keeper]);
-    send_ok(&mut svm, claim_ix(bob_eth, bob_tok), &payer, &[&payer, &keeper]);
-    // Double-claim MUST REJECT!
-    send_err(&mut svm, claim_ix(alice_eth, alice_tok), &payer, &[&payer, &keeper], "double ClaimResolved");
-
-    // Now OI == 0 -> LP withdraws full ETH insurance (plus earned trade fees!)
-    let eth_lp_shares = read_u64(&svm, &eth_ins_rec, 80);
-    let mut wd_eth_ins = vec![13u8; 9];
-    wd_eth_ins[1..9].copy_from_slice(&eth_lp_shares.to_le_bytes());
-    let cu_wd_ins = send_ok(
-        &mut svm,
-        Instruction {
-            program_id: prog_id,
-            accounts: vec![
-                AccountMeta::new(eth_mkt, false),
-                AccountMeta::new(eth_ins_rec, false),
-                AccountMeta::new_readonly(lp.pubkey(), true),
-                AccountMeta::new_readonly(mint, false),
-                AccountMeta::new(eth_vault, false),
-                AccountMeta::new(lp_tok, false),
-                AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),
-            ],
-            data: wd_eth_ins,
-        },
+        ix_create_market(prog_id, dex, adl_mkt, mint, adl_oracle.pubkey(), lp.pubkey(), lp_tok, fee_vault,
+            100 * POS_SCALE, 10, 20, 0, 1000, 500, 100, 0, 400, 2500, 1_000_000 * POS_SCALE),
         &payer,
         &[&payer, &lp],
     );
+    send_ok(&mut svm, ix_deposit_insurance(prog_id, dex, adl_mkt, adl_ins, lp.pubkey(), lp_tok, mint, dex_vault, TOKEN_PROGRAM_ID, 200 * POS_SCALE), &payer, &[&payer, &lp]);
 
-    // Permanent TombstoneMarket (INV-16: no ABA reuse!)
-    send_ok(
-        &mut svm,
-        Instruction {
-            program_id: prog_id,
-            accounts: vec![AccountMeta::new(eth_mkt, false)],
-            data: vec![21],
-        },
-        &payer,
-        &[&payer],
-    );
-    assert_eq!(read_u8(&svm, &eth_mkt, 4), 3); // STATUS_TOMBSTONED
-    // Attempt to open position on tombstoned market MUST REJECT!
-    let dummy_pos = create_prog_acc(&mut svm, &prog_id, POS_SIZE);
-    send_err(
-        &mut svm,
-        Instruction {
-            program_id: prog_id,
-            accounts: vec![
-                AccountMeta::new(eth_mkt, false),
-                AccountMeta::new(dummy_pos, false),
-                AccountMeta::new_readonly(alice.pubkey(), true),
-            ],
-            data: vec![8],
-        },
-        &payer,
-        &[&payer, &alice],
-        "OpenPosition on tombstoned market",
-    );
-    assert_vault_conserved(&svm, &eth_mkt, &eth_vault, "after ETH tombstone");
+    let t1 = Keypair::new();
+    let t2 = Keypair::new();
+    svm.airdrop(&t1.pubkey(), 10_000_000_000).unwrap();
+    svm.airdrop(&t2.pubkey(), 10_000_000_000).unwrap();
+    let t1_tok = create_tok_acc(&mut svm, &mint, &t1.pubkey(), 1_000 * POS_SCALE);
+    let t2_tok = create_tok_acc(&mut svm, &mint, &t2.pubkey(), 1_000 * POS_SCALE);
+    let t1_pfl = create_prog_acc(&mut svm, &prog_id, PFL_SIZE);
+    let t2_pfl = create_prog_acc(&mut svm, &prog_id, PFL_SIZE);
+    send_ok(&mut svm, ix_init_portfolio(prog_id, dex, t1_pfl, t1.pubkey()), &payer, &[&payer, &t1]);
+    send_ok(&mut svm, ix_init_portfolio(prog_id, dex, t2_pfl, t2.pubkey()), &payer, &[&payer, &t2]);
+    send_ok(&mut svm, ix_deposit_collateral(prog_id, dex, t1_pfl, t1.pubkey(), t1_tok, mint, dex_vault, TOKEN_PROGRAM_ID, 15 * POS_SCALE), &payer, &[&payer, &t1]);
+    send_ok(&mut svm, ix_deposit_collateral(prog_id, dex, t2_pfl, t2.pubkey(), t2_tok, mint, dex_vault, TOKEN_PROGRAM_ID, 500 * POS_SCALE), &payer, &[&payer, &t2]);
+
+    // T1 (Long 1 @ $100, cap=$15) vs T2 (Short 1 @ $100)
+    send_ok(&mut svm, ix_trade(prog_id, dex, adl_mkt, t1_pfl, t1.pubkey(), t2_pfl, t2.pubkey(), 0, POS_SCALE), &payer, &[&payer, &t1, &t2]);
+    // Crash price over 4 slots so T1 drops below MM and gets liquidated!
+    let mut ap = 100 * POS_SCALE;
+    for step in 1..=4 {
+        set_slot(&mut svm, 120 + step);
+        ap = (ap * 96) / 100;
+        send_ok(&mut svm, ix_update_oracle(prog_id, adl_mkt, adl_oracle.pubkey(), ap, 0, 0), &payer, &[&payer, &adl_oracle]);
+    }
+    send_ok(&mut svm, ix_liquidate(prog_id, dex, adl_mkt, t1_pfl, keeper_tok, mint, dex_vault, TOKEN_PROGRAM_ID), &payer, &[&payer]);
+    assert_eq!(read_u64(&svm, &adl_mkt, 256), 0); // oiLong == 0
+    assert_eq!(read_u64(&svm, &adl_mkt, 280), POS_SCALE); // rawBasisShort == 1.0 (dead leg!)
+    // WithdrawInsurance MUST fail while dead leg rawBasis > 0!
+    send_err(&mut svm, ix_withdraw_insurance(prog_id, dex, adl_mkt, adl_ins, lp.pubkey(), lp_tok, mint, dex_vault, TOKEN_PROGRAM_ID, 200 * POS_SCALE), &payer, &[&payer, &lp], "WithdrawInsurance while dead rawBasis > 0");
+    // ClearDeadLeg resets rawBasisShort -> 0 AND adlShort -> ADL_ONE!
+    let cu_clear = send_ok(&mut svm, ix_clear_dead_leg(prog_id, dex, adl_mkt, t2_pfl), &payer, &[&payer]);
+    assert_eq!(read_u64(&svm, &adl_mkt, 280), 0);
+    assert_eq!(read_u64(&svm, &adl_mkt, 296), ADL_ONE);
+
+    // Market recovered! Re-open a fresh pair (T1 adds collateral, opens Long 1 vs T2 Short 1),
+    // then burn admin, go stale -> permissionless WindDown -> ForceClosePair -> Resolve -> WithdrawIns -> Tombstone!
+    send_ok(&mut svm, ix_deposit_collateral(prog_id, dex, t1_pfl, t1.pubkey(), t1_tok, mint, dex_vault, TOKEN_PROGRAM_ID, 50 * POS_SCALE), &payer, &[&payer, &t1]);
+    send_ok(&mut svm, ix_trade(prog_id, dex, adl_mkt, t1_pfl, t1.pubkey(), t2_pfl, t2.pubkey(), 0, POS_SCALE), &payer, &[&payer, &t1, &t2]);
+    send_ok(&mut svm, ix_burn_market_admin(prog_id, adl_mkt, lp.pubkey()), &payer, &[&payer, &lp]);
+    send_err(&mut svm, ix_start_wind_down(prog_id, adl_mkt, keeper.pubkey()), &payer, &[&payer, &keeper], "StartWindDown while oracle fresh");
+
+    // Advance slot past maxStaleness (20) -> permissionless WindDown!
+    set_slot(&mut svm, 150);
+    send_ok(&mut svm, ix_start_wind_down(prog_id, adl_mkt, keeper.pubkey()), &payer, &[&payer, &keeper]);
+    send_err(&mut svm, ix_force_close_pair(prog_id, dex, adl_mkt, t1_pfl, t2_pfl), &payer, &[&payer], "ForceClosePair during exitWindow");
+    // Advance past exitWindow (10) -> permissionless ForceClosePair!
+    set_slot(&mut svm, 160);
+    send_ok(&mut svm, ix_force_close_pair(prog_id, dex, adl_mkt, t1_pfl, t2_pfl), &payer, &[&payer]);
+    send_ok(&mut svm, ix_resolve_market(prog_id, adl_mkt), &payer, &[&payer]);
+    // If T2 still has any unclaimed posPnl leg on adl_mkt, claim it!
+    let _ = send_ixs_try(&mut svm, &[ix_claim_resolved(prog_id, dex, adl_mkt, t2_pfl)], &payer, &[&payer]);
+    send_ok(&mut svm, ix_withdraw_insurance(prog_id, dex, adl_mkt, adl_ins, lp.pubkey(), lp_tok, mint, dex_vault, TOKEN_PROGRAM_ID, 200 * POS_SCALE), &payer, &[&payer, &lp]);
+    send_ok(&mut svm, ix_tombstone_market(prog_id, adl_mkt), &payer, &[&payer]);
+    assert_eq!(read_u8(&svm, &adl_mkt, 4), 3); // STATUS_TOMBSTONED
+    send_err(&mut svm, ix_burn_market_admin(prog_id, adl_mkt, lp.pubkey()), &payer, &[&payer, &lp], "BurnAdmin on tombstoned market");
+
+    let all_mkts2 = vec![btc_mkt, eth_mkt, scam_mkt, adl_mkt];
+    let all_pfls2 = vec![alice_pfl, bob_pfl, attacker_pfl, t1_pfl, t2_pfl];
+    assert_dex_invariants(&svm, &dex, &dex_vault, &all_mkts2, &all_pfls2, "post-suite6-tombstone");
+    println!("[PASS] Suite 6: Post-ADL ClearDeadLeg ({} CU) + Full WindDown -> ForceClose -> Resolve -> Tombstone!", cu_clear);
+
+    // =========================================================================
+    // SUITE 7: 1,000-STEP RANDOMIZED STATEFUL FUZZER!
+    //   Fresh DEX with 3 active markets + 5 cross-margin portfolios + 1 LP.
+    //   Checks EXACT `C_tot + I_tot + R_tot + S_tot == V == SPL_balance`,
+    //   exact `Σ pfl.capital == C_tot`, `Σ m.insurance == I_tot`, `Σ m.realizedPool == R_tot`,
+    //   `oiLong == oiShort <= rawBasis`, `adl <= ADL_ONE`, `totalMm/totalIm` coherence
+    //   after EVERY SINGLE TRANSACTION!
+    // =========================================================================
+    let f_dex = create_prog_acc(&mut svm, &prog_id, DEX_SIZE);
+    let (f_vault, f_bump) = create_dex_vault(&mut svm, &prog_id, &f_dex, &mint);
+    send_ok(&mut svm, ix_init_dex(prog_id, f_dex, dex_admin.pubkey(), mint, f_vault, fee_vault, TOKEN_PROGRAM_ID, f_bump, 6, 0), &payer, &[&payer, &dex_admin]);
+
+    set_slot(&mut svm, 200);
+    let mut f_oracles = Vec::new();
+    let mut f_mkts = Vec::new();
+    let mut f_mkt_pairs = Vec::new();
+    let mut f_ins_accs = Vec::new();
+    let mut f_prices = [100 * POS_SCALE, 50 * POS_SCALE, 200 * POS_SCALE];
+    for m_i in 0..3usize {
+        let orc = Keypair::new();
+        svm.airdrop(&orc.pubkey(), 10_000_000_000).unwrap();
+        let mkt = create_prog_acc(&mut svm, &prog_id, MKT_SIZE);
+        let ins = create_prog_acc(&mut svm, &prog_id, INS_SIZE);
+        send_ok(
+            &mut svm,
+            ix_create_market(prog_id, f_dex, mkt, mint, orc.pubkey(), dex_admin.pubkey(), alice_tok, fee_vault,
+                f_prices[m_i], 10, 500, 0, 1000, 500, 100, 5, 400, 2500, 10_000 * POS_SCALE),
+            &payer,
+            &[&payer, &dex_admin],
+        );
+        send_ok(&mut svm, ix_deposit_insurance(prog_id, f_dex, mkt, ins, lp.pubkey(), lp_tok, mint, f_vault, TOKEN_PROGRAM_ID, 200 * POS_SCALE), &payer, &[&payer, &lp]);
+        f_mkt_pairs.push(((m_i + 1) as u64, mkt));
+        f_oracles.push(orc);
+        f_mkts.push(mkt);
+        f_ins_accs.push(ins);
+    }
+
+    let mut f_traders = Vec::new();
+    let mut f_toks = Vec::new();
+    let mut f_pfls = Vec::new();
+    for _ in 0..5 {
+        let kp = Keypair::new();
+        svm.airdrop(&kp.pubkey(), 10_000_000_000).unwrap();
+        let tok = create_tok_acc(&mut svm, &mint, &kp.pubkey(), 10_000 * POS_SCALE);
+        let pfl = create_prog_acc(&mut svm, &prog_id, PFL_SIZE);
+        send_ok(&mut svm, ix_init_portfolio(prog_id, f_dex, pfl, kp.pubkey()), &payer, &[&payer, &kp]);
+        send_ok(&mut svm, ix_deposit_collateral(prog_id, f_dex, pfl, kp.pubkey(), tok, mint, f_vault, TOKEN_PROGRAM_ID, 80 * POS_SCALE), &payer, &[&payer, &kp]);
+        f_traders.push(kp);
+        f_toks.push(tok);
+        f_pfls.push(pfl);
+    }
+    assert_dex_invariants(&svm, &f_dex, &f_vault, &f_mkts, &f_pfls, "fuzz-init");
+
+    let mut rng = Rng(0x5EED_CAFE_2026_0001);
+    let mut stats = [0u64; 8]; // [oracle, dep, wdr, open, reduce, refresh, liq, clearDead]
+    let mut ok_txs = 0u64;
+    let mut max_cu = 0u64;
+    let mut trend_dir = [1i64, -1i64, 1i64];
+
+    for step in 0..1000u64 {
+        if step % 25 == 0 {
+            for mi in 0..3 {
+                trend_dir[mi] = if rng.range(2) == 0 { 1 } else { -1 };
+            }
+        }
+        let act = rng.range(100);
+        if act < 22 {
+            // Advance slot + trend-biased clamped oracle move (exercises liquidations + ADL!)
+            let cur = get_slot(&svm) + 1;
+            set_slot(&mut svm, cur);
+            let mi = rng.range(3) as usize;
+            let mag = (rng.range(350) + 40) as i64; // 0.4% .. 3.9%
+            let dir = if rng.range(4) == 0 { -trend_dir[mi] } else { trend_dir[mi] };
+            let bps_delta = (dir * mag).clamp(-380, 380);
+            let cur_p = read_u64(&svm, &f_mkts[mi], 112);
+            let mut new_p = ((cur_p as i128) * (10_000 + bps_delta as i128) / 10_000) as u64;
+            new_p = new_p.clamp(5 * POS_SCALE, 500 * POS_SCALE);
+            let fund_sign = rng.range(2) as u8;
+            let fund_e6 = rng.range(cur_p / 2000 + 1);
+            if let Ok(cu) = send_ixs_try(&mut svm, &[ix_update_oracle(prog_id, f_mkts[mi], f_oracles[mi].pubkey(), new_p, fund_sign, fund_e6)], &payer, &[&payer, &f_oracles[mi]]) {
+                f_prices[mi] = new_p;
+                stats[0] += 1;
+                ok_txs += 1;
+                max_cu = max_cu.max(cu);
+            }
+        } else if act < 28 {
+            // DepositCollateral
+            let ti = rng.range(5) as usize;
+            let amt = (rng.range(30) + 10) * POS_SCALE;
+            if let Ok(cu) = send_ixs_try(&mut svm, &[ix_deposit_collateral(prog_id, f_dex, f_pfls[ti], f_traders[ti].pubkey(), f_toks[ti], mint, f_vault, TOKEN_PROGRAM_ID, amt)], &payer, &[&payer, &f_traders[ti]]) {
+                stats[1] += 1;
+                ok_txs += 1;
+                max_cu = max_cu.max(cu);
+            }
+        } else if act < 35 {
+            // Atomic [RefreshLeg..., WithdrawCollateral]
+            let ti = rng.range(5) as usize;
+            let amt = (rng.range(20) + 1) * POS_SCALE;
+            let mut ixs = refresh_open_legs_ixs(&svm, prog_id, f_dex, f_pfls[ti], &f_mkt_pairs);
+            ixs.push(ix_withdraw_collateral(prog_id, f_dex, f_pfls[ti], f_traders[ti].pubkey(), f_toks[ti], mint, f_vault, TOKEN_PROGRAM_ID, amt));
+            if let Ok(cu) = send_ixs_try(&mut svm, &ixs, &payer, &[&payer, &f_traders[ti]]) {
+                stats[2] += 1;
+                ok_txs += 1;
+                max_cu = max_cu.max(cu);
+            }
+        } else if act < 60 {
+            // Trade Open (higher leverage: 2..6 units, with atomic pre-refresh!)
+            let mi = rng.range(3) as usize;
+            let tl = rng.range(5) as usize;
+            let mut ts = rng.range(5) as usize;
+            if ts == tl { ts = (ts + 1) % 5; }
+            let qty = (rng.range(5) + 2) * POS_SCALE;
+            let mut ixs = refresh_open_legs_ixs(&svm, prog_id, f_dex, f_pfls[tl], &f_mkt_pairs);
+            ixs.extend(refresh_open_legs_ixs(&svm, prog_id, f_dex, f_pfls[ts], &f_mkt_pairs));
+            ixs.push(ix_trade(prog_id, f_dex, f_mkts[mi], f_pfls[tl], f_traders[tl].pubkey(), f_pfls[ts], f_traders[ts].pubkey(), 0, qty));
+            if let Ok(cu) = send_ixs_try(&mut svm, &ixs, &payer, &[&payer, &f_traders[tl], &f_traders[ts]]) {
+                stats[3] += 1;
+                ok_txs += 1;
+                max_cu = max_cu.max(cu);
+            }
+        } else if act < 72 {
+            // Trade Reduce
+            let mi = rng.range(3) as usize;
+            let tl = rng.range(5) as usize;
+            let mut ts = rng.range(5) as usize;
+            if ts == tl { ts = (ts + 1) % 5; }
+            let qty = (rng.range(3) + 1) * POS_SCALE;
+            if let Ok(cu) = send_ixs_try(&mut svm, &[ix_trade(prog_id, f_dex, f_mkts[mi], f_pfls[tl], f_traders[tl].pubkey(), f_pfls[ts], f_traders[ts].pubkey(), 1, qty)], &payer, &[&payer, &f_traders[tl], &f_traders[ts]]) {
+                stats[4] += 1;
+                ok_txs += 1;
+                max_cu = max_cu.max(cu);
+            }
+        } else if act < 82 {
+            // RefreshLeg
+            let mi = rng.range(3) as usize;
+            let ti = rng.range(5) as usize;
+            let force = rng.range(4) == 0;
+            if let Ok(cu) = send_ixs_try(&mut svm, &[ix_refresh_leg(prog_id, f_dex, f_mkts[mi], f_pfls[ti], force)], &payer, &[&payer]) {
+                stats[5] += 1;
+                ok_txs += 1;
+                max_cu = max_cu.max(cu);
+            }
+        } else if act < 93 {
+            // Liquidate sweep across all markets & traders
+            let mi = rng.range(3) as usize;
+            let ti = rng.range(5) as usize;
+            if let Ok(cu) = send_ixs_try(&mut svm, &[ix_liquidate(prog_id, f_dex, f_mkts[mi], f_pfls[ti], keeper_tok, mint, f_vault, TOKEN_PROGRAM_ID)], &payer, &[&payer]) {
+                stats[6] += 1;
+                ok_txs += 1;
+                max_cu = max_cu.max(cu);
+            }
+        } else {
+            // ClearDeadLeg sweep
+            let mi = rng.range(3) as usize;
+            let ti = rng.range(5) as usize;
+            if let Ok(cu) = send_ixs_try(&mut svm, &[ix_clear_dead_leg(prog_id, f_dex, f_mkts[mi], f_pfls[ti])], &payer, &[&payer]) {
+                stats[7] += 1;
+                ok_txs += 1;
+                max_cu = max_cu.max(cu);
+            }
+        }
+
+        // Assert EVERY SINGLE GLOBAL & LOCAL INVARIANT AFTER EVERY STEP!
+        assert_dex_invariants(&svm, &f_dex, &f_vault, &f_mkts, &f_pfls, &format!("fuzz-step-{}", step));
+    }
+
     println!(
-        "[PASS] 8. Lifecycle & Anti-DoS Tombstone  | ForceClose={} CU, Resolve={} CU, Claim={} CU, WdIns={} CU",
-        cu_fc, cu_res, cu_claim, cu_wd_ins
+        "[PASS] Suite 7: 1,000-Step Stateful Fuzzer — {} valid txs, ZERO invariant violations! (oracle={}, dep={}, wdr={}, open={}, red={}, ref={}, liq={}, clearDead={}, max_cu={})",
+        ok_txs, stats[0], stats[1], stats[2], stats[3], stats[4], stats[5], stats[6], stats[7], max_cu
     );
-
     println!("==================================================================================");
-    println!("  ALL 8 FULL LIFECYCLE + ADVERSARIAL SECURITY SUITES PASSED ON REAL LITESVM!");
+    println!("  ALL 7 PERCOLATOR-LEAN v2 VERIFICATION + FUZZ SUITES PASSED 100%!");
     println!("==================================================================================");
 }
