@@ -16,6 +16,11 @@
                             `num_samples >= 1`, `std_dev` confidence bound)
   - Supports optional 2-leg composite ratio pricing (`base / quote`, e.g. `STOXX/SOL`, `BTC/ETH`)
     across any combination of feed formats!
+  - Supports optional on-chain EWMA smoothing & Hybrid After-Hours mode (`FLAG_HYBRID_AH`):
+    * Live hours: updates `ewmaPrice` via exact integer EWMA `(prev*(10000-α) + spot*α) / 10000`.
+    * After-hours (base feed stale/wide-conf, e.g. closed equity markets): carries `ewmaPrice`
+      automatically while STILL repricing 24/7 against a live `quoteFeed` (e.g. `STOXX/SOL`)!
+    * Optional admin-signed `PushEwmaMark` (`op = 3`) bounded per-slot by `±ewmaMaxDevBps`.
   - Auto-clamps the price step to `±mkt.maxMoveBps`, computes on-chain premium funding strictly
     within the remaining clamp budget, and CPIs `percolator::UpdateOracle` via PDA `["orac", adp, bump]`.
 -/
@@ -49,23 +54,27 @@ def DISC_SWITCHBOARD : UInt64 := 0x28DBD70AC46C1BC4 -- sha256("account:PullFeedA
 def FLAG_HAS_QUOTE : UInt8 := 1
 def FLAG_PIN_FID   : UInt8 := 2
 def FLAG_PIN_QFID  : UInt8 := 4
+def FLAG_HYBRID_AH : UInt8 := 8  -- Hybrid after-hours EWMA fallback when base feed is stale/wide-conf
 
 namespace OErr
-  def feedStale     : UInt64 := 300
-  def feedWideConf  : UInt64 := 301
-  def feedMismatch  : UInt64 := 302
-  def progMismatch  : UInt64 := 303
-  def badFeedFormat : UInt64 := 304
-  def badFeedId     : UInt64 := 305
+  def feedStale       : UInt64 := 300
+  def feedWideConf    : UInt64 := 301
+  def feedMismatch    : UInt64 := 302
+  def progMismatch    : UInt64 := 303
+  def badFeedFormat   : UInt64 := 304
+  def badFeedId       : UInt64 := 305
+  def ewmaDevExceeded : UInt64 := 306
+  def ewmaNotEnabled  : UInt64 := 307
+  def ewmaSameSlot    : UInt64 := 308
 end OErr
 
 namespace AdpOff
-  def size              : UInt64 := 320
+  def size              : UInt64 := 352
   def magic             : UInt64 := 0   -- u32 ("OADP")
   def pdaBump           : UInt64 := 4   -- u8
   def feedType          : UInt64 := 5   -- u8 (0=Custom, 1=PythV2, 2=Chainlink, 3=Switchboard)
   def quoteFeedType     : UInt64 := 6   -- u8 (same enum when FLAG_HAS_QUOTE set)
-  def flags             : UInt64 := 7   -- u8 (bit0=hasQuote, bit1=pinFeedId, bit2=pinQuoteFeedId)
+  def flags             : UInt64 := 7   -- u8 (bit0=hasQuote, bit1=pinFeedId, bit2=pinQuoteFeedId, bit3=hybridAH)
   def admin             : UInt64 := 8   -- Pubkey (32)
   def percProg          : UInt64 := 40  -- Pubkey (32)
   def market            : UInt64 := 72  -- Pubkey (32)
@@ -78,6 +87,10 @@ namespace AdpOff
   def quoteFeed         : UInt64 := 224 -- Pubkey (32) — optional denominator feed (`base / quote`)
   def quoteFeedOwner    : UInt64 := 256 -- Pubkey (32) — pinned owner of `quoteFeed`
   def quoteFeedId       : UInt64 := 288 -- [u8; 32]    — pinned Pyth `feed_id` for `quoteFeed`
+  def ewmaAlphaBps      : UInt64 := 320 -- u64 (0=pass-through; 1..=10000 = EWMA weight on latest spot)
+  def ewmaPrice         : UInt64 := 328 -- u64 (E6 current EWMA base price; 0 until seeded)
+  def ewmaMaxDevBps     : UInt64 := 336 -- u64 (max per-slot deviation in bps for PushEwmaMark)
+  def lastEwmaSlot      : UInt64 := 344 -- u64 (slot of last EWMA update)
 end AdpOff
 
 namespace FeedOff
@@ -185,6 +198,11 @@ theorem scaleToE6Nat_mono_and_id (a b d : Nat) (hab : a ≤ b) :
     · exact Nat.mul_le_mul_right _ hab
   · unfold scaleToE6Nat; simp
 
+/-- Pure model of exact integer EWMA blend: `⌊(prev * (10_000 - α) + spot * α) / 10_000⌋`. -/
+def ewmaBlendNat (prev spot alphaBps : Nat) : Nat :=
+  if prev = 0 ∨ alphaBps = 0 ∨ alphaBps ≥ 10_000 then spot
+  else (prev * (10_000 - alphaBps) + spot * alphaBps) / 10_000
+
 /-- Formal Proof #4: 2-leg composite ratio pricing (`⌊baseE6 * 10^6 / quoteE6⌋`) fed into
     `clampedStepNat` + `clampedFundingNat` ALWAYS obeys the core per-slot clamp! -/
 theorem ratio_crank_within_clamp (oldP baseE6 quoteE6 maxMoveBps fundBps : Nat) (ho : oldP ≥ 1) :
@@ -194,6 +212,65 @@ theorem ratio_crank_within_clamp (oldP baseE6 quoteE6 maxMoveBps fundBps : Nat) 
     let diff := if newP ≥ oldP then newP - oldP else oldP - newP
     diff + fundE6 ≤ (oldP * maxMoveBps) / 10_000 :=
   crank_step_and_funding_within_clamp oldP ((baseE6 * 1_000_000) / quoteE6) maxMoveBps fundBps ho
+
+/-- Formal Proof #5 (EWMA Convexity / No-Overshoot / Strictly Positive):
+    `ewmaBlendNat` ALWAYS lies inside `[min prev spot, max prev spot]` for all `prev, spot`,
+    guaranteeing zero underflow to 0 and zero overshoot past `MAX_PRICE`! -/
+theorem ewmaBlendNat_bounds (prev spot alphaBps : Nat) :
+    min prev spot ≤ ewmaBlendNat prev spot alphaBps ∧
+    ewmaBlendNat prev spot alphaBps ≤ max prev spot := by
+  unfold ewmaBlendNat
+  by_cases h : prev = 0 ∨ alphaBps = 0 ∨ alphaBps ≥ 10_000
+  · simp only [h, ↓reduceIte]; omega
+  · simp only [h, ↓reduceIte]
+    have ha : alphaBps < 10_000 := by omega
+    have hlo : min prev spot * 10_000 ≤ prev * (10_000 - alphaBps) + spot * alphaBps := by
+      have h1 : min prev spot * (10_000 - alphaBps) ≤ prev * (10_000 - alphaBps) :=
+        Nat.mul_le_mul_right _ (Nat.min_le_left prev spot)
+      have h2 : min prev spot * alphaBps ≤ spot * alphaBps :=
+        Nat.mul_le_mul_right _ (Nat.min_le_right prev spot)
+      have hsum : min prev spot * (10_000 - alphaBps) + min prev spot * alphaBps =
+                  min prev spot * 10_000 := by
+        rw [← Nat.mul_add, Nat.sub_add_cancel (Nat.le_of_lt ha)]
+      omega
+    have hhi : prev * (10_000 - alphaBps) + spot * alphaBps ≤ max prev spot * 10_000 := by
+      have h1 : prev * (10_000 - alphaBps) ≤ max prev spot * (10_000 - alphaBps) :=
+        Nat.mul_le_mul_right _ (Nat.le_max_left prev spot)
+      have h2 : spot * alphaBps ≤ max prev spot * alphaBps :=
+        Nat.mul_le_mul_right _ (Nat.le_max_right prev spot)
+      have hsum : max prev spot * (10_000 - alphaBps) + max prev spot * alphaBps =
+                  max prev spot * 10_000 := by
+        rw [← Nat.mul_add, Nat.sub_add_cancel (Nat.le_of_lt ha)]
+      omega
+    constructor
+    · exact (Nat.le_div_iff_mul_le (by omega : 0 < 10_000)).mpr hlo
+    · exact Nat.div_le_of_le_mul (by rw [Nat.mul_comm 10_000 (max prev spot)]; exact hhi)
+
+/-- Formal Proof #6 (EWMA Exact Fixed Point): constant spot price has zero integer rounding drift! -/
+theorem ewmaBlendNat_fixed_point (p alphaBps : Nat) :
+    ewmaBlendNat p p alphaBps = p := by
+  unfold ewmaBlendNat
+  by_cases h : p = 0 ∨ alphaBps = 0 ∨ alphaBps ≥ 10_000
+  · simp only [h, ↓reduceIte]
+  · simp only [h, ↓reduceIte]
+    have ha : alphaBps ≤ 10_000 := by omega
+    rw [← Nat.mul_add, Nat.sub_add_cancel ha]
+    exact Nat.mul_div_cancel p (by omega : 0 < 10_000)
+
+/-- Formal Proof #7 (Hybrid After-Hours EWMA + Ratio Clamp Safety):
+    Whether using live EWMA or carried after-hours EWMA (single-leg or 2-leg ratio),
+    `clampedStepNat` + `clampedFundingNat` ALWAYS satisfies `percolator-lean`'s core clamp! -/
+theorem ewma_ratio_crank_within_clamp
+    (oldP prevEwma spotBase quoteE6 alphaBps maxMoveBps fundBps : Nat)
+    (ho : oldP ≥ 1) (isAfterHours : Bool) :
+    let effBase := if isAfterHours then prevEwma else ewmaBlendNat prevEwma spotBase alphaBps
+    let targetP := if quoteE6 = 0 then effBase else (effBase * 1_000_000) / quoteE6
+    let (newP, step) := clampedStepNat oldP targetP maxMoveBps
+    let fundE6 := clampedFundingNat oldP step maxMoveBps fundBps
+    let diff := if newP ≥ oldP then newP - oldP else oldP - newP
+    diff + fundE6 ≤ (oldP * maxMoveBps) / 10_000 := by
+  dsimp only
+  exact crank_step_and_funding_within_clamp oldP _ maxMoveBps fundBps ho
 
 /-! ### Exact 128-bit & Decimal Scaling Helpers -/
 
@@ -272,13 +349,20 @@ def scaleU128ToE6 (hi lo dec : UInt64) : SolanaM UInt64 := do
     SolanaM.require (hi == 0) Err.arithmeticOverflow
     scaleU64ToE6 lo dec
 
+/-- Exact 64-bit integer EWMA blend: `⌊(prev * (10_000 - α) + spot * α) / 10_000⌋`.
+    Safe in native `UInt64` for all `prev, spot ≤ MAX_PRICE (10^12)` and `α ≤ 10_000` (`≤ 10^16 ≪ 2^64`). -/
+def ewmaBlendU64 (prev spot alphaBps : UInt64) : UInt64 :=
+  if prev == 0 || alphaBps == 0 || alphaBps >= BPS_DEN then spot
+  else (prev * (BPS_DEN - alphaBps) + spot * alphaBps) / BPS_DEN
+
 /-! ### Unified On-Chain Oracle Feed Parser (Custom / Pyth V2 / Chainlink OCR2 / Switchboard) -/
 
 /-- Parse and validate one oracle account according to `feedType`, returning `(priceE6, confE6)`.
-    Enforces account key, pinned owner, Anchor discriminator, format constraints, staleness,
-    and positive non-overflowing price bounds! -/
+    Always enforces account key, pinned owner, Anchor discriminator, format constraints, and `feed_id`.
+    When `allowStale == true` (hybrid after-hours mode), a stale feed returns `(0, 0)` so the caller
+    can cleanly fall back to the carried EWMA mark instead of aborting! -/
 def parseOracleFeed (feed : AccountView) (expectedKeyPtr expectedOwnerPtr expectedFidPtr : Ptr)
-    (feedType : UInt8) (pinFid : Bool) (maxAge curSlot curTs : UInt64) :
+    (feedType : UInt8) (pinFid allowStale : Bool) (maxAge curSlot curTs : UInt64) :
     SolanaM (UInt64 × UInt64) := do
   SolanaM.require (← pubkeyEq (AccountView.keyPtr feed)   expectedKeyPtr)   OErr.feedMismatch
   SolanaM.require (← pubkeyEq (AccountView.ownerPtr feed) expectedOwnerPtr) Err.illegalOwner
@@ -291,7 +375,10 @@ def parseOracleFeed (feed : AccountView) (expectedKeyPtr expectedOwnerPtr expect
     let price   ← loadU64 fData FeedOff.price
     let conf    ← loadU64 fData FeedOff.conf
     let pubSlot ← loadU64 fData FeedOff.publishSlot
-    SolanaM.require (curSlot >= pubSlot && (curSlot - pubSlot) <= maxAge) OErr.feedStale
+    let fresh := curSlot >= pubSlot && (curSlot - pubSlot) <= maxAge
+    if !fresh then
+      if allowStale then return (0, 0)
+      else SolanaM.fail OErr.feedStale
     SolanaM.require (price > 0 && price <= MAX_PRICE) PErr.invalidParams
     return (price, conf)
 
@@ -307,10 +394,13 @@ def parseOracleFeed (feed : AccountView) (expectedKeyPtr expectedOwnerPtr expect
     let rawExpo  ← loadU32 fData PythOff.expo
     let pubTime  ← loadU64 fData PythOff.publishTime
     let postSlot ← loadU64 fData PythOff.postedSlot
-    -- Reject negative/zero `i64` price and negative `publish_time`
+    -- Reject negative/zero `i64` price
     SolanaM.require (rawPrice > 0 && (rawPrice >>> 63) == 0) OErr.badFeedFormat
-    SolanaM.require ((pubTime >>> 63) == 0 && (curTs >>> 63) == 0) OErr.feedStale
-    SolanaM.require (curTs >= pubTime && (curTs - pubTime) <= maxAge && postSlot <= curSlot) OErr.feedStale
+    let fresh := (pubTime >>> 63) == 0 && (curTs >>> 63) == 0 &&
+                 curTs >= pubTime && (curTs - pubTime) <= maxAge && postSlot <= curSlot
+    if !fresh then
+      if allowStale then return (0, 0)
+      else SolanaM.fail OErr.feedStale
     -- Convert `i32` exponent to E6 scale
     if (rawExpo &&& 0x80000000) != 0 then
       let negExp := (0 - rawExpo).toUInt64
@@ -346,7 +436,10 @@ def parseOracleFeed (feed : AccountView) (expectedKeyPtr expectedOwnerPtr expect
     let ansHi  ← loadU64 fData (entryOff + ChainlinkOff.entryAnswerHi)
     -- Reject negative `i128` answers (`ansHi` sign bit set) or zero answer
     SolanaM.require ((ansHi >>> 63) == 0 && (ansHi != 0 || ansLo != 0)) OErr.badFeedFormat
-    SolanaM.require (curSlot >= slot && (curSlot - slot) <= maxAge) OErr.feedStale
+    let fresh := curSlot >= slot && (curSlot - slot) <= maxAge
+    if !fresh then
+      if allowStale then return (0, 0)
+      else SolanaM.fail OErr.feedStale
     let pE6 ← scaleU128ToE6 ansHi ansLo dec
     SolanaM.require (pE6 > 0 && pE6 <= MAX_PRICE) PErr.invalidParams
     return (pE6, 0)
@@ -364,7 +457,10 @@ def parseOracleFeed (feed : AccountView) (expectedKeyPtr expectedOwnerPtr expect
     SolanaM.require (samples >= 1 && resSlot > 0) OErr.badFeedFormat
     SolanaM.require ((valHi >>> 63) == 0 && (valHi != 0 || valLo != 0)) OErr.badFeedFormat
     SolanaM.require ((stdHi >>> 63) == 0) OErr.badFeedFormat
-    SolanaM.require (curSlot >= resSlot && (curSlot - resSlot) <= maxAge) OErr.feedStale
+    let fresh := curSlot >= resSlot && (curSlot - resSlot) <= maxAge
+    if !fresh then
+      if allowStale then return (0, 0)
+      else SolanaM.fail OErr.feedStale
     let pE6 ← divU128By64 valHi valLo SwitchboardOff.scaleToE6
     let cE6 ← divU128By64 stdHi stdLo SwitchboardOff.scaleToE6
     SolanaM.require (pE6 > 0 && pE6 <= MAX_PRICE) PErr.invalidParams
@@ -477,22 +573,45 @@ def handleCrank (input : Ptr) : SolanaM Unit := do
   let maxConfBps ← loadU64 aData AdpOff.maxConfBps
   let feedType   ← loadU8  aData AdpOff.feedType
   let flags      ← loadU8  aData AdpOff.flags
+  let alphaBps   ← loadU64 aData AdpOff.ewmaAlphaBps
+  let prevEwma   ← loadU64 aData AdpOff.ewmaPrice
+  let isHybrid   := (flags &&& FLAG_HYBRID_AH) != 0
+  let useEwma    := alphaBps > 0 || isHybrid
 
-  -- Parse & validate primary feed
-  let (baseP, baseC) ← parseOracleFeed feed
+  -- Parse & validate primary feed (with optional EWMA smoothing & Hybrid After-Hours fallback!)
+  let (rawBaseP, baseC) ← parseOracleFeed feed
     (aData + AdpOff.feedAccount) (aData + AdpOff.feedOwner) (aData + AdpOff.feedId)
-    feedType ((flags &&& FLAG_PIN_FID) != 0) maxAge curSlot curTs
-  let maxBaseC ← mulDiv64 baseP maxConfBps BPS_DEN
-  SolanaM.require (baseC <= maxBaseC) OErr.feedWideConf
+    feedType ((flags &&& FLAG_PIN_FID) != 0) isHybrid maxAge curSlot curTs
+  let baseConfOk : Bool ← if rawBaseP > 0 then do
+      let maxBaseC ← mulDiv64 rawBaseP maxConfBps BPS_DEN
+      if baseC <= maxBaseC then pure true else pure false
+    else pure false
+  let baseP ← if rawBaseP > 0 && baseConfOk then do
+      if useEwma then
+        SolanaM.require (← AccountView.isWritable adp) Err.invalidAccountData
+        let nextEwma := ewmaBlendU64 prevEwma rawBaseP alphaBps
+        storeU64 aData AdpOff.ewmaPrice nextEwma
+        storeU64 aData AdpOff.lastEwmaSlot curSlot
+        pure nextEwma
+      else pure rawBaseP
+    else if isHybrid then do
+      -- Hybrid After-Hours fallback: carry last EWMA base mark while underlying market is closed!
+      if rawBaseP == 0 then
+        SolanaM.require (prevEwma > 0) OErr.feedStale
+      else
+        SolanaM.require (prevEwma > 0) OErr.feedWideConf
+      pure prevEwma
+    else SolanaM.fail OErr.feedWideConf
 
   -- Optional 2-leg composite ratio (`base / quote`, e.g. `STOXX/SOL` or `BTC/ETH`)
+  -- Quote feed (`SOL/USD`) is ALWAYS strictly live-validated (24/7 crypto quote!)
   let feedPrice ← if (flags &&& FLAG_HAS_QUOTE) != 0 then do
       SolanaM.require (n >= 6) Err.notEnoughAccountKeys
       let qFeed ← AccountView.nextCursor percProg
       let qType ← loadU8 aData AdpOff.quoteFeedType
       let (qP, qC) ← parseOracleFeed qFeed
         (aData + AdpOff.quoteFeed) (aData + AdpOff.quoteFeedOwner) (aData + AdpOff.quoteFeedId)
-        qType ((flags &&& FLAG_PIN_QFID) != 0) maxAge curSlot curTs
+        qType ((flags &&& FLAG_PIN_QFID) != 0) false maxAge curSlot curTs
       let maxQC ← mulDiv64 qP maxConfBps BPS_DEN
       SolanaM.require (qC <= maxQC) OErr.feedWideConf
       let ratioP ← mulDiv64 baseP POS_SCALE qP
@@ -549,12 +668,90 @@ def handleCrank (input : Ptr) : SolanaM Unit := do
   let rc ← sysInvokeSignedC buf infos 2 signersArr 1
   SolanaM.require (rc == 0) rc
 
+/-- Op 2: One-shot immutable `InitEwma` configuring EWMA smoothing & Hybrid After-Hours mode.
+    Accounts: `[adp(W), admin(S)]`.
+    Data (26 B): `[op=2, hybridAfterHours(u8), ewmaAlphaBps(u64), ewmaMaxDevBps(u64), initEwmaPrice(u64)]`. -/
+def handleInitEwma (input : Ptr) : SolanaM Unit := do
+  let (n, adp, ix, progId) ← parseIxOnly input
+  SolanaM.require (n >= 2) Err.notEnoughAccountKeys
+  SolanaM.require (ix.len >= 26) Err.invalidInstructionData
+  let admin ← AccountView.nextCursor adp
+
+  SolanaM.require (← AccountView.isSigner admin) Err.missingRequiredSignature
+  SolanaM.require (← AccountView.isWritable adp) Err.invalidAccountData
+  SolanaM.require (← pubkeyEq (AccountView.ownerPtr adp) progId) Err.illegalOwner
+  SolanaM.require ((← AccountView.dataLen adp) >= AdpOff.size) Err.accountDataTooSmall
+  let aData := AccountView.dataPtr adp
+  SolanaM.require ((← loadU32 aData AdpOff.magic) == MAGIC_ADAPTER) PErr.invalidMagic
+  SolanaM.require (← pubkeyEq (AccountView.keyPtr admin) (aData + AdpOff.admin)) PErr.ownerMismatch
+
+  -- Strictly one-shot immutable configuration!
+  let curFlags ← loadU8  aData AdpOff.flags
+  let curAlpha ← loadU64 aData AdpOff.ewmaAlphaBps
+  let curEwma  ← loadU64 aData AdpOff.ewmaPrice
+  SolanaM.require (curAlpha == 0 && curEwma == 0 && (curFlags &&& FLAG_HYBRID_AH) == 0) Err.accountAlreadyInitialized
+
+  let hybridAh    ← loadU8  ix.ptr 1
+  let alphaBps    ← loadU64 ix.ptr 2
+  let maxDevBps   ← loadU64 ix.ptr 10
+  let initEwma    ← loadU64 ix.ptr 18
+  SolanaM.require (alphaBps <= BPS_DEN && maxDevBps <= BPS_DEN && initEwma <= MAX_PRICE) PErr.invalidParams
+  SolanaM.require (alphaBps > 0 || hybridAh != 0) PErr.invalidParams
+
+  if hybridAh != 0 then
+    storeU8 aData AdpOff.flags (curFlags ||| FLAG_HYBRID_AH)
+  storeU64 aData AdpOff.ewmaAlphaBps  alphaBps
+  storeU64 aData AdpOff.ewmaMaxDevBps maxDevBps
+  storeU64 aData AdpOff.ewmaPrice     initEwma
+  storeU64 aData AdpOff.lastEwmaSlot  0
+
+/-- Op 3: Bounded per-slot `PushEwmaMark` (`[adp(W), admin(S)]`, 9 B `[op=3, markE6(u64)]`).
+    Allows the adapter admin to smoothly nudge the carried EWMA base mark during after-hours
+    (e.g. from futures/book pricing while equity cash markets are closed), strictly clamped
+    to `±ewmaMaxDevBps` per slot and blended via `ewmaAlphaBps`! -/
+def handlePushEwmaMark (input : Ptr) : SolanaM Unit := do
+  let (n, adp, ix, progId) ← parseIxOnly input
+  SolanaM.require (n >= 2) Err.notEnoughAccountKeys
+  SolanaM.require (ix.len >= 9) Err.invalidInstructionData
+  let admin ← AccountView.nextCursor adp
+
+  SolanaM.require (← AccountView.isSigner admin) Err.missingRequiredSignature
+  SolanaM.require (← AccountView.isWritable adp) Err.invalidAccountData
+  SolanaM.require (← pubkeyEq (AccountView.ownerPtr adp) progId) Err.illegalOwner
+  SolanaM.require ((← AccountView.dataLen adp) >= AdpOff.size) Err.accountDataTooSmall
+  let aData := AccountView.dataPtr adp
+  SolanaM.require ((← loadU32 aData AdpOff.magic) == MAGIC_ADAPTER) PErr.invalidMagic
+  SolanaM.require (← pubkeyEq (AccountView.keyPtr admin) (aData + AdpOff.admin)) PErr.ownerMismatch
+
+  let flags    ← loadU8  aData AdpOff.flags
+  let prevEwma ← loadU64 aData AdpOff.ewmaPrice
+  SolanaM.require ((flags &&& FLAG_HYBRID_AH) != 0 && prevEwma > 0) OErr.ewmaNotEnabled
+
+  let (curSlot, _) ← getClockSlotAndTs
+  let lastSlot ← loadU64 aData AdpOff.lastEwmaSlot
+  SolanaM.require (curSlot > lastSlot) OErr.ewmaSameSlot
+
+  let markE6 ← loadU64 ix.ptr 1
+  SolanaM.require (markE6 > 0 && markE6 <= MAX_PRICE) PErr.invalidParams
+
+  let maxDevBps ← loadU64 aData AdpOff.ewmaMaxDevBps
+  let maxDev ← mulDiv64 prevEwma maxDevBps BPS_DEN
+  let diff := if markE6 >= prevEwma then markE6 - prevEwma else prevEwma - markE6
+  SolanaM.require (diff <= maxDev) OErr.ewmaDevExceeded
+
+  let alphaBps ← loadU64 aData AdpOff.ewmaAlphaBps
+  let nextEwma := ewmaBlendU64 prevEwma markE6 alphaBps
+  storeU64 aData AdpOff.ewmaPrice    nextEwma
+  storeU64 aData AdpOff.lastEwmaSlot curSlot
+
 def dispatch (input : Ptr) : SolanaM Unit := do
   let (_, _, ix, _) ← parseIxOnly input
   SolanaM.require (ix.len >= 1) Err.invalidInstructionData
   let op ← loadU8 ix.ptr 0
   if op == 0 then handleInitAdapter input
   else if op == 1 then handleCrank input
+  else if op == 2 then handleInitEwma input
+  else if op == 3 then handlePushEwmaMark input
   else SolanaM.fail PErr.invalidInstruction
 
 def entrypoint (input : Ptr) (s : SvmState) : UInt64 × SvmState :=

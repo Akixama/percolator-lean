@@ -1458,7 +1458,7 @@ fn main() {
 
     // 9A: OracleAdapter CPI composition (Custom + Pyth V2 + Chainlink OCR2 + Switchboard + 2-Leg Ratio!)
     let comp_mkt2 = create_prog_acc(&mut svm, &prog_id, MKT_SIZE);
-    let adp_acc = create_prog_acc(&mut svm, &adapter_prog, 320);
+    let adp_acc = create_prog_acc(&mut svm, &adapter_prog, 352);
     let (orac_pda, orac_bump) = Address::find_program_address(&[b"orac", adp_acc.as_ref()], &adapter_prog);
     // External on-chain price feed account (32B: magic="FEED", price, conf, publishSlot)
     let feed_acc = Keypair::new().pubkey();
@@ -1596,7 +1596,7 @@ fn main() {
     let pyth_fid = [0xABu8; 32];
     let pyth_feed = Keypair::new().pubkey();
     let pyth_mkt = create_prog_acc(&mut svm, &prog_id, MKT_SIZE);
-    let pyth_adp = create_prog_acc(&mut svm, &adapter_prog, 320);
+    let pyth_adp = create_prog_acc(&mut svm, &adapter_prog, 352);
     let (pyth_pda, pyth_bump) = Address::find_program_address(&[b"orac", pyth_adp.as_ref()], &adapter_prog);
     svm.set_account(pyth_feed, Account { lamports: 10_000_000, data: make_pyth_v2(pyth_fid, 10_300_000_000, 5_000_000, -8, 1_750_000_000, s0 + 30, 1), owner: pyth_prog_id, executable: false, rent_epoch: 0 }).unwrap();
     send_ok(&mut svm, ix_create_market(prog_id, dex, pyth_mkt, mint, pyth_pda, lp.pubkey(), lp_tok, fee_vault, 100 * POS_SCALE, 10, 50, 0, 1000, 500, 100, 0, 400, 2500, 1_000_000 * POS_SCALE), &payer, &[&payer, &lp]);
@@ -1629,7 +1629,7 @@ fn main() {
     // (b) Chainlink OCR2 Parser Test ($100 -> $102.50, ring-buffer wraparound live_cursor=0, live_len=4, decimals=8)
     let cl_feed = Keypair::new().pubkey();
     let cl_mkt = create_prog_acc(&mut svm, &prog_id, MKT_SIZE);
-    let cl_adp = create_prog_acc(&mut svm, &adapter_prog, 320);
+    let cl_adp = create_prog_acc(&mut svm, &adapter_prog, 352);
     let (cl_pda, cl_bump) = Address::find_program_address(&[b"orac", cl_adp.as_ref()], &adapter_prog);
     svm.set_account(cl_feed, Account { lamports: 10_000_000, data: make_chainlink_ocr2(8, 4, 0, s0 + 31, 10_250_000_000i128), owner: cl_prog_id, executable: false, rent_epoch: 0 }).unwrap();
     send_ok(&mut svm, ix_create_market(prog_id, dex, cl_mkt, mint, cl_pda, lp.pubkey(), lp_tok, fee_vault, 100 * POS_SCALE, 10, 50, 0, 1000, 500, 100, 0, 400, 2500, 1_000_000 * POS_SCALE), &payer, &[&payer, &lp]);
@@ -1653,7 +1653,7 @@ fn main() {
     // (c) Switchboard On-Demand Parser Test ($100 -> $104.00, full 128-bit PRECISION=18 scaling!)
     let sb_feed = Keypair::new().pubkey();
     let sb_mkt = create_prog_acc(&mut svm, &prog_id, MKT_SIZE);
-    let sb_adp = create_prog_acc(&mut svm, &adapter_prog, 320);
+    let sb_adp = create_prog_acc(&mut svm, &adapter_prog, 352);
     let (sb_pda, sb_bump) = Address::find_program_address(&[b"orac", sb_adp.as_ref()], &adapter_prog);
     let sb_val: i128 = 104i128 * 1_000_000_000_000_000_000i128;
     let sb_std: i128 = 100_000_000_000_000_000i128;
@@ -1678,7 +1678,7 @@ fn main() {
 
     // (d) 2-Leg Composite Ratio Market (`Pyth V2 $500` / `Chainlink OCR2 $125` = `4.00` — e.g. STOXX/SOL!)
     let rat_mkt = create_prog_acc(&mut svm, &prog_id, MKT_SIZE);
-    let rat_adp = create_prog_acc(&mut svm, &adapter_prog, 320);
+    let rat_adp = create_prog_acc(&mut svm, &adapter_prog, 352);
     let (rat_pda, rat_bump) = Address::find_program_address(&[b"orac", rat_adp.as_ref()], &adapter_prog);
     let stoxx_feed = Keypair::new().pubkey();
     let sol_feed   = Keypair::new().pubkey();
@@ -1703,9 +1703,102 @@ fn main() {
         AccountMeta::new_readonly(prog_id, false), AccountMeta::new_readonly(sol_feed, false),
     ], data: vec![1] }, &payer, &[&payer], "Program log: 0x1,");
     assert_eq!(read_u64(&svm, &rat_mkt, 112), 4 * POS_SCALE, "2-Leg Ratio Pyth($500)/Chainlink($125) converged to exact 4.00!");
+
+    // (e) EWMA Smoothing + Hybrid After-Hours 2-Leg STOXX/SOL + Bounded PushEwmaMark!
+    let ewma_mkt = create_prog_acc(&mut svm, &prog_id, MKT_SIZE);
+    let ewma_adp = create_prog_acc(&mut svm, &adapter_prog, 352);
+    let (ewma_pda, ewma_bump) = Address::find_program_address(&[b"orac", ewma_adp.as_ref()], &adapter_prog);
+    send_ok(&mut svm, ix_create_market(prog_id, dex, ewma_mkt, mint, ewma_pda, lp.pubkey(), lp_tok, fee_vault, 4 * POS_SCALE, 10, 50, 0, 1000, 500, 100, 0, 400, 2500, 1_000_000 * POS_SCALE), &payer, &[&payer, &lp]);
+    let mut ewma_init = vec![0u8; 60];
+    ewma_init[0] = 0; ewma_init[1] = ewma_bump; ewma_init[2] = 1; ewma_init[3] = 2;
+    ewma_init[4..12].copy_from_slice(&30u64.to_le_bytes());
+    ewma_init[12..20].copy_from_slice(&100u64.to_le_bytes());
+    ewma_init[28..60].copy_from_slice(&stoxx_fid);
+    send_ok(&mut svm, Instruction { program_id: adapter_prog, accounts: vec![
+        AccountMeta::new(ewma_adp, false), AccountMeta::new_readonly(lp.pubkey(), true),
+        AccountMeta::new_readonly(prog_id, false), AccountMeta::new_readonly(ewma_mkt, false),
+        AccountMeta::new_readonly(stoxx_feed, false), AccountMeta::new_readonly(sol_feed, false),
+    ], data: ewma_init }, &payer, &[&payer, &lp]);
+    // Op 2: One-shot InitEwma (hybridAH=1, alphaBps=2000 [20%], maxDevBps=500 [5%], initEwmaPrice=$500)
+    let mut init_ewma_data = vec![0u8; 26];
+    init_ewma_data[0] = 2;
+    init_ewma_data[1] = 1;
+    init_ewma_data[2..10].copy_from_slice(&2000u64.to_le_bytes());
+    init_ewma_data[10..18].copy_from_slice(&500u64.to_le_bytes());
+    init_ewma_data[18..26].copy_from_slice(&(500 * POS_SCALE).to_le_bytes());
+    let ix_init_ewma = Instruction {
+        program_id: adapter_prog,
+        accounts: vec![AccountMeta::new(ewma_adp, false), AccountMeta::new_readonly(lp.pubkey(), true)],
+        data: init_ewma_data,
+    };
+    send_ok(&mut svm, ix_init_ewma.clone(), &payer, &[&payer, &lp]);
+    send_err(&mut svm, ix_init_ewma, &payer, &[&payer, &lp], "InitEwma must be strictly one-shot immutable");
+
+    let ix_ewma_crank = || Instruction {
+        program_id: adapter_prog,
+        accounts: vec![
+            AccountMeta::new(ewma_adp, false), AccountMeta::new(ewma_mkt, false),
+            AccountMeta::new_readonly(stoxx_feed, false), AccountMeta::new_readonly(ewma_pda, false),
+            AccountMeta::new_readonly(prog_id, false), AccountMeta::new_readonly(sol_feed, false),
+        ],
+        data: vec![1],
+    };
+    let ix_push_ewma = |signer: Address, mark_e6: u64| {
+        let mut d = vec![0u8; 9];
+        d[0] = 3;
+        d[1..9].copy_from_slice(&mark_e6.to_le_bytes());
+        Instruction {
+            program_id: adapter_prog,
+            accounts: vec![AccountMeta::new(ewma_adp, false), AccountMeta::new_readonly(signer, true)],
+            data: d,
+        }
+    };
+
+    // (e1) Live hours: STOXX jumps $500 -> $510 (fresh Pyth), SOL=$125 (fresh Chainlink)
+    //      EWMA(20%) = 500*0.8 + 510*0.2 = $502.00; STOXX/SOL = 502/125 = 4.016000!
+    let mut c5: Clock = svm.get_sysvar(); c5.slot = s0 + 35; c5.unix_timestamp = 1_750_000_010; svm.set_sysvar(&c5);
+    svm.set_account(stoxx_feed, Account { lamports: 10_000_000, data: make_pyth_v2(stoxx_fid, 51_000_000_000, 10_000_000, -8, 1_750_000_009, s0 + 35, 1), owner: pyth_prog_id, executable: false, rent_epoch: 0 }).unwrap();
+    svm.set_account(sol_feed,   Account { lamports: 10_000_000, data: make_chainlink_ocr2(8, 4, 2, s0 + 35, 12_500_000_000i128), owner: cl_prog_id, executable: false, rent_epoch: 0 }).unwrap();
+    let cu_ewma_live = send_ok_assert_log(&mut svm, ix_ewma_crank(), &payer, &[&payer], "Program log: 0x1,");
+    assert_eq!(read_u64(&svm, &ewma_adp, 328), 502 * POS_SCALE, "Live EWMA(20%) $500->$510 = $502.00!");
+    assert_eq!(read_u64(&svm, &ewma_mkt, 112), 4_016_000, "Live EWMA STOXX/SOL = 502/125 = 4.016!");
+
+    // (e2) After-hours: STOXX closes (stale by +3,600s > 30s!), SOL moves live $125 -> $128!
+    //      Verify spoofed feed_id is STILL rejected, stale 24/7 quote SOL is STILL rejected,
+    //      and valid after-hours Crank carries ewma(STOXX)=$502 / live(SOL)=$128 = 3.921875!
+    let mut c6: Clock = svm.get_sysvar(); c6.slot = s0 + 36; c6.unix_timestamp = 1_750_003_610; svm.set_sysvar(&c6);
+    svm.set_account(stoxx_feed, Account { lamports: 10_000_000, data: make_pyth_v2([0xEEu8; 32], 51_000_000_000, 10_000_000, -8, 1_750_000_009, s0 + 35, 1), owner: pyth_prog_id, executable: false, rent_epoch: 0 }).unwrap();
+    svm.set_account(sol_feed,   Account { lamports: 10_000_000, data: make_chainlink_ocr2(8, 4, 2, s0 + 36, 12_800_000_000i128), owner: cl_prog_id, executable: false, rent_epoch: 0 }).unwrap();
+    send_err_custom(&mut svm, ix_ewma_crank(), &payer, &[&payer], 305, "After-hours still rejects wrong Pyth feed_id");
+    svm.set_account(stoxx_feed, Account { lamports: 10_000_000, data: make_pyth_v2(stoxx_fid, 51_000_000_000, 10_000_000, -8, 1_750_000_009, s0 + 35, 1), owner: pyth_prog_id, executable: false, rent_epoch: 0 }).unwrap();
+    svm.set_account(sol_feed,   Account { lamports: 10_000_000, data: make_chainlink_ocr2(8, 4, 2, s0 + 1,  12_800_000_000i128), owner: cl_prog_id, executable: false, rent_epoch: 0 }).unwrap();
+    send_err_custom(&mut svm, ix_ewma_crank(), &payer, &[&payer], 300, "After-hours still rejects stale 24/7 quote feed");
+    svm.set_account(sol_feed,   Account { lamports: 10_000_000, data: make_chainlink_ocr2(8, 4, 2, s0 + 36, 12_800_000_000i128), owner: cl_prog_id, executable: false, rent_epoch: 0 }).unwrap();
+    let cu_ewma_ah = send_ok_assert_log(&mut svm, ix_ewma_crank(), &payer, &[&payer], "Program log: 0x1,");
+    assert_eq!(read_u64(&svm, &ewma_adp, 328), 502 * POS_SCALE, "After-hours carries EWMA base=$502!");
+    assert_eq!(read_u64(&svm, &ewma_mkt, 112), 3_921_875, "After-hours STOXX/SOL = 502/128 = 3.921875!");
+
+    // (e3) Bounded PushEwmaMark (op=3): reject non-admin, reject >5% jump (306), accept $520 (+3.58%),
+    //      reject same-slot double push (308), then permissionless Crank reprices to 505.60/128 = 3.950!
+    send_err(&mut svm, ix_push_ewma(attacker.pubkey(), 510 * POS_SCALE), &payer, &[&payer, &attacker], "PushEwmaMark rejects non-admin");
+    send_err_custom(&mut svm, ix_push_ewma(lp.pubkey(), 550 * POS_SCALE), &payer, &[&payer, &lp], 306, "PushEwmaMark rejects >maxDevBps jump");
+    let cu_push_ewma = send_ok(&mut svm, ix_push_ewma(lp.pubkey(), 520 * POS_SCALE), &payer, &[&payer, &lp]);
+    assert_eq!(read_u64(&svm, &ewma_adp, 328), 505_600_000, "PushEwmaMark blended $502->$520 (20%) = $505.60!");
+    send_err_custom(&mut svm, ix_push_ewma(lp.pubkey(), 510 * POS_SCALE), &payer, &[&payer, &lp], 308, "PushEwmaMark rejects same-slot double push");
+    let mut c7: Clock = svm.get_sysvar(); c7.slot = s0 + 37; c7.unix_timestamp = 1_750_003_615; svm.set_sysvar(&c7);
+    svm.set_account(sol_feed, Account { lamports: 10_000_000, data: make_chainlink_ocr2(8, 4, 2, s0 + 37, 12_800_000_000i128), owner: cl_prog_id, executable: false, rent_epoch: 0 }).unwrap();
+    send_ok_assert_log(&mut svm, ix_ewma_crank(), &payer, &[&payer], "Program log: 0x1,");
+    assert_eq!(read_u64(&svm, &ewma_mkt, 112), 3_950_000, "After-hours Crank after PushEwmaMark = 505.60/128 = 3.950!");
+
+    // (e4) Market re-open: Pyth STOXX resumes live at $515.60 -> EWMA smoothly blends to $507.60!
+    let mut c8: Clock = svm.get_sysvar(); c8.slot = s0 + 38; c8.unix_timestamp = 1_750_003_620; svm.set_sysvar(&c8);
+    svm.set_account(stoxx_feed, Account { lamports: 10_000_000, data: make_pyth_v2(stoxx_fid, 51_560_000_000, 10_000_000, -8, 1_750_003_619, s0 + 38, 1), owner: pyth_prog_id, executable: false, rent_epoch: 0 }).unwrap();
+    svm.set_account(sol_feed,   Account { lamports: 10_000_000, data: make_chainlink_ocr2(8, 4, 2, s0 + 38, 12_800_000_000i128), owner: cl_prog_id, executable: false, rent_epoch: 0 }).unwrap();
+    send_ok_assert_log(&mut svm, ix_ewma_crank(), &payer, &[&payer], "Program log: 0x1,");
+    assert_eq!(read_u64(&svm, &ewma_adp, 328), 507_600_000, "Market re-open smoothly blends EWMA $505.60->$515.60 = $507.60!");
     println!(
-        "       Oracle Parsers: PythV2={} CU, ChainlinkOCR2={} CU, Switchboard128={} CU, Ratio(Pyth/CL)={} CU",
-        cu_pyth, cu_cl, cu_sb, cu_ratio
+        "       Oracle Parsers: PythV2={} CU, ChainlinkOCR2={} CU, Switchboard128={} CU, Ratio(Pyth/CL)={} CU, EWMA(live={} / AH={} / push={} CU)",
+        cu_pyth, cu_cl, cu_sb, cu_ratio, cu_ewma_live, cu_ewma_ah, cu_push_ewma
     );
 
     // 9B: Passive LP AMM Matcher CPI composition (Single-Signer Taker Open & Close!)
@@ -1957,7 +2050,7 @@ fn main() {
             &[&payer, &lp],
         );
         // Also wire an OracleAdapter CPI feed on a second set of adapters? We can rotate oracleAuth later for crank test!
-        let adp = create_prog_acc(&mut svm, &adapter_prog, 320);
+        let adp = create_prog_acc(&mut svm, &adapter_prog, 352);
         let (opda, obump) = Address::find_program_address(&[b"orac", adp.as_ref()], &adapter_prog);
         let feed = Keypair::new().pubkey();
         let mut fd = vec![0u8; 32];

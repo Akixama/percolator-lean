@@ -1,6 +1,6 @@
 # `percolator-lean` Formal Invariants & Proof Catalog
 
-Every economic, solvency, and risk-isolation invariant of `percolator-lean` is formalized in [`Percolator/Spec.lean`](Percolator/Spec.lean) and machine-checked in Lean 4's kernel in [`Percolator/Proofs.lean`](Percolator/Proofs.lean) and [`Percolator/TraceProofs.lean`](Percolator/TraceProofs.lean) (**69 theorems total**, **0 `sorry`**, **0 custom axioms**, and **0 external Lean dependencies**).
+Every economic, solvency, and risk-isolation invariant of `percolator-lean` is formalized in [`Percolator/Spec.lean`](Percolator/Spec.lean) and machine-checked in Lean 4's kernel in [`Percolator/Proofs.lean`](Percolator/Proofs.lean), [`Percolator/TraceProofs.lean`](Percolator/TraceProofs.lean), [`Percolator/Matcher.lean`](Percolator/Matcher.lean), and [`Percolator/OracleAdapter.lean`](Percolator/OracleAdapter.lean) (**72 theorems total**, **0 `sorry`**, **0 custom axioms**, and **0 external Lean dependencies**).
 
 ---
 
@@ -69,7 +69,7 @@ Every economic, solvency, and risk-isolation invariant of `percolator-lean` is f
 | Program | Lean 4 Theorems | Guarantee |
 |---|---|---|
 | **[`Percolator.Matcher`](Percolator/Matcher.lean)** | `quoteAsk_ge_mark`, `quoteBid_le_mark`, `quoteAsk_within_maxMove`, `quoteBid_within_maxMove` | Passive LP AMM ask quotes are always $\ge \text{markPrice}$, bid quotes are always $\le \text{markPrice}$, and both stay strictly within `±⌊markPrice * maxMoveBps / 10000⌋` (guaranteed to satisfy core `execPriceClamp`). |
-| **[`Percolator.OracleAdapter`](Percolator/OracleAdapter.lean)** | `crank_step_and_funding_within_clamp`, `ringBufferPrevIdx_lt`, `scaleToE6Nat_mono_and_id`, `ratio_crank_within_clamp` | Auto-clamped price convergence step plus on-chain premium funding (both single-feed and 2-leg composite ratio `base / quote`) always satisfy $|\Delta P| + \text{fundE6} \le \lfloor P_{\text{old}} \cdot \text{maxMoveBps} / 10000 \rfloor$; Chainlink OCR2 ring-buffer indexing is strictly in-bounds (`< liveLength`); E6 decimal scaling is monotone and exact at `d = 6`. |
+| **[`Percolator.OracleAdapter`](Percolator/OracleAdapter.lean)** | `crank_step_and_funding_within_clamp`, `ringBufferPrevIdx_lt`, `scaleToE6Nat_mono_and_id`, `ratio_crank_within_clamp`, `ewmaBlendNat_bounds`, `ewmaBlendNat_fixed_point`, `ewma_ratio_crank_within_clamp` | Auto-clamped price convergence step plus on-chain premium funding (single-feed, 2-leg ratio, live EWMA, and hybrid after-hours EWMA) always satisfy $|\Delta P| + \text{fundE6} \le \lfloor P_{\text{old}} \cdot \text{maxMoveBps} / 10000 \rfloor$; Chainlink OCR2 ring-buffer indexing is strictly in-bounds (`< liveLength`); E6 decimal scaling is monotone and exact at `d = 6`; EWMA blend stays strictly inside $[\min(\text{prev}, \text{spot}), \max(\text{prev}, \text{spot})]$ with exact fixed-point preservation (`ewma(p, p) = p`). |
 
 ---
 
