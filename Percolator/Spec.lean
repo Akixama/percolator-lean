@@ -815,4 +815,27 @@ def canPermissionlessWindDown (m : MarketState) (curSlot : Nat) : Prop :=
 def canRefreshAtSlot (m : MarketState) (curSlot : Nat) : Prop :=
   (m.status = .active ∧ (curSlot - m.lastOracleSlot) ≤ m.maxStaleness) ∨ m.status = .windDown
 
+/-- Exact capital-backed `reservedMm` update (`syncLegMargins` in `Program.lean`).
+    Maintains the unconditional inductive invariant `totalReservedMm ≤ capital` and prevents
+    any untrusted market from inflating its MM reservation to shield collateral from other legs. -/
+def syncReservedMm (cap totRes oldRes newTotMm newMm : Nat) : Nat × Nat :=
+  let baseRes   := totRes - oldRes
+  let availRes  := cap - baseRes
+  let capTarget := if cap ≥ newTotMm then newMm else min oldRes newMm
+  let newRes    := min capTarget availRes
+  (newRes, baseRes + newRes)
+
+/-- One arbitrary adversarial step on an untrusted `RUG` leg `(rugLoss, rugFee, newTotMm, newRugMm)`
+    updating `(cap, totRes, rugRes)` while preserving every other leg's `reservedMm`. -/
+def stepRugReservedState (cap totRes rugRes rugLoss rugFee newTotMm newRugMm : Nat) : Nat × Nat × Nat :=
+  let otherRes := totRes - rugRes
+  let avail1   := cap - otherRes
+  let capDeb   := min rugLoss avail1
+  let cap1     := cap - capDeb
+  let avail2   := cap1 - otherRes
+  let feeDeb   := min rugFee avail2
+  let cap2     := cap1 - feeDeb
+  let (rugRes', totRes') := syncReservedMm cap2 totRes rugRes newTotMm newRugMm
+  (cap2, totRes', rugRes')
+
 end Percolator.Spec

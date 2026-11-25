@@ -10,7 +10,7 @@ The repository ships a minimal core clearinghouse ([`percolator.so`](Percolator/
 
 | Program | ELF `.so` Size | sBPF Insns | Stack | Heap | Formal Lean 4 Proofs (`0 sorry`, `0` custom axioms) |
 |---|---:|---:|---:|---:|---|
-| **[`Percolator.Program`](Percolator/Program.lean)** (Core DEX) | **72,240 B** | 8,879 | 536 B | 0 B | 61 theorems (`Proofs.lean` + `TraceProofs.lean`) |
+| **[`Percolator.Program`](Percolator/Program.lean)** (Core DEX) | **73,224 B** | 9,002 | 552 B | 0 B | 64 theorems (`Proofs.lean` + `TraceProofs.lean`) |
 | **[`Percolator.Matcher`](Percolator/Matcher.lean)** (LP AMM CPI) | **8,744 B** | 973 | 712 B | 0 B | 4 theorems (`quoteAsk/Bid` bounds & clamp) |
 | **[`Percolator.OracleAdapter`](Percolator/OracleAdapter.lean)** (Pyth/CL/SB + Ratio + EWMA CPI) | **20,920 B** | 2,489 | 568 B | 0 B | 7 theorems (`crank_step_and_funding_within_clamp`, `ringBufferPrevIdx_lt`, `scaleToE6Nat_mono_and_id`, `ratio_crank_within_clamp`, `ewmaBlendNat_bounds`, `ewmaBlendNat_fixed_point`, `ewma_ratio_crank_within_clamp`) |
 
@@ -28,7 +28,7 @@ The repository ships a minimal core clearinghouse ([`percolator.so`](Percolator/
                 │ CPI (invoke_signed)                   │ CPI (invoke_signed)
                 ▼  InitPortfolio / Trade / Withdraw     ▼  UpdateOracle
 ┌──────────────────────────────────────────────────────────────────────────┐
-│                percolator-lean Core (72,240 B · 20 ops · 0 heap)         │
+│                percolator-lean Core (73,224 B · 20 ops · 0 heap)         │
 │  • Realizable Shared Cross-Margin      • On-Chain PDA Vault Creation     │
 │  • Per-Market Isolated R_m / I_m / A_m • Exact C + I + R + S = V         │
 │  • Fair Partial Takeover & Hand-Off    • Post-ADL Monotone Recovery      │
@@ -53,15 +53,15 @@ Keeping matching, AMM quoting, orderbooks, external oracle parsing, funding form
 3. **Instant backed profit realization:** Positive PnL on market $m$ (`posPnl`) is a claim strictly against market $m$'s own `realizedPool` $R_m$. On healthy markets ($R_m \ge P^+_m$ with `warmupSlots == 0`), `RefreshLeg` immediately credits `posPnl` **1:1 into shared `pfl.capital`** ($R_m \to C_{\text{tot}}$). Hedged multi-market portfolios (e.g. Long $500 BTC + Short $500 ETH on $100 shared capital) net 1:1 in a single atomic transaction `[RefreshLeg(ETH), RefreshLeg(BTC)]` with zero liquidation and zero warmup drag.
 4. **Insolvent haircut conservation:** When $R_m < P^+_m$, positive PnL payout is strictly bounded by floor division $\lfloor p \cdot \min(R_m, P^+_m) / P^+_m \rfloor \le \min(p, R_m)$, proven monotone non-decreasing for remaining claimants (`haircutPayout_monotone_ratio` — no first-mover drain).
 
-### 2.2 Per-Leg Loss Containment (`cross_margin_isolation_envelope`)
+### 2.2 Per-Leg Loss Containment & `reservedMm` Anti-Shielding Firewall
 
-Each `Portfolio` maintains `totalMm = ∑ active_leg.cachedMm` and `totalIm = ∑ active_leg.cachedIm`. When leg $j$ incurs a loss or liquidation fee, debits from shared `capital` are strictly capped at:
+Each `Portfolio` maintains `totalMm = ∑ active_leg.cachedMm`, `totalIm = ∑ active_leg.cachedIm`, and `totalReservedMm = ∑ active_leg.reservedMm` with the unconditional inductive invariant **`totalReservedMm ≤ capital`**. When leg $j$ incurs a loss or liquidation fee, debits from shared `capital` are strictly capped at:
 
-$$\text{capAvailableForLeg}(j) = \text{capital} - (\text{totalMm} - \text{leg}_j.\text{cachedMm})$$
+$$\text{capAvailableForLeg}(j) = \text{capital} - (\text{totalReservedMm} - \text{leg}_j.\text{reservedMm})$$
 
-This single rule proves both halves of `cross_margin_isolation_envelope`:
-- **Anti-Reverse-Contagion:** Even an arbitrarily large crash on a toxic leg (`SCAM`) leaves $\text{capital}' \ge \text{otherMm}$, protecting unrelated healthy legs (`BTC`, `ETH`) and keeping their insurance pools bit-for-bit untouched.
-- **Anti-Shielding:** Whenever a portfolio is healthy ($\text{capital} \ge \text{totalMm}$), $\text{capAvailableForLeg}(j) \ge \text{MM}_j \ge \text{stepLoss}_j + \text{liqFee}_j$ (under $\text{maxMoveBps} + \text{liqFeeBps} \le \text{mmBps}$), so fake legs can never shield capital from a healthy market's one-step loss + liquidation fee.
+On every margin refresh (`syncLegMargins`), a leg may only grow `reservedMm` above its prior reservation when `capital ≥ totalMm'` (and always bounded by `capital - otherRes`). This proves both halves of `cross_margin_isolation_envelope` AND `alice_mule_godmode_rug_zero_haircut_on_bob`:
+- **Anti-Reverse-Contagion:** Even an arbitrarily large crash on a toxic leg (`RUG/USD`) leaves $\text{capital}' \ge \text{otherRes}$, protecting unrelated healthy legs (`BTC`, `ETH`, `SOL`) and keeping their insurance pools bit-for-bit untouched.
+- **Unconditional Anti-Shielding (God-Mode `RUG` Oracle Immunity):** Even if Alice + Mule control `RUG/USD`'s oracle and pump `RUG/USD` 12×+ (Long or Short `RUG`) to inflate `rugLeg.cachedMm ≫ capital`, `totalReservedMm ≤ capital` holds unconditionally and `solLeg.reservedMm` is never reduced — guaranteeing $\text{capAvailableForLeg}(\text{SOL}) \ge \text{MM}_{\text{SOL}}$ so Bob's `SOL/USD` payout suffers **zero shortfall, zero insurance draw, and zero haircut**, while preserving 100% full cross-margin sharing of excess equity on healthy markets.
 
 Each market may also set an immutable nonzero maintenance-margin floor `minMm` (`computeMarginWithFloor`), eliminating dust-position liquidation griefing while strictly strengthening solvency (`minMm_strengthens_solvency`).
 
@@ -140,30 +140,30 @@ Key state transitions emit compact structured 5×`u64` logs via Solana's `sol_lo
 
 ## 6. Verification & Worst-Case Multi-Leg Benchmarks (LiteSVM / Agave 3.1.3)
 
-See [`INVARIANTS.md`](INVARIANTS.md) for all **72 kernel-checked Lean 4 theorems** (`0 sorry`, `0` custom axioms). All **11 end-to-end suites** in [`svm-runner/src/main.rs`](svm-runner/src/main.rs) pass 100% with **zero vault mocks**:
+See [`INVARIANTS.md`](INVARIANTS.md) for all **75 kernel-checked Lean 4 theorems** (`0 sorry`, `0` custom axioms). All **11 end-to-end suites** in [`svm-runner/src/main.rs`](svm-runner/src/main.rs) pass 100% with **zero vault mocks**:
 
 ### Worst-Case 8-Leg (`MAX_LEGS = 8`) & Double-8-Leg (16-Leg) CU and Wire-MTU Stress Benchmarks (Suite 11)
 
-Every worst-case actor path (users, cranks, and liquidation keepers) executes in **one single legacy Solana transaction** (`≤ 876 B / 1,232 B` UDP MTU, zero LUT required) at **≤ 10.2% of Solana's 200,000 default CU budget** (~70× below Solana's 1.4M max tx CU limit):
+Every worst-case actor path (users, cranks, and liquidation keepers) executes in **one single legacy Solana transaction** (`≤ 876 B / 1,232 B` UDP MTU, zero LUT required) at **≤ 10.5% of Solana's 200,000 default CU budget** (~66× below Solana's 1.4M max tx CU limit):
 
 | Role & Worst-Case Transaction | Compute Units | % of 200k Default CU | Legacy Wire Size | % of 1,232 B MTU |
 |---|---:|---:|---:|---:|
-| **User — 8-Leg Atomic Withdraw** `[8× RefreshLeg + WithdrawCollateral]` | **11,743 CU** | 5.9% | **793 B** | 64.4% |
-| **User — Double-8-Leg Trade** `[16× RefreshLeg + Trade]` (both parties at 8 legs) | **20,352 CU** | 10.2% | **865 B** | 70.2% |
-| **User — Position Hand-Off** `[7× RefreshLeg + Trade(mode=2 / mode=3)]` | **10,554 / 11,443 CU** | 5.3% / 5.7% | **793 B** | 64.4% |
-| **User — Post-ADL Open** `[15× RefreshLeg + Trade(mode=0)]` | **20,298 CU** | 10.1% | **857 B** | 69.6% |
-| **Liquidation Keeper — 8-Leg Fallback** `[7× RefreshLeg + Liquidate(mode=0)]` | **10,621 CU** | 5.3% | **690 B** | 56.0% |
-| **Liquidation Keeper — Double-8-Leg Post-ADL Takeover** `[14× RefreshLeg + Liquidate(mode=1)]` | **18,152 CU** | 9.1% | **876 B** | 71.1% |
+| **User — 8-Leg Atomic Withdraw** `[8× RefreshLeg + WithdrawCollateral]` | **12,039 CU** | 6.0% | **793 B** | 64.4% |
+| **User — Double-8-Leg Trade** `[16× RefreshLeg + Trade]` (both parties at 8 legs) | **21,047 CU** | 10.5% | **865 B** | 70.2% |
+| **User — Position Hand-Off** `[7× RefreshLeg + Trade(mode=2 / mode=3)]` | **10,947 / 11,872 CU** | 5.5% / 5.9% | **793 B** | 64.4% |
+| **User — Post-ADL Open** `[15× RefreshLeg + Trade(mode=0)]` | **20,982 CU** | 10.5% | **857 B** | 69.6% |
+| **Liquidation Keeper — 8-Leg Fallback** `[7× RefreshLeg + Liquidate(mode=0)]` | **11,124 CU** | 5.6% | **690 B** | 56.0% |
+| **Liquidation Keeper — Double-8-Leg Post-ADL Takeover** `[14× RefreshLeg + Liquidate(mode=1)]` | **18,828 CU** | 9.4% | **876 B** | 71.1% |
 | **Crank — 8-Market Oracle Batch** `[8× UpdateOracle]` (1 tx) | **4,976 CU** | 2.5% | **702 B** | 57.0% |
 | **Crank — Native Oracle Parsers (CPI)** (Pyth V2 / Chainlink OCR2 / Switchboard 128b / Ratio / EWMA live / AH / Push) | **2,525 / 2,478 / 3,425 / 2,797 / 2,816 / 2,686 / 377 CU** | 0.2%–1.7% | — | — |
-| **Crank — 8-Market CPI & Wind-Down** (`OracleAdapter` max/8×, `ForceClosePair`, `ResolveMarket`) | **2,396** (19,147 total) / **2,809** / **429 CU** | 1.2%–1.4% | — | — |
+| **Crank — 8-Market CPI & Wind-Down** (`OracleAdapter` max/8×, `ForceClosePair`, `ResolveMarket`) | **2,396** (19,147 total) / **2,948** / **429 CU** | 1.2%–1.5% | — | — |
 
 ### Full 11-Suite Verification Summary
 
 1. **Suite 1 — On-Chain `InitDex` PDA Vault Creation (`5,303 CU`)**: Creates real SPL Token `DexVault` PDA on-chain despite 1-lamport pre-funding griefing; rejects real executable `noop.so` as `tokenProg`, fake `sysProg`, and wrong PDA bump.
 2. **Suite 2 — Multi-Market Creation (`1,965 CU`)**: Rejects solvency-envelope violations; creates isolated `BTC`, `ETH`, `SCAM` markets.
 3. **Suite 3 — Cross-Margin Capital Efficiency (`trade 2,808 CU`, `refresh 1,162 CU`, `oracle 625 CU`)**: Long $500 BTC + Short $500 ETH on $100 shared capital survives a 7.84% parallel drop via atomic `[RefreshLeg(ETH), RefreshLeg(BTC)]` with `$100` intact and zero liquidation; verifies stale-leg withdrawal rejection and atomic withdrawal (`4,189 CU`).
-4. **Suite 4 — Anti-Reverse-Contagion & All-Leg Freshness (`liq 3,466 CU`)**: Rejects bare `Liquidate(SCAM)` while `BTC` leg is stale; atomic `[RefreshLeg(BTC), Liquidate(SCAM)]` liquidates `SCAM` leaving Alice with exact `capital == BTC_MM`, `I_BTC`/`I_ETH` untouched, and attacker capped at `R_SCAM`.
+4. **Suite 4 — Anti-Reverse-Contagion + God-Mode `RUG/USD` 12× Shielding Immunity (`liq 3,599 CU`)**: Rejects bare `Liquidate(SCAM)` while `BTC` leg is stale; atomic `[RefreshLeg(BTC), Liquidate(SCAM)]` leaves Alice with exact `capital == BTC_MM`, `I_BTC`/`I_ETH` untouched; plus **Suite 4B** runs both Long-`RUG` and Short-`RUG` 12× god-mode oracle pump shielding attacks verifying `solLeg.reservedMm == $50`, `I_SOL` untouched, and Bob1/Bob2 paid **100.00% (`+$40`)** with zero haircut.
 5. **Suite 5 — Runtime Security Regressions**: Rejects same-slot oracle spam, unclamped jumps, **real executable `noop.so` passed as `tokenProgram` across all 5 SPL CPI handlers (`Custom(120)`)**, wrong `mint` (`Custom(112)`), wrong `vaultPda` (`Custom(113)`), aliased trades, and live-OI insurance withdrawals.
 6. **Suite 6 — Post-ADL Recovery, Full Lifecycle, Event Logs & Rent Reclaim (`clearDeadLeg 1,054 CU`, `closeAccount 248 CU`)**: Full ADL → `ClearDeadLeg` → `WindDown` → `ForceClosePair` → `Resolve` → `Tombstone` → `CloseAccount` reclaiming 100% rent across Portfolio, InsReceipt, and Market while verifying structured `sol_log_64_` events.
 7. **Suite 7 — Core Composability & Donated-Insurance Tombstone**: Bounded `execPrice` spread transfer (rejects out-of-band), `oracleAuth`/`marketAdmin` rotation, `minMm` dust floor rejection, and permissionless insurance donation cleanly sweeping orphan donated insurance to `totalSurplus` on `ResolveMarket` + tombstoning.
@@ -179,7 +179,7 @@ Every worst-case actor path (users, cranks, and liquidation keepers) executes in
 ## 7. Build & Reproduce
 
 ```bash
-# Run full Lean 4 kernel proof verification (72 theorems, 0 sorry, 0 custom axioms),
+# Run full Lean 4 kernel proof verification (75 theorems, 0 sorry, 0 custom axioms),
 # compile all 3 sBPF .so binaries, and execute all 11 LiteSVM suites:
 ./scripts/build-and-test.sh
 ```

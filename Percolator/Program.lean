@@ -211,6 +211,7 @@ def findOrAllocLegSlot (pflData mktKey : Ptr) (mid : UInt64) : SolanaM UInt64 :=
   storeU64 lp LegOff.cachedMm 0
   storeU64 lp LegOff.cachedIm 0
   storeU64 lp LegOff.lastRefreshSlot 0
+  storeU64 lp LegOff.reservedMm 0
   let cnt ← loadU8 pflData PflOff.legCount
   storeU8 pflData PflOff.legCount (cnt + 1)
   return empty
@@ -283,27 +284,44 @@ def legEffectiveQty (mktData lp : Ptr) : SolanaM UInt64 := do
   let adl ← loadU64 mktData (if side == SIDE_LONG then MktOff.adlLong else MktOff.adlShort)
   mulDiv64 rawB adl ADL_ONE
 
-/-- Refresh `cachedMm` / `cachedIm` on `slotIdx` and maintain exact `pfl.totalMm` / `pfl.totalIm`. -/
+/-- Refresh `cachedMm` / `cachedIm` / `reservedMm` on `slotIdx` and maintain exact
+    `pfl.totalMm`, `pfl.totalIm`, and unconditional `pfl.totalReservedMm <= pfl.capital`!
+    Anti-shielding rule: a leg may ONLY grow `reservedMm` above `oldRes` when `capital >= newTotMm`,
+    and ALWAYS bounded by `capital - otherRes` so an untrusted market can NEVER inflate its
+    margin reservation to starve another market's `MM`! -/
 def syncLegMargins (mktData pflData : Ptr) (slotIdx curSlot : UInt64) : SolanaM Unit := do
   let lp := legPtrAt pflData slotIdx
-  let oldMm ← loadU64 lp LegOff.cachedMm
-  let oldIm ← loadU64 lp LegOff.cachedIm
+  let oldMm  ← loadU64 lp LegOff.cachedMm
+  let oldIm  ← loadU64 lp LegOff.cachedIm
+  let oldRes ← loadU64 lp LegOff.reservedMm
   let eff ← legEffectiveQty mktData lp
   let markP ← loadU64 mktData MktOff.markPrice
   let minMm ← loadU64 mktData MktOff.minMm
   let newMm ← computeMarginWithFloor eff markP (← loadU64 mktData MktOff.mmBps) minMm
   let newIm ← computeMarginWithFloor eff markP (← loadU64 mktData MktOff.imBps) minMm
-  let totMm ← loadU64 pflData PflOff.totalMm
-  let totIm ← loadU64 pflData PflOff.totalIm
-  let baseMm := if totMm >= oldMm then totMm - oldMm else 0
-  let baseIm := if totIm >= oldIm then totIm - oldIm else 0
-  storeU64 pflData PflOff.totalMm (← checkedAdd64 baseMm newMm)
-  storeU64 pflData PflOff.totalIm (← checkedAdd64 baseIm newIm)
-  storeU64 lp LegOff.cachedMm newMm
-  storeU64 lp LegOff.cachedIm newIm
+  let totMm  ← loadU64 pflData PflOff.totalMm
+  let totIm  ← loadU64 pflData PflOff.totalIm
+  let totRes ← loadU64 pflData PflOff.totalReservedMm
+  let baseMm  := if totMm  >= oldMm  then totMm  - oldMm  else 0
+  let baseIm  := if totIm  >= oldIm  then totIm  - oldIm  else 0
+  let baseRes := if totRes >= oldRes then totRes - oldRes else 0
+  let newTotMm ← checkedAdd64 baseMm newMm
+  let newTotIm ← checkedAdd64 baseIm newIm
+  let cap ← loadU64 pflData PflOff.capital
+  let availRes := if cap >= baseRes then cap - baseRes else 0
+  let capTarget :=
+    if cap >= newTotMm then newMm
+    else if oldRes < newMm then oldRes else newMm
+  let newRes := if capTarget < availRes then capTarget else availRes
+  storeU64 pflData PflOff.totalMm         newTotMm
+  storeU64 pflData PflOff.totalIm         newTotIm
+  storeU64 pflData PflOff.totalReservedMm (← checkedAdd64 baseRes newRes)
+  storeU64 lp LegOff.cachedMm        newMm
+  storeU64 lp LegOff.cachedIm        newIm
+  storeU64 lp LegOff.reservedMm      newRes
   storeU64 lp LegOff.lastRefreshSlot curSlot
 
-/-- Settle `entryK → kSide` with per-leg loss containment (`capAvailableForLeg = capital - otherMm`),
+/-- Settle `entryK → kSide` with per-leg loss containment (`capAvailableForLeg = capital - otherRes`),
     optionally realize backed `posPnl` directly into shared `pfl.capital`, and sync cached margins.
     Returns any unbacked loss `shortfall`. -/
 def settleAndRefreshLeg (dexData mktData pflData : Ptr) (slotIdx curSlot : UInt64)
@@ -327,13 +345,13 @@ def settleAndRefreshLeg (dexData mktData pflData : Ptr) (slotIdx curSlot : UInt6
       posPnl := posPnl - pnlBurned
       if pnlBurned > 0 then subU64At mktData MktOff.totalPosPnl pnlBurned
       let rem1 := loss - pnlBurned
-      -- Per-leg loss containment (`cross_margin_isolation_envelope`):
-      -- NEVER debit below `otherMm = totalMm - leg.cachedMm`!
+      -- Per-leg loss containment (`cross_margin_isolation_envelope` + anti-shielding):
+      -- NEVER debit below `otherRes = totalReservedMm - leg.reservedMm`!
       let cap ← loadU64 pflData PflOff.capital
-      let totMm ← loadU64 pflData PflOff.totalMm
-      let legMm ← loadU64 lp LegOff.cachedMm
-      let otherMm := if totMm >= legMm then totMm - legMm else 0
-      let availCap := if cap >= otherMm then cap - otherMm else 0
+      let totRes ← loadU64 pflData PflOff.totalReservedMm
+      let legRes ← loadU64 lp LegOff.reservedMm
+      let otherRes := if totRes >= legRes then totRes - legRes else 0
+      let availCap := if cap >= otherRes then cap - otherRes else 0
       let capDeb := if rem1 < availCap then rem1 else availCap
       if capDeb > 0 then
         storeU64 pflData PflOff.capital (cap - capDeb)
@@ -1066,9 +1084,10 @@ def handleLiquidate (input : Ptr) : SolanaM Unit := do
     else
       let g := if deficit > feeFloor then deficit else feeFloor
       if g < maxFee then g else maxFee
-  let legMm ← loadU64 lp LegOff.cachedMm
-  let otherMm := if totMm >= legMm then totMm - legMm else 0
-  let availForFee := if cap >= otherMm then cap - otherMm else 0
+  let legRes ← loadU64 lp LegOff.reservedMm
+  let totRes ← loadU64 fData PflOff.totalReservedMm
+  let otherRes := if totRes >= legRes then totRes - legRes else 0
+  let availForFee := if cap >= otherRes then cap - otherRes else 0
   let liqFee := if targetFee < availForFee then targetFee else availForFee
   if liqFee > 0 then
     storeU64 fData PflOff.capital (cap - liqFee)
@@ -1393,7 +1412,8 @@ def handleCloseAccount (input : Ptr) : SolanaM Unit := do
     SolanaM.require (dlen >= PflOff.size) Err.accountDataTooSmall
     requireKeyEq (AccountView.keyPtr authority) (data + PflOff.owner) PErr.ownerMismatch
     SolanaM.require ((← loadU64 data PflOff.capital) == 0 && (← loadU8 data PflOff.legCount) == 0 &&
-                     (← loadU64 data PflOff.totalMm) == 0 && (← loadU64 data PflOff.totalIm) == 0) PErr.nonzeroState
+                     (← loadU64 data PflOff.totalMm) == 0 && (← loadU64 data PflOff.totalIm) == 0 &&
+                     (← loadU64 data PflOff.totalReservedMm) == 0) PErr.nonzeroState
   else if magic == MAGIC_INSURANCE then
     SolanaM.require (dlen >= InsOff.size) Err.accountDataTooSmall
     requireKeyEq (AccountView.keyPtr authority) (data + InsOff.owner) PErr.ownerMismatch

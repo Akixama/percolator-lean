@@ -17,11 +17,11 @@ const SPL_TOKEN_RENT_MIN: u64 = 2_039_280;
 // Exact v2 layout constants matching Percolator/Layout.lean
 const DEX_SIZE: usize = 200;
 const MKT_SIZE: usize = 352;
-const PFL_SIZE: usize = 880;
+const PFL_SIZE: usize = 952;
 const INS_SIZE: usize = 88;
 const MAX_LEGS: usize = 8;
-const LEG_HEADER: usize = 112;
-const LEG_STRIDE: usize = 96;
+const LEG_HEADER: usize = 120;
+const LEG_STRIDE: usize = 104;
 const POS_SCALE: u64 = 1_000_000;
 const ADL_ONE: u64 = 1_000_000_000;
 
@@ -285,20 +285,29 @@ fn assert_dex_invariants(
         let cap = read_u64(svm, p, 88);
         let tot_mm = read_u64(svm, p, 96);
         let tot_im = read_u64(svm, p, 104);
+        let tot_res = read_u64(svm, p, 112);
         let leg_cnt = read_u8(svm, p, 4);
         let mut calc_mm: u64 = 0;
         let mut calc_im: u64 = 0;
+        let mut calc_res: u64 = 0;
         let mut calc_cnt: u8 = 0;
         for idx in 0..MAX_LEGS {
             let base = LEG_HEADER + idx * LEG_STRIDE;
             if read_u8(svm, p, base) != 0 {
+                let l_mm = read_u64(svm, p, base + 72);
+                let l_im = read_u64(svm, p, base + 80);
+                let l_res = read_u64(svm, p, base + 96);
+                assert!(l_res <= l_mm, "[{}] Leg reservedMm ({}) > cachedMm ({})", label, l_res, l_mm);
                 calc_cnt += 1;
-                calc_mm += read_u64(svm, p, base + 72);
-                calc_im += read_u64(svm, p, base + 80);
+                calc_mm += l_mm;
+                calc_im += l_im;
+                calc_res += l_res;
             }
         }
         assert_eq!(calc_mm, tot_mm, "[{}] Portfolio totalMm mismatch: calc {} != stored {}", label, calc_mm, tot_mm);
         assert_eq!(calc_im, tot_im, "[{}] Portfolio totalIm mismatch: calc {} != stored {}", label, calc_im, tot_im);
+        assert_eq!(calc_res, tot_res, "[{}] Portfolio totalReservedMm mismatch: calc {} != stored {}", label, calc_res, tot_res);
+        assert!(tot_res <= cap, "[{}] ANTI-SHIELDING VIOLATED: totalReservedMm ({}) > capital ({})", label, tot_res, cap);
         assert_eq!(calc_cnt, leg_cnt, "[{}] Portfolio legCount mismatch: calc {} != stored {}", label, calc_cnt, leg_cnt);
         sum_c += cap;
     }
@@ -1071,9 +1080,115 @@ fn main() {
     assert!(attacker_gain <= scam_r_before, "Attacker extracted {} > R_SCAM ({})!", attacker_gain, scam_r_before);
     assert_eq!(read_u64(&svm, &btc_mkt, 224), btc_ins_before, "I_BTC still untouched after Attacker claim!");
     assert_dex_invariants(&svm, &dex, &dex_vault, &all_mkts, &all_pfls, "post-scam-containment");
+
+    // 4B: God-Mode RUG/USD Oracle Shielding Attacks (Alice + Mule vs Bob on SOL/USD!)
+    //     Tests BOTH Long-RUG 12x pump AND Short-RUG 12x pump shielding attempts:
+    //     Alice + Mule control RUG's oracle & inflate rugLeg.cachedMm >> Alice.capital;
+    //     verify reservedMm firewall guarantees Bob receives 100.00% of his SOL/USD profit,
+    //     ZERO haircut on Bob, and I_SOL bit-for-bit untouched!
+    {
+        let s_dex = create_prog_acc(&mut svm, &prog_id, DEX_SIZE);
+        let (s_vault, s_bump) = derive_dex_vault(&prog_id, &s_dex);
+        send_ok(&mut svm, ix_init_dex(prog_id, s_dex, dex_admin.pubkey(), mint, s_vault, fee_vault, TOKEN_PROGRAM_ID, SYSTEM_PROGRAM_ID, s_bump, 6, 0, SPL_TOKEN_RENT_MIN), &payer, &[&payer, &dex_admin]);
+        let sol_orac = Keypair::new();
+        let rug_orac = Keypair::new();
+        let sol_mkt = create_prog_acc(&mut svm, &prog_id, MKT_SIZE);
+        let rug_mkt = create_prog_acc(&mut svm, &prog_id, MKT_SIZE);
+        let sol_ins = create_prog_acc(&mut svm, &prog_id, INS_SIZE);
+        send_ok(&mut svm, ix_create_market(prog_id, s_dex, sol_mkt, mint, sol_orac.pubkey(), lp.pubkey(), lp_tok, fee_vault, 100 * POS_SCALE, 20, 200, 0, 1000, 500, 100, 0, 400, 2500, 1_000_000 * POS_SCALE), &payer, &[&payer, &lp]);
+        send_ok(&mut svm, ix_create_market(prog_id, s_dex, rug_mkt, mint, rug_orac.pubkey(), attacker.pubkey(), attacker_tok, fee_vault, POS_SCALE, 20, 200, 0, 1000, 500, 100, 0, 400, 2500, 1_000_000 * POS_SCALE), &payer, &[&payer, &attacker]);
+        send_ok(&mut svm, ix_deposit_insurance(prog_id, s_dex, sol_mkt, sol_ins, lp.pubkey(), lp_tok, mint, s_vault, TOKEN_PROGRAM_ID, 500 * POS_SCALE), &payer, &[&payer, &lp]);
+
+        // 4B-1: Long-RUG 12x Pump Shielding Attack
+        let a1 = Keypair::new(); let b1 = Keypair::new(); let m1 = Keypair::new();
+        let a1_tok = create_tok_acc(&mut svm, &mint, &a1.pubkey(), 1_000 * POS_SCALE);
+        let b1_tok = create_tok_acc(&mut svm, &mint, &b1.pubkey(), 1_000 * POS_SCALE);
+        let m1_tok = create_tok_acc(&mut svm, &mint, &m1.pubkey(), 1_000 * POS_SCALE);
+        let a1_pfl = create_prog_acc(&mut svm, &prog_id, PFL_SIZE);
+        let b1_pfl = create_prog_acc(&mut svm, &prog_id, PFL_SIZE);
+        let m1_pfl = create_prog_acc(&mut svm, &prog_id, PFL_SIZE);
+        for (p, u, t, amt) in [
+            (a1_pfl, &a1, a1_tok, 120 * POS_SCALE),
+            (b1_pfl, &b1, b1_tok, 500 * POS_SCALE),
+            (m1_pfl, &m1, m1_tok, 20 * POS_SCALE),
+        ] {
+            send_ok(&mut svm, ix_init_portfolio(prog_id, s_dex, p, u.pubkey()), &payer, &[&payer, u]);
+            send_ok(&mut svm, ix_deposit_collateral(prog_id, s_dex, p, u.pubkey(), t, mint, s_vault, TOKEN_PROGRAM_ID, amt), &payer, &[&payer, u]);
+        }
+        // Alice1: Long 10 SOL ($1000, MM=$50, IM=$100) vs Bob1 + Long 200 RUG ($200, MM=$10, IM=$20) vs Mule1
+        send_ok(&mut svm, ix_trade(prog_id, s_dex, sol_mkt, a1_pfl, a1.pubkey(), b1_pfl, b1.pubkey(), 0, 10 * POS_SCALE), &payer, &[&payer, &a1, &b1]);
+        send_ok(&mut svm, ix_trade(prog_id, s_dex, rug_mkt, a1_pfl, a1.pubkey(), m1_pfl, m1.pubkey(), 0, 200 * POS_SCALE), &payer, &[&payer, &a1, &m1]);
+
+        // 4B-2: Short-RUG 12x Pump Shielding Attack (simultaneously on same markets!)
+        let a2 = Keypair::new(); let b2 = Keypair::new(); let m2 = Keypair::new();
+        let a2_tok = create_tok_acc(&mut svm, &mint, &a2.pubkey(), 1_000 * POS_SCALE);
+        let b2_tok = create_tok_acc(&mut svm, &mint, &b2.pubkey(), 1_000 * POS_SCALE);
+        let m2_tok = create_tok_acc(&mut svm, &mint, &m2.pubkey(), 1_000 * POS_SCALE);
+        let a2_pfl = create_prog_acc(&mut svm, &prog_id, PFL_SIZE);
+        let b2_pfl = create_prog_acc(&mut svm, &prog_id, PFL_SIZE);
+        let m2_pfl = create_prog_acc(&mut svm, &prog_id, PFL_SIZE);
+        for (p, u, t, amt) in [
+            (a2_pfl, &a2, a2_tok, 120 * POS_SCALE),
+            (b2_pfl, &b2, b2_tok, 500 * POS_SCALE),
+            (m2_pfl, &m2, m2_tok, 20 * POS_SCALE),
+        ] {
+            send_ok(&mut svm, ix_init_portfolio(prog_id, s_dex, p, u.pubkey()), &payer, &[&payer, u]);
+            send_ok(&mut svm, ix_deposit_collateral(prog_id, s_dex, p, u.pubkey(), t, mint, s_vault, TOKEN_PROGRAM_ID, amt), &payer, &[&payer, u]);
+        }
+        send_ok(&mut svm, ix_trade(prog_id, s_dex, sol_mkt, a2_pfl, a2.pubkey(), b2_pfl, b2.pubkey(), 0, 10 * POS_SCALE), &payer, &[&payer, &a2, &b2]);
+        send_ok(&mut svm, ix_trade(prog_id, s_dex, rug_mkt, m2_pfl, m2.pubkey(), a2_pfl, a2.pubkey(), 0, 200 * POS_SCALE), &payer, &[&payer, &m2, &a2]);
+
+        let s_mkts = vec![sol_mkt, rug_mkt];
+        let s_pfls = vec![a1_pfl, b1_pfl, m1_pfl, a2_pfl, b2_pfl, m2_pfl];
+
+        // Alice + Mule pump RUG/USD +4%/slot for 65 slots ($1 -> >$12.50, >12x!)
+        // WITHOUT refreshing on intermediate slots (direct 12x jump in cachedMm on slot +65!)
+        let base_sl = get_slot(&svm);
+        let mut rug_p = POS_SCALE;
+        for step in 1..=65u64 {
+            set_slot(&mut svm, base_sl + step);
+            rug_p = (rug_p * 104) / 100;
+            send_ok(&mut svm, ix_update_oracle(prog_id, rug_mkt, rug_orac.pubkey(), rug_p, 0, 0), &payer, &[&payer, &rug_orac]);
+        }
+        // Refresh RUG on both Alice1 (Long RUG) and Alice2 (Short RUG): cachedMm_RUG > $120!
+        send_ok(&mut svm, ix_refresh_leg(prog_id, s_dex, rug_mkt, a1_pfl, false), &payer, &[&payer]);
+        send_ok(&mut svm, ix_refresh_leg(prog_id, s_dex, rug_mkt, a2_pfl, false), &payer, &[&payer]);
+        let a1_rug_mm = read_u64(&svm, &a1_pfl, LEG_HEADER + LEG_STRIDE + 72);
+        let a2_rug_mm = read_u64(&svm, &a2_pfl, LEG_HEADER + LEG_STRIDE + 72);
+        assert!(a1_rug_mm > 120 * POS_SCALE && a2_rug_mm > 120 * POS_SCALE, "RUG cachedMm must exceed Alice's $120 capital!");
+        // Anti-shielding check: Alice1 & Alice2's SOL reservedMm MUST still be exact $50!
+        assert_eq!(read_u64(&svm, &a1_pfl, LEG_HEADER + 96), 50 * POS_SCALE, "Alice1 SOL reservedMm protected!");
+        assert_eq!(read_u64(&svm, &a2_pfl, LEG_HEADER + 96), 50 * POS_SCALE, "Alice2 SOL reservedMm protected!");
+        assert_eq!(read_u64(&svm, &a2_pfl, 88), 50 * POS_SCALE, "Alice2 capital stopped at exact SOL MM=$50!");
+        assert_eq!(read_u64(&svm, &a2_pfl, LEG_HEADER + LEG_STRIDE + 96), 0, "Alice2 RUG reservedMm capped at $0!");
+        assert_dex_invariants(&svm, &s_dex, &s_vault, &s_mkts, &s_pfls, "4B-post-rug-12x-pump");
+
+        // Now SOL/USD drops -4% ($100 -> $96: each Alice loses $40, each Bob earns +$40)!
+        set_slot(&mut svm, base_sl + 66);
+        send_ok(&mut svm, ix_update_oracle(prog_id, sol_mkt, sol_orac.pubkey(), 96 * POS_SCALE, 0, 0), &payer, &[&payer, &sol_orac]);
+        let sol_ins_before = read_u64(&svm, &sol_mkt, 224);
+        send_ixs_ok(&mut svm, &[
+            ix_refresh_leg(prog_id, s_dex, rug_mkt, a1_pfl, false),
+            ix_liquidate(prog_id, s_dex, sol_mkt, a1_pfl, keeper_tok, mint, s_vault, TOKEN_PROGRAM_ID),
+        ], &payer, &[&payer]);
+        send_ixs_ok(&mut svm, &[
+            ix_refresh_leg(prog_id, s_dex, rug_mkt, a2_pfl, false),
+            ix_liquidate(prog_id, s_dex, sol_mkt, a2_pfl, keeper_tok, mint, s_vault, TOKEN_PROGRAM_ID),
+        ], &payer, &[&payer]);
+        // I_SOL MUST be bit-for-bit untouched (ZERO shortfall on BOTH Alice1 and Alice2)!
+        assert_eq!(read_u64(&svm, &sol_mkt, 224), sol_ins_before, "I_SOL MUST be bit-for-bit untouched!");
+        // Both Bob1 and Bob2 collect 100.00% (+$40.00 each!) directly into their capital — ZERO haircut!
+        send_ok(&mut svm, ix_refresh_leg(prog_id, s_dex, sol_mkt, b1_pfl, false), &payer, &[&payer]);
+        send_ok(&mut svm, ix_refresh_leg(prog_id, s_dex, sol_mkt, b2_pfl, false), &payer, &[&payer]);
+        assert_eq!(read_u64(&svm, &b1_pfl, 88), 540 * POS_SCALE, "Bob1 received 100.00% (+$40) despite Long-RUG 12x shielding attack!");
+        assert_eq!(read_u64(&svm, &b2_pfl, 88), 540 * POS_SCALE, "Bob2 received 100.00% (+$40) despite Short-RUG 12x shielding attack!");
+        assert_dex_invariants(&svm, &s_dex, &s_vault, &s_mkts, &s_pfls, "4B-post-bob-100pct-payout");
+    }
+    // Restore clock slot to 119 for Suite 5 (4B used isolated s_dex)
+    set_slot(&mut svm, 119);
     println!(
-        "[PASS] Suite 4: Anti-Reverse-Contagion + Fake-PnL Containment (liq={} CU, Alice survived with cap={} >= BTC_MM={}, Attacker capped at {} <= R_SCAM={})",
-        cu_liq, alice_cap_after, alice_mm_after, attacker_gain, scam_r_before
+        "[PASS] Suite 4: Anti-Reverse-Contagion + God-Mode RUG 12x Shielding Immunity (liq={} CU, Alice survived cap={} >= BTC_MM={}, Bob1/Bob2 paid 100% +$40, I_SOL untouched!)",
+        cu_liq, alice_cap_after, alice_mm_after
     );
 
     // =========================================================================

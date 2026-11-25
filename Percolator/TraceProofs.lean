@@ -708,4 +708,93 @@ theorem reachable_global_solvency (mids pids : List Nat)
   unfold DexState.stockExact at hstock
   omega
 
+/-! ### Unconditional Anti-Shielding Proofs (`reservedMm` Firewall under God-Mode `RUG` Oracle) -/
+
+/-- **Unconditional `syncReservedMm` Soundness**:
+    Regardless of how large `newMm` or `newTotMm` becomes (even a 1,000,000× `RUG/USD` pump!),
+    `syncReservedMm` ALWAYS preserves `newTotRes ≤ cap`, `newRes ≤ newMm`, AND leaves every
+    other leg's available capital `cap - (newTotRes - solRes) ≥ solRes`! -/
+theorem syncReservedMm_preserves_bound_and_other_leg
+    (cap totRes oldRes newTotMm newMm solRes : Nat)
+    (hcap : totRes ≤ cap) (hold : oldRes ≤ totRes) (hsol : solRes ≤ totRes - oldRes) :
+    let (newRes, newTotRes) := syncReservedMm cap totRes oldRes newTotMm newMm
+    newTotRes ≤ cap ∧ newRes ≤ newMm ∧ solRes ≤ newTotRes ∧
+    cap - (newTotRes - solRes) ≥ solRes := by
+  unfold syncReservedMm
+  dsimp only
+  by_cases h : cap ≥ newTotMm
+  · simp only [h, ↓reduceIte]; omega
+  · simp only [h, ↓reduceIte]; omega
+
+/-- **Single-Step God-Mode `RUG/USD` Attack Immunity**:
+    For ANY `RUG/USD` loss, ANY `RUG/USD` liquidation fee, and ANY inflated `newRugMm`,
+    `stepRugReservedState` preserves `totRes' ≤ cap'`, `solRes + rugRes' ≤ totRes'`, AND
+    `cap' - (totRes' - solRes) ≥ solRes`! -/
+theorem rug_step_preserves_sol_reserved_mm
+    (cap totRes rugRes solRes rugLoss rugFee newTotMm newRugMm : Nat)
+    (hcap : totRes ≤ cap) (hdisj : solRes + rugRes ≤ totRes) :
+    let (cap', totRes', rugRes') :=
+      stepRugReservedState cap totRes rugRes rugLoss rugFee newTotMm newRugMm
+    totRes' ≤ cap' ∧ solRes + rugRes' ≤ totRes' ∧
+    cap' - (totRes' - solRes) ≥ solRes := by
+  unfold stepRugReservedState syncReservedMm
+  dsimp only
+  by_cases h : cap - min rugLoss (cap - (totRes - rugRes)) -
+      min rugFee (cap - min rugLoss (cap - (totRes - rugRes)) - (totRes - rugRes)) ≥ newTotMm
+  · simp only [h, ↓reduceIte]; omega
+  · simp only [h, ↓reduceIte]; omega
+
+/-- Apply an arbitrary finite sequence of god-mode `RUG/USD` oracle actions
+    `(rugLoss, rugFee, newTotMm, newRugMm)` to `(cap, totRes, rugRes)`. -/
+def runRugAttackTrace :
+    Nat × Nat × Nat → List (Nat × Nat × Nat × Nat) → Nat × Nat × Nat
+  | s, [] => s
+  | (cap, totRes, rugRes), (l, f, ntm, nrm) :: rest =>
+      runRugAttackTrace (stepRugReservedState cap totRes rugRes l f ntm nrm) rest
+
+/-- **Inductive Multi-Step God-Mode `RUG/USD` Oracle Immunity Theorem (Alice + Mule vs Bob)**:
+    Suppose Alice holds an honest `SOL/USD` leg (against Bob) with `solRes ≥ solMm` alongside
+    an untrusted `RUG/USD` leg whose oracle & admin are 100% controlled by Alice + Mule.
+    After ANY finite sequence of arbitrary `RUG/USD` pumps, dumps, funding blasts, liquidations,
+    or margin inflations, when `SOL/USD` moves against Alice by `solStepLoss` (≤ `solMm`):
+    1. `SOL/USD` STILL has `availCap(SOL) ≥ solMm` unconditionally (zero shielding!), AND
+    2. `applyContainedLoss` on `SOL/USD` produces **`shortfall = 0`** (Bob's `SOL/USD` positive PnL
+       is paid 100% in full — zero bad debt, zero draw on `I_SOL`, zero haircut on Bob!). -/
+theorem alice_mule_godmode_rug_zero_haircut_on_bob
+    (cap0 totRes0 rugRes0 solRes solMm solStepLoss : Nat)
+    (solLeg : LegState) (trace : List (Nat × Nat × Nat × Nat))
+    (hcap0 : totRes0 ≤ cap0)
+    (hdisj0 : solRes + rugRes0 ≤ totRes0)
+    (hsolMm : solMm ≤ solRes)
+    (hstep : solStepLoss ≤ solMm) :
+    let (capF, totResF, _) := runRugAttackTrace (cap0, totRes0, rugRes0) trace
+    let availSol := capF - (totResF - solRes)
+    let (_, _, _, _, shortfall) :=
+      applyContainedLoss capF totResF { solLeg with cachedMm := solRes } solStepLoss
+    availSol ≥ solMm ∧ shortfall = 0 := by
+  have hinv : ∀ (tr : List (Nat × Nat × Nat × Nat)) (c t r : Nat),
+      t ≤ c → solRes + r ≤ t →
+      let (c', t', r') := runRugAttackTrace (c, t, r) tr
+      t' ≤ c' ∧ solRes + r' ≤ t' := by
+    intro tr
+    induction tr with
+    | nil =>
+      intro c t r hc hd
+      exact ⟨hc, hd⟩
+    | cons act rest ih =>
+      intro c t r hc hd
+      rcases act with ⟨l, f, ntm, nrm⟩
+      dsimp only [runRugAttackTrace]
+      have h1 := rug_step_preserves_sol_reserved_mm c t r solRes l f ntm nrm hc hd
+      dsimp only at h1
+      exact ih _ _ _ h1.1 h1.2.1
+  have hfin := hinv trace cap0 totRes0 rugRes0 hcap0 hdisj0
+  cases hrun : runRugAttackTrace (cap0, totRes0, rugRes0) trace with
+  | mk capF pair =>
+    cases pair with
+    | mk totResF rugResF =>
+      rw [hrun] at hfin
+      dsimp only [applyContainedLoss, capAvailableForLeg]
+      omega
+
 end Percolator.TraceProofs

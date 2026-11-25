@@ -156,21 +156,22 @@ namespace MktOff
   def minMm          : UInt64 := 344 -- u64 (minimum nonzero MM floor; prevents dust griefing)
 end MktOff
 
-/-! ### Exact Byte Offsets: `Portfolio` (880 bytes = 112B header + 8 × 96B `Leg` slots) -/
+/-! ### Exact Byte Offsets: `Portfolio` (952 bytes = 120B header + 8 × 104B `Leg` slots) -/
 
 namespace PflOff
-  def headerSize  : UInt64 := 112
-  def legStride   : UInt64 := 96
-  def size        : UInt64 := 880  -- 112 + 8 * 96
-  def magic       : UInt64 := 0    -- u32 ("PFLO")
-  def legCount    : UInt64 := 4    -- u8 (0..8)
-  def portfolioId : UInt64 := 8    -- u64 (monotonic)
-  def episode     : UInt64 := 16   -- u64
-  def dex         : UInt64 := 24   -- Pubkey (32)
-  def owner       : UInt64 := 56   -- Pubkey (32)
-  def capital     : UInt64 := 88   -- u64 (shared cross-margin collateral!)
-  def totalMm     : UInt64 := 96   -- u64 (sum of active legs' cachedMm)
-  def totalIm     : UInt64 := 104  -- u64 (sum of active legs' cachedIm)
+  def headerSize      : UInt64 := 120
+  def legStride       : UInt64 := 104
+  def size            : UInt64 := 952  -- 120 + 8 * 104
+  def magic           : UInt64 := 0    -- u32 ("PFLO")
+  def legCount        : UInt64 := 4    -- u8 (0..8)
+  def portfolioId     : UInt64 := 8    -- u64 (monotonic)
+  def episode         : UInt64 := 16   -- u64
+  def dex             : UInt64 := 24   -- Pubkey (32)
+  def owner           : UInt64 := 56   -- Pubkey (32)
+  def capital         : UInt64 := 88   -- u64 (shared cross-margin collateral!)
+  def totalMm         : UInt64 := 96   -- u64 (sum of active legs' cachedMm)
+  def totalIm         : UInt64 := 104  -- u64 (sum of active legs' cachedIm)
+  def totalReservedMm : UInt64 := 112  -- u64 (sum of active legs' reservedMm; ALWAYS <= capital!)
 end PflOff
 
 namespace LegOff
@@ -184,6 +185,7 @@ namespace LegOff
   def cachedMm        : UInt64 := 72  -- u64 (latest MM requirement for this leg)
   def cachedIm        : UInt64 := 80  -- u64 (latest IM requirement for this leg)
   def lastRefreshSlot : UInt64 := 88  -- u64 (same-slot refresh witness!)
+  def reservedMm      : UInt64 := 96  -- u64 (capital-backed MM reservation; prevents shielding!)
 end LegOff
 
 /-! ### Exact Byte Offsets: `InsReceipt` (88 bytes — Per-Market Isolated Insurance LP Shares) -/
