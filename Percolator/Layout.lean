@@ -85,6 +85,8 @@ namespace PErr
   def oracleSameSlot     : UInt64 := 126
   def dexMismatch        : UInt64 := 127
   def invalidVaultState  : UInt64 := 128
+  def invalidSysProg     : UInt64 := 129
+  def execPriceClamp     : UInt64 := 130
 end PErr
 
 /-! ### Exact Byte Offsets: `Dex` (200 bytes) -/
@@ -112,7 +114,7 @@ end DexOff
 /-! ### Exact Byte Offsets: `Market` (344 bytes — Per-Market Isolated Risk Domain) -/
 
 namespace MktOff
-  def size           : UInt64 := 344
+  def size           : UInt64 := 352
   def magic          : UInt64 := 0   -- u32 ("MKTP")
   def status         : UInt64 := 4   -- u8
   def marketId       : UInt64 := 8   -- u64
@@ -148,6 +150,7 @@ namespace MktOff
   def resolvedNum    : UInt64 := 320 -- u64
   def resolvedDen    : UInt64 := 328 -- u64
   def activeLegs     : UInt64 := 336 -- u64
+  def minMm          : UInt64 := 344 -- u64 (minimum nonzero MM floor; prevents dust griefing)
 end MktOff
 
 /-! ### Exact Byte Offsets: `Portfolio` (880 bytes = 112B header + 8 × 96B `Leg` slots) -/
@@ -191,13 +194,13 @@ namespace InsOff
   def shares    : UInt64 := 80  -- u64
 end InsOff
 
-/-! ### Instruction Opcodes (18 clean unified instructions) -/
+/-! ### Instruction Opcodes (20 minimal unified instructions) -/
 
 namespace IxOp
   def initDex            : UInt8 := 0
   def updateCreateFee    : UInt8 := 1
   def createMarket       : UInt8 := 2
-  def burnMarketAdmin    : UInt8 := 3
+  def updateMarketAuth   : UInt8 := 3
   def updateOracle       : UInt8 := 4
   def initPortfolio      : UInt8 := 5
   def depositCollateral  : UInt8 := 6
@@ -213,6 +216,7 @@ namespace IxOp
   def resolveMarket      : UInt8 := 16
   def claimResolved      : UInt8 := 17
   def tombstoneMarket    : UInt8 := 18
+  def closeAccount       : UInt8 := 19
 end IxOp
 
 end Percolator

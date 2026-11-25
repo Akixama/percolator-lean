@@ -23,6 +23,7 @@ Every economic, solvency, and risk-isolation invariant of `percolator-lean` is f
 |---|---|---|
 | **Clamped Oracle Zero Bad Debt** | `oracle_clamp_zero_bad_debt` | Under the market solvency envelope $\text{maxMoveBps} + \text{liqFeeBps} \le \text{mmBps}$ and oracle clamp $|\Delta P| \cdot 10^4 \le P_{\text{old}} \cdot \text{maxMoveBps}$, any healthy position ($\text{equity} \ge \text{MM}$) satisfies $\text{stepLoss} + \text{liqFee} \le \text{equity}$ — zero bad debt and zero insurance theft on single-step moves. |
 | **Cross-Margin Isolation Envelope** | `cross_margin_isolation_envelope` | Simultaneously proves **both** halves of cross-margin containment for `applyContainedLoss` with `capAvailableForLeg = capital - (totalMm - leg.cachedMm)`: (1) **Anti-Reverse-Contagion:** any loss $L$ on a toxic leg leaves $\text{capital}' \ge \text{totalMm} - \text{leg.cachedMm}$, preserving maintenance margin for every other leg; (2) **Anti-Shielding:** whenever $\text{capital} \ge \text{totalMm}$, no other leg can shield `capital` from paying a healthy market's clamped 1-step loss + liquidation fee. |
+| **Minimum Nonzero MM Floor** | `minMm_strengthens_solvency` | Enforcing $\text{MM} = \max(\text{minMm}, \text{marginReq}(N, \text{mmBps}))$ strictly strengthens `oracle_clamp_zero_bad_debt` while preventing dust-liquidation griefing. |
 | **Zero-Sum Oracle Step** | `oracle_step_zero_sum` | Directional rounding guarantees credited winner delta $\lfloor A \cdot \Delta / 10^9 \rfloor \le \lceil A \cdot \Delta / 10^9 \rceil$ debited loser delta on every oracle tick. |
 
 ---
@@ -44,16 +45,25 @@ Every economic, solvency, and risk-isolation invariant of `percolator-lean` is f
 |---|---|---|
 | **Per-Market & Untouched-User Frame Isolation** | `createMarket_sound`, `depositCollateral_sound`, `withdrawCollateral_sound`, `depositInsurance_sound`, `withdrawInsurance_sound`, `realizeLegPnl_sound`, `settleContainedLoss_sound`, `tradeOpen_sound`, `tradeReduce_sound`, `liquidate_sound`, `clearDeadLeg_sound`, `forceClosePair_terminates_and_sound`, `claimResolved_sound` | Every transition on market $m$ and portfolio(s) $p$ proves `st'.markets otherMid = st.markets otherMid` for all $\text{otherMid} \ne m$ and `st'.portfolios otherPid = st.portfolios otherPid` for all untouched portfolios $\text{otherPid} \ne p$. |
 | **Zero Admin Custody / Contagion** | `admin_updateCreateFee_zero_contagion` | Protocol admin fee updates leave `stockExact`, `markets`, `portfolios`, and `insShares` identically unchanged. |
-| **Terminal Tombstone Permanence** | `tombstone_rejects_burnAdmin` | Tombstoned markets reject state-mutating instructions permanently. |
+| **Authority Rotation Isolation** | `updateMarketAuth_zero_contagion`, `tombstone_rejects_updateMarketAuth` | Rotating `oracleAuth` or transferring/burning `marketAdmin` preserves exact global stock equality and leaves balances, OI, portfolios, and other markets untouched; permanently rejected on tombstoned markets. |
 
 ---
 
-## 5. Runtime Boundary Checks Enforced On-Chain (`Percolator/Program.lean`)
+## 5. External Composable Program Proofs
+
+| Program | Lean 4 Theorems | Guarantee |
+|---|---|---|
+| **[`Percolator.Matcher`](Percolator/Matcher.lean)** | `quoteAsk_ge_mark`, `quoteBid_le_mark`, `quoteAsk_within_maxMove`, `quoteBid_within_maxMove` | Passive LP AMM ask quotes are always $\ge \text{markPrice}$, bid quotes are always $\le \text{markPrice}$, and both stay strictly within `±⌊markPrice * maxMoveBps / 10000⌋` (guaranteed to satisfy core `execPriceClamp`). |
+| **[`Percolator.OracleAdapter`](Percolator/OracleAdapter.lean)** | `crank_step_and_funding_within_clamp` | Auto-clamped price convergence step plus on-chain premium funding always satisfy $|\Delta P| + \text{fundE6} \le \lfloor P_{\text{old}} \cdot \text{maxMoveBps} / 10000 \rfloor$. |
+
+---
+
+## 6. Runtime Boundary Checks Enforced On-Chain (`Percolator/Program.lean`)
 
 Beyond the pure mathematical transitions, the compiled sBPF program enforces the Solana execution boundary:
 
-1. **Canonical Token Program Pinning:** All SPL CPIs require exact 32-byte match with `TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA`.
-2. **Cryptographic Vault PDA & SPL Account Integrity:** `InitDex` verifies `sol_sha256(["dvlt", dex, bump, progId, "ProgramDerivedAddress"]) == vaultPda` and asserts SPL owner, mint, self-ownership, 0 initial balance, `Initialized` state, no delegate, and no close authority.
+1. **Canonical Program Pinning:** All SPL CPIs require exact 32-byte match with `TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA`, and `InitDex` pins `SystemProgram` (`11111111111111111111111111111111`).
+2. **On-Chain `DexVault` PDA Creation & Integrity:** `InitDex` creates and initializes `vaultPda` on-chain via `SystemProgram::Transfer + Allocate + Assign` (signed by PDA `["dvlt", dex, bump]`) + `SPL Token InitializeAccount3`, cryptographically enforcing PDA derivation, clean zero-balance SPL state, no delegate, no close authority, and immunity to 1-lamport pre-funding griefing.
 3. **Per-Slot Oracle Rate Limit:** `UpdateOracle` enforces `curSlot > lastOracleSlot`, ensuring single-step clamped moves per slot.
 4. **Same-Slot Multi-Leg Freshness:** `WithdrawCollateral` and `Trade(mode=0)` enforce `leg.lastRefreshSlot == curSlot` for every active open leg, preventing stale-oracle collateral extraction while keeping flat withdrawals unconditional and `Liquidate` strictly $O(1)$.
-5. **Post-ADL Insurance & Resolution Lock:** `WithdrawInsurance` requires `oiLong == 0 ∧ oiShort == 0 ∧ rawBasisLong == 0 ∧ rawBasisShort == 0`; `ResolveMarket` additionally requires `activeLegs == 0`.
+5. **Post-ADL Insurance, Resolution & Safe Rent Reclaim:** `WithdrawInsurance` requires `oiLong == 0 ∧ oiShort == 0 ∧ rawBasisLong == 0 ∧ rawBasisShort == 0`; `ResolveMarket` additionally requires `activeLegs == 0`; `CloseAccount` only closes empty `Portfolio`/`InsReceipt` or `Tombstoned` `Market` and zeroes the magic word before draining lamports to prevent same-tx revival.

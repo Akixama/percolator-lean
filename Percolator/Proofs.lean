@@ -236,10 +236,21 @@ theorem cross_margin_isolation_envelope
     exact oracle_clamp_zero_bad_debt qty oldP newP (capAvailableForLeg capital totalMm leg.cachedMm)
       maxMoveBps liqFeeBps mmBps henv hclamp havail
 
+/-- Minimum nonzero MM floor (`max minMm (marginReq ...)`) strictly strengthens solvency! -/
+theorem minMm_strengthens_solvency
+    (qty oldP newP equity maxMoveBps liqFeeBps mmBps minMm : Nat)
+    (henv : maxMoveBps + liqFeeBps ≤ mmBps)
+    (hclamp : oracleClampOk oldP newP maxMoveBps)
+    (hhealthy : equity ≥ max minMm (marginReq (marginNotional qty oldP) mmBps)) :
+    let diff := if newP ≥ oldP then newP - oldP else oldP - newP
+    mulDivDown qty diff posScaleNat + mulDivDown (marginNotional qty oldP) liqFeeBps bpsDenNat ≤ equity := by
+  exact oracle_clamp_zero_bad_debt qty oldP newP equity maxMoveBps liqFeeBps mmBps henv hclamp
+    (Nat.le_trans (Nat.le_max_right _ _) hhealthy)
+
 /-! ### 5. Exact Global Stock Equality (`C_tot + I_tot + R_tot + S_tot = V`) & Isolation Across ALL Transitions -/
 
-theorem admin_updateCreateFee_zero_contagion (st st' : DexState) (signer newFee : Nat)
-    (h : stepUpdateCreateFee st signer newFee = some st') :
+theorem admin_updateCreateFee_zero_contagion (st st' : DexState) (signer newFee newAdmin : Nat)
+    (h : stepUpdateCreateFee st signer newFee newAdmin = some st') :
     st'.stockExact = st.stockExact ∧
     st'.markets = st.markets ∧
     st'.portfolios = st.portfolios ∧
@@ -303,9 +314,9 @@ theorem withdrawCollateral_sound (st st' : DexState) (pid amount curSlot otherPi
     unfold DexState.stockExact at *
     exact ⟨by dsimp only; omega, rfl, updateFn_ne _ _ _ _ hneP⟩
 
-theorem depositInsurance_sound (st st' : DexState) (mid lp amount otherMid : Nat)
+theorem depositInsurance_sound (st st' : DexState) (mid lp amount otherMid : Nat) (donate : Bool)
     (hstock : st.stockExact)
-    (h : stepDepositInsurance st mid lp amount = some st')
+    (h : stepDepositInsurance st mid lp amount donate = some st')
     (hneM : otherMid ≠ mid) :
     st'.stockExact ∧
     st'.markets otherMid = st.markets otherMid ∧
@@ -317,16 +328,20 @@ theorem depositInsurance_sound (st st' : DexState) (mid lp amount otherMid : Nat
     simp only [hm, Bind.bind, Option.bind] at h
     split at h
     · split at h
+      · cases h
+        unfold DexState.stockExact at *
+        exact ⟨by dsimp only; omega, updateFn_ne _ _ _ _ hneM, rfl⟩
       · split at h
-        · cases h
-        · cases h
-          unfold DexState.stockExact at *
-          exact ⟨by dsimp only; omega, updateFn_ne _ _ _ _ hneM, rfl⟩
-      · split at h
-        · cases h
-        · cases h
-          unfold DexState.stockExact at *
-          exact ⟨by dsimp only; omega, updateFn_ne _ _ _ _ hneM, rfl⟩
+        · split at h
+          · cases h
+          · cases h
+            unfold DexState.stockExact at *
+            exact ⟨by dsimp only; omega, updateFn_ne _ _ _ _ hneM, rfl⟩
+        · split at h
+          · cases h
+          · cases h
+            unfold DexState.stockExact at *
+            exact ⟨by dsimp only; omega, updateFn_ne _ _ _ _ hneM, rfl⟩
     · cases h
 
 theorem withdrawInsurance_sound (st st' : DexState) (mid lp burnShares otherMid : Nat)
@@ -400,9 +415,9 @@ theorem settleContainedLoss_sound (st st' : DexState) (mid pid loss otherMid oth
           exact ⟨by dsimp only; omega, updateFn_ne _ _ _ _ hneM, updateFn_ne _ _ _ _ hneP⟩
         · cases h
 
-theorem tradeOpen_sound (st st' : DexState) (mid pidL pidS qty otherMid otherPid : Nat)
+theorem tradeOpen_sound (st st' : DexState) (mid pidL pidS qty spreadLToS spreadSToL otherMid otherPid : Nat)
     (hstock : st.stockExact) (hwf : ∀ m, st.markets mid = some m → m.wf)
-    (h : stepTradeOpen st mid pidL pidS qty = some st')
+    (h : stepTradeOpen st mid pidL pidS qty spreadLToS spreadSToL = some st')
     (hneM : otherMid ≠ mid) (hneL : otherPid ≠ pidL) (hneS : otherPid ≠ pidS) :
     st'.stockExact ∧
     (∀ m', st'.markets mid = some m' → m'.wf) ∧
@@ -674,9 +689,28 @@ theorem resolved_payout_order_independent (m1 m2 : MarketState) (pnl : Nat)
     resolvedLegPayout m1 pnl = resolvedLegPayout m2 pnl := by
   unfold resolvedLegPayout; rw [hnum, hden]
 
-theorem tombstone_rejects_burnAdmin (st : DexState) (mid signer : Nat)
+theorem updateMarketAuth_zero_contagion (st st' : DexState) (mid signer role newKey otherMid : Nat)
+    (h : stepUpdateMarketAuth st mid signer role newKey = some st') (hne : otherMid ≠ mid) :
+    st'.stockExact = st.stockExact ∧
+    st'.markets otherMid = st.markets otherMid ∧
+    st'.portfolios = st.portfolios ∧
+    st'.insShares = st.insShares := by
+  unfold stepUpdateMarketAuth at h
+  cases hm : st.markets mid with
+  | none => simp [hm] at h
+  | some m =>
+    simp only [hm, Bind.bind, Option.bind] at h
+    split at h
+    · split at h
+      · cases h; exact ⟨rfl, updateFn_ne _ _ _ _ hne, rfl, rfl⟩
+      · split at h
+        · cases h; exact ⟨rfl, updateFn_ne _ _ _ _ hne, rfl, rfl⟩
+        · cases h
+    · cases h
+
+theorem tombstone_rejects_updateMarketAuth (st : DexState) (mid signer role newKey : Nat)
     (m : MarketState) (hm : st.markets mid = some m) (htomb : m.status = .tombstoned) :
-    stepBurnMarketAdmin st mid signer = none := by
-  unfold stepBurnMarketAdmin; simp [hm, htomb]
+    stepUpdateMarketAuth st mid signer role newKey = none := by
+  unfold stepUpdateMarketAuth; simp [hm, htomb]
 
 end Percolator.Proofs

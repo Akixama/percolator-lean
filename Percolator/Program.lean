@@ -50,42 +50,9 @@ def checkTokenProg (tokProg : AccountView) : SolanaM Unit := do
   SolanaM.require ((← loadU64 k 16) == SPL_TOK_W2) PErr.invalidTokenProg
   SolanaM.require ((← loadU64 k 24) == SPL_TOK_W3) PErr.invalidTokenProg
 
-/-- Cryptographically verify `vaultPda == create_program_address(["dvlt", dex.key, bump], progId)`
-    via `sol_sha256` AND validate it is a clean, empty, self-owned, non-delegated SPL Token Account. -/
-def verifyDexVaultPda (dex vaultPda tokProg mint : AccountView) (progId : Ptr) (bump : UInt8) :
-    SolanaM Unit := do
-  -- 80B SolBytes[5] + 32B digest + 32B scratch (tag:4, bump:1, "ProgramDerivedAddress":21) = 144B
-  let buf ← stackAlloc 144
-  let digest  := buf + 80
-  let scratch := buf + 112
-  storeU32 scratch 0  TAG_DEX_VAULT
-  storeU8  scratch 4  bump
-  -- "ProgramDerivedAddress" (21 bytes) starting at scratch + 8
-  let marker := scratch + 8
-  storeU64 marker 0  0x446d6172676f7250 -- "ProgramD"
-  storeU64 marker 8  0x6441646576697265 -- "erivedAd"
-  storeU32 marker 16 0x73657264         -- "dres"
-  storeU8  marker 20 0x73               -- "s"
-  -- 5 slice descriptors for sol_sha256
-  storeU64 buf 0  scratch;                  storeU64 buf 8  4
-  storeU64 buf 16 (AccountView.keyPtr dex); storeU64 buf 24 32
-  storeU64 buf 32 (scratch + 4);            storeU64 buf 40 1
-  storeU64 buf 48 progId;                   storeU64 buf 56 32
-  storeU64 buf 64 marker;                   storeU64 buf 72 21
-  let rc ← sysSha256 buf 5 digest
-  SolanaM.require (rc == 0) PErr.vaultMismatch
-  requireKeyEq digest (AccountView.keyPtr vaultPda) PErr.vaultMismatch
-
-  -- Validate SPL Token Account layout (165 bytes)
-  requireKeyEq (AccountView.ownerPtr vaultPda) (AccountView.keyPtr tokProg) PErr.invalidVaultState
-  SolanaM.require ((← AccountView.dataLen vaultPda) >= 165) PErr.invalidVaultState
-  let vData := AccountView.dataPtr vaultPda
-  requireKeyEq (vData + 0)  (AccountView.keyPtr mint)     PErr.mintMismatch
-  requireKeyEq (vData + 32) (AccountView.keyPtr vaultPda) PErr.invalidVaultState
-  SolanaM.require ((← loadU64 vData 64)  == 0) PErr.invalidVaultState -- amount == 0
-  SolanaM.require ((← loadU32 vData 72)  == 0) PErr.invalidVaultState -- delegate == None
-  SolanaM.require ((← loadU8  vData 108) == 1) PErr.invalidVaultState -- state == Initialized
-  SolanaM.require ((← loadU32 vData 129) == 0) PErr.invalidVaultState -- close_authority == None
+/-- Pin SystemProgram CPIs strictly to canonical `11111111111111111111111111111111` (all zeros). -/
+def checkSysProg (sysProg : AccountView) : SolanaM Unit := do
+  SolanaM.require (← pubkeyIsZero (AccountView.keyPtr sysProg)) PErr.invalidSysProg
 
 def getClockSlot : SolanaM UInt64 := do
   let buf ← stackAlloc 40
@@ -254,6 +221,11 @@ def computeMarginReq (effQty markPrice bps : UInt64) : SolanaM UInt64 := do
   if effQty == 0 then return 0
   mulDiv64Ceil (← mulDiv64Ceil effQty markPrice POS_SCALE) bps BPS_DEN
 
+def computeMarginWithFloor (effQty markPrice bps floor : UInt64) : SolanaM UInt64 := do
+  if effQty == 0 then return 0
+  let r ← computeMarginReq effQty markPrice bps
+  return if r < floor then floor else r
+
 def legEffectiveQty (mktData lp : Ptr) : SolanaM UInt64 := do
   let side ← loadU8 lp LegOff.side
   let rawB ← loadU64 lp LegOff.rawBasis
@@ -268,8 +240,9 @@ def syncLegMargins (mktData pflData : Ptr) (slotIdx curSlot : UInt64) : SolanaM 
   let oldIm ← loadU64 lp LegOff.cachedIm
   let eff ← legEffectiveQty mktData lp
   let markP ← loadU64 mktData MktOff.markPrice
-  let newMm ← computeMarginReq eff markP (← loadU64 mktData MktOff.mmBps)
-  let newIm ← computeMarginReq eff markP (← loadU64 mktData MktOff.imBps)
+  let minMm ← loadU64 mktData MktOff.minMm
+  let newMm ← computeMarginWithFloor eff markP (← loadU64 mktData MktOff.mmBps) minMm
+  let newIm ← computeMarginWithFloor eff markP (← loadU64 mktData MktOff.imBps) minMm
   let totMm ← loadU64 pflData PflOff.totalMm
   let totIm ← loadU64 pflData PflOff.totalIm
   let baseMm := if totMm >= oldMm then totMm - oldMm else 0
@@ -345,16 +318,26 @@ def settleAndRefreshLeg (dexData mktData pflData : Ptr) (slotIdx curSlot : UInt6
 /-! ### Instruction Handlers (All 19 Unified Instructions, Auto-Outlined by `lean-svm`) -/
 
 def handleInitDex (input : Ptr) : SolanaM Unit := do
-  let (dex, admin, mint, vaultPda, feeVault, tokProg, ix, progId) ← parse6 input
-  SolanaM.require (ix.len >= 12) Err.invalidInstructionData
-  requireSigner admin
+  let (dex, admin, mint, vaultPda, feeVault, tokProg, sysProg, ix, progId) ← parse7 input
+  SolanaM.require (ix.len >= 20) Err.invalidInstructionData
+  requireSigner admin; requireWritable vaultPda
   checkFreshAccount dex progId DexOff.size
   checkTokenProg tokProg
-  let vaultBump ← loadU8  ix.ptr 1
-  let decimals  ← loadU8  ix.ptr 2
-  let createFee ← loadU64 ix.ptr 4
-  SolanaM.require (createFee <= MAX_CREATE_FEE) PErr.invalidParams
-  verifyDexVaultPda dex vaultPda tokProg mint progId vaultBump
+  checkSysProg sysProg
+  let vaultBump    ← loadU8  ix.ptr 1
+  let decimals     ← loadU8  ix.ptr 2
+  let createFee    ← loadU64 ix.ptr 4
+  let rentLamports ← loadU64 ix.ptr 12
+  SolanaM.require (createFee <= MAX_CREATE_FEE && rentLamports >= 2_039_280) PErr.invalidParams
+
+  -- Create & initialize the `DexVault` PDA token account on-chain (works on real clusters &
+  -- immune to 1-lamport pre-funding griefing; runtime enforces PDA seeds ["dvlt", dex, bump]!).
+  let curLam ← AccountView.lamports vaultPda
+  if curLam < rentLamports then
+    systemTransfer sysProg admin vaultPda (rentLamports - curLam)
+  systemAllocateSigned sysProg vaultPda 165 TAG_DEX_VAULT (AccountView.keyPtr dex) vaultBump
+  systemAssignSigned   sysProg vaultPda (AccountView.keyPtr tokProg) TAG_DEX_VAULT (AccountView.keyPtr dex) vaultBump
+  tokenInitializeAccount3 tokProg vaultPda mint (AccountView.keyPtr vaultPda)
 
   let dData := AccountView.dataPtr dex
   storeU32 dData DexOff.magic MAGIC_DEX
@@ -370,8 +353,10 @@ def handleInitDex (input : Ptr) : SolanaM Unit := do
   storeU64 dData DexOff.createFee createFee
 
 def handleUpdateCreateFee (input : Ptr) : SolanaM Unit := do
-  let (dex, admin, ix, progId) ← parse2 input
+  let (n, dex, ix, progId) ← parseIxOnly input
+  SolanaM.require (n >= 2) Err.notEnoughAccountKeys
   SolanaM.require (ix.len >= 9) Err.invalidInstructionData
+  let admin ← AccountView.nextCursor dex
   requireSigner admin; requireWritable dex
   checkOwnedMagic dex progId DexOff.size MAGIC_DEX
   let dData := AccountView.dataPtr dex
@@ -379,6 +364,10 @@ def handleUpdateCreateFee (input : Ptr) : SolanaM Unit := do
   let newFee ← loadU64 ix.ptr 1
   SolanaM.require (newFee <= MAX_CREATE_FEE) PErr.invalidParams
   storeU64 dData DexOff.createFee newFee
+  if n >= 3 then
+    let newAdmin ← AccountView.nextCursor admin
+    SolanaM.require (!(← pubkeyIsZero (AccountView.keyPtr newAdmin))) PErr.invalidParams
+    pubkeyCopy (dData + DexOff.admin) (AccountView.keyPtr newAdmin)
 
 def handleCreateMarket (input : Ptr) : SolanaM Unit := do
   let (dex, mkt, mint, oracleAuth, creator, creatorTok, feeVaultTok, tokProg, ix, progId) ← parse8 input
@@ -402,6 +391,7 @@ def handleCreateMarket (input : Ptr) : SolanaM Unit := do
   let maxMoveBps    ← loadU64 ix.ptr 68
   let maxInsDrawBps ← loadU64 ix.ptr 76
   let maxOi         ← loadU64 ix.ptr 84
+  let minMm         ← if ix.len >= 100 then loadU64 ix.ptr 92 else pure 0
 
   SolanaM.require (initPrice > 0 && initPrice <= MAX_PRICE) PErr.invalidParams
   SolanaM.require (exitWindow >= MIN_EXIT_WINDOW && maxStaleness >= 1) PErr.invalidParams
@@ -441,19 +431,34 @@ def handleCreateMarket (input : Ptr) : SolanaM Unit := do
   storeU64 mData MktOff.adlShort ADL_ONE
   storeU64 mData MktOff.kLong K_ZERO
   storeU64 mData MktOff.kShort K_ZERO
+  storeU64 mData MktOff.minMm minMm
 
-def handleBurnMarketAdmin (input : Ptr) : SolanaM Unit := do
-  let (mkt, admin, _, progId) ← parse2 input
+/-- Burn (`n == 2` or zero key) or transfer `marketAdmin` (`role == 0`), or rotate `oracleAuth` (`role == 1`). -/
+def handleUpdateMarketAuth (input : Ptr) : SolanaM Unit := do
+  let (n, mkt, ix, progId) ← parseIxOnly input
+  SolanaM.require (n >= 2) Err.notEnoughAccountKeys
+  let admin ← AccountView.nextCursor mkt
   requireSigner admin; requireWritable mkt
   checkOwnedMagic mkt progId MktOff.size MAGIC_MARKET
   let mData := AccountView.dataPtr mkt
   SolanaM.require ((← loadU8 mData MktOff.status) != STATUS_TOMBSTONED) PErr.invalidStatus
   SolanaM.require (!(← pubkeyIsZero (mData + MktOff.marketAdmin))) PErr.unauthorized
   requireKeyEq (AccountView.keyPtr admin) (mData + MktOff.marketAdmin) PErr.unauthorized
-  storeU64 mData (MktOff.marketAdmin + 0)  0
-  storeU64 mData (MktOff.marketAdmin + 8)  0
-  storeU64 mData (MktOff.marketAdmin + 16) 0
-  storeU64 mData (MktOff.marketAdmin + 24) 0
+  let role ← if ix.len >= 2 then loadU8 ix.ptr 1 else pure 0
+  if role == 0 then
+    if n >= 3 then
+      let newAdmin ← AccountView.nextCursor admin
+      pubkeyCopy (mData + MktOff.marketAdmin) (AccountView.keyPtr newAdmin)
+    else
+      storeU64 mData (MktOff.marketAdmin + 0)  0
+      storeU64 mData (MktOff.marketAdmin + 8)  0
+      storeU64 mData (MktOff.marketAdmin + 16) 0
+      storeU64 mData (MktOff.marketAdmin + 24) 0
+  else
+    SolanaM.require (n >= 3) Err.notEnoughAccountKeys
+    let newOracle ← AccountView.nextCursor admin
+    SolanaM.require (!(← pubkeyIsZero (AccountView.keyPtr newOracle))) PErr.invalidParams
+    pubkeyCopy (mData + MktOff.oracleAuth) (AccountView.keyPtr newOracle)
 
 def handleUpdateOracle (input : Ptr) : SolanaM Unit := do
   let (mkt, oracleAuth, ix, progId) ← parse2 input
@@ -523,8 +528,7 @@ def handleDepositCollateral (input : Ptr) : SolanaM Unit := do
   checkOwnedMagic pfl progId PflOff.size MAGIC_PORTFOLIO
   let dData := AccountView.dataPtr dex
   let fData := AccountView.dataPtr pfl
-  requireKeyEq (AccountView.keyPtr dex)   (fData + PflOff.dex)   PErr.dexMismatch
-  requireKeyEq (AccountView.keyPtr owner) (fData + PflOff.owner) PErr.ownerMismatch
+  requireKeyEq (AccountView.keyPtr dex) (fData + PflOff.dex) PErr.dexMismatch
   checkDexVaultAndMint dData mint vaultPda tokProg
 
   let amount ← loadU64 ix.ptr 1
@@ -571,7 +575,7 @@ def handleWithdrawCollateral (input : Ptr) : SolanaM Unit := do
 def handleDepositInsurance (input : Ptr) : SolanaM Unit := do
   let (dex, mkt, receipt, lp, lpTok, mint, vaultPda, tokProg, ix, progId) ← parse8 input
   SolanaM.require (ix.len >= 9) Err.invalidInstructionData
-  requireSigner lp; requireWritable dex; requireWritable mkt; requireWritable receipt
+  requireSigner lp; requireWritable dex; requireWritable mkt
   checkOwnedMagic dex progId DexOff.size MAGIC_DEX
   checkOwnedMagic mkt progId MktOff.size MAGIC_MARKET
   let dData := AccountView.dataPtr dex
@@ -583,35 +587,44 @@ def handleDepositInsurance (input : Ptr) : SolanaM Unit := do
   SolanaM.require (st == STATUS_ACTIVE || st == STATUS_WINDDOWN) PErr.invalidStatus
   let amount ← loadU64 ix.ptr 1
   SolanaM.require (amount > 0) PErr.invalidParams
-
-  requireKeyEq (AccountView.ownerPtr receipt) progId Err.illegalOwner
-  SolanaM.require ((← AccountView.dataLen receipt) >= InsOff.size) Err.accountDataTooSmall
-  let rData := AccountView.dataPtr receipt
-  let mid ← loadU64 mData MktOff.marketId
-  if (← loadU32 rData InsOff.magic) == 0 then
-    storeU32 rData InsOff.magic MAGIC_INSURANCE
-    storeU64 rData InsOff.marketId mid
-    pubkeyCopy (rData + InsOff.owner)  (AccountView.keyPtr lp)
-    pubkeyCopy (rData + InsOff.market) (AccountView.keyPtr mkt)
-  else
-    SolanaM.require ((← loadU32 rData InsOff.magic) == MAGIC_INSURANCE) PErr.invalidMagic
-    requireKeyEq (AccountView.keyPtr lp)  (rData + InsOff.owner)  PErr.ownerMismatch
-    requireKeyEq (AccountView.keyPtr mkt) (rData + InsOff.market) PErr.marketMismatch
-    SolanaM.require ((← loadU64 rData InsOff.marketId) == mid) PErr.marketMismatch
-
-  let totSh ← loadU64 mData MktOff.totalInsShares
-  let ins   ← loadU64 mData MktOff.insurance
-  let minted ← if totSh == 0 || ins == 0 then pure amount else mulDiv64 amount totSh ins
-  SolanaM.require (minted > 0) PErr.invalidParams
+  let donate ← if ix.len >= 10 then loadU8 ix.ptr 9 else pure 0
 
   let dec ← loadU8 dData DexOff.decimals
-  tokenTransferChecked tokProg lpTok mint vaultPda lp amount dec
+  if donate != 0 then
+    -- Permissionless permanent insurance donation (0 LP shares minted!)
+    tokenTransferChecked tokProg lpTok mint vaultPda lp amount dec
+    addU64At dData DexOff.vaultBalance   amount
+    addU64At dData DexOff.totalInsurance amount
+    addU64At mData MktOff.insurance      amount
+  else
+    requireWritable receipt
+    requireKeyEq (AccountView.ownerPtr receipt) progId Err.illegalOwner
+    SolanaM.require ((← AccountView.dataLen receipt) >= InsOff.size) Err.accountDataTooSmall
+    let rData := AccountView.dataPtr receipt
+    let mid ← loadU64 mData MktOff.marketId
+    if (← loadU32 rData InsOff.magic) == 0 then
+      storeU32 rData InsOff.magic MAGIC_INSURANCE
+      storeU64 rData InsOff.marketId mid
+      pubkeyCopy (rData + InsOff.owner)  (AccountView.keyPtr lp)
+      pubkeyCopy (rData + InsOff.market) (AccountView.keyPtr mkt)
+    else
+      SolanaM.require ((← loadU32 rData InsOff.magic) == MAGIC_INSURANCE) PErr.invalidMagic
+      requireKeyEq (AccountView.keyPtr lp)  (rData + InsOff.owner)  PErr.ownerMismatch
+      requireKeyEq (AccountView.keyPtr mkt) (rData + InsOff.market) PErr.marketMismatch
+      SolanaM.require ((← loadU64 rData InsOff.marketId) == mid) PErr.marketMismatch
 
-  addU64At dData DexOff.vaultBalance   amount
-  addU64At dData DexOff.totalInsurance amount
-  addU64At mData MktOff.insurance      amount
-  addU64At mData MktOff.totalInsShares minted
-  addU64At rData InsOff.shares         minted
+    let totSh ← loadU64 mData MktOff.totalInsShares
+    let ins   ← loadU64 mData MktOff.insurance
+    let minted ← if totSh == 0 || ins == 0 then pure amount else mulDiv64 amount totSh ins
+    SolanaM.require (minted > 0) PErr.invalidParams
+
+    tokenTransferChecked tokProg lpTok mint vaultPda lp amount dec
+
+    addU64At dData DexOff.vaultBalance   amount
+    addU64At dData DexOff.totalInsurance amount
+    addU64At mData MktOff.insurance      amount
+    addU64At mData MktOff.totalInsShares minted
+    addU64At rData InsOff.shares         minted
 
 def handleWithdrawInsurance (input : Ptr) : SolanaM Unit := do
   let (dex, mkt, receipt, lp, destTok, mint, vaultPda, tokProg, ix, progId) ← parse8 input
@@ -679,6 +692,28 @@ def handleRefreshLeg (input : Ptr) : SolanaM Unit := do
   let _ ← settleAndRefreshLeg dData mData fData slotIdx curSlot forceHaircut
   freeLegIfEmpty fData slotIdx
 
+/-- Apply optional bounded `execPrice` spread transfer directly between Long & Short `capital`.
+    Preserves `C_tot` identically and allows external CLOB/AMM/matcher CPIs with real spreads! -/
+def applyExecSpread (mData fLData fSData : Ptr) (qty execPrice : UInt64) : SolanaM Unit := do
+  if execPrice == 0 then return ()
+  let markP ← loadU64 mData MktOff.markPrice
+  if execPrice == markP then return ()
+  let diff := if execPrice > markP then execPrice - markP else markP - execPrice
+  let maxSlip ← mulDiv64 markP (← loadU64 mData MktOff.maxMoveBps) BPS_DEN
+  SolanaM.require (diff <= maxSlip) PErr.execPriceClamp
+  let spread ← mulDiv64Ceil qty diff POS_SCALE
+  if spread > 0 then
+    if execPrice > markP then
+      let cL ← loadU64 fLData PflOff.capital
+      SolanaM.require (cL >= spread) PErr.insufficientFunds
+      storeU64 fLData PflOff.capital (cL - spread)
+      addU64At fSData PflOff.capital spread
+    else
+      let cS ← loadU64 fSData PflOff.capital
+      SolanaM.require (cS >= spread) PErr.insufficientFunds
+      storeU64 fSData PflOff.capital (cS - spread)
+      addU64At fLData PflOff.capital spread
+
 def handleTrade (input : Ptr) : SolanaM Unit := do
   let (dex, mkt, pflL, ownerL, pflS, ownerS, ix, progId) ← parse6 input
   SolanaM.require (ix.len >= 10) Err.invalidInstructionData
@@ -700,8 +735,9 @@ def handleTrade (input : Ptr) : SolanaM Unit := do
   requireKeyEq (AccountView.keyPtr ownerL) (fLData + PflOff.owner) PErr.ownerMismatch
   requireKeyEq (AccountView.keyPtr ownerS) (fSData + PflOff.owner) PErr.ownerMismatch
 
-  let mode ← loadU8  ix.ptr 1
-  let qty  ← loadU64 ix.ptr 2
+  let mode      ← loadU8  ix.ptr 1
+  let qty       ← loadU64 ix.ptr 2
+  let execPrice ← if ix.len >= 18 then loadU64 ix.ptr 10 else pure 0
   SolanaM.require (qty > 0) PErr.invalidParams
 
   let st ← loadU8 mData MktOff.status
@@ -726,6 +762,7 @@ def handleTrade (input : Ptr) : SolanaM Unit := do
 
     let _ ← settleAndRefreshLeg dData mData fLData slotL curSlot false
     let _ ← settleAndRefreshLeg dData mData fSData slotS curSlot false
+    applyExecSpread mData fLData fSData qty execPrice
 
     let oiL ← loadU64 mData MktOff.oiLong
     let oiS ← loadU64 mData MktOff.oiShort
@@ -787,6 +824,7 @@ def handleTrade (input : Ptr) : SolanaM Unit := do
 
     let _ ← settleAndRefreshLeg dData mData fLData slotL curSlot false
     let _ ← settleAndRefreshLeg dData mData fSData slotS curSlot false
+    applyExecSpread mData fLData fSData qty execPrice
 
     let oiL ← loadU64 mData MktOff.oiLong
     let oiS ← loadU64 mData MktOff.oiShort
@@ -1133,7 +1171,40 @@ def handleTombstoneMarket (input : Ptr) : SolanaM Unit := do
                    (← loadU64 mData MktOff.totalPosPnl) == 0) PErr.nonzeroState
   storeU8 mData MktOff.status STATUS_TOMBSTONED
 
-/-! ### Top-Level Solana Entrypoint (`lean-svm` lowers opcode dispatch to O(log2 19) binary search!) -/
+/-- Unified rent reclaim for empty `Portfolio`, empty `InsReceipt`, or `Tombstoned` `Market`.
+    Zeroes magic before draining lamports to prevent same-tx revival attacks! -/
+def handleCloseAccount (input : Ptr) : SolanaM Unit := do
+  let (acc, authority, dest, _, progId) ← parse3 input
+  requireSigner authority; requireWritable acc; requireWritable dest
+  requireKeyNe (AccountView.keyPtr acc) (AccountView.keyPtr dest) PErr.aliasedAccounts
+  requireKeyEq (AccountView.ownerPtr acc) progId Err.illegalOwner
+  let dlen ← AccountView.dataLen acc
+  let data := AccountView.dataPtr acc
+  let magic ← loadU32 data 0
+  if magic == MAGIC_PORTFOLIO then
+    SolanaM.require (dlen >= PflOff.size) Err.accountDataTooSmall
+    requireKeyEq (AccountView.keyPtr authority) (data + PflOff.owner) PErr.ownerMismatch
+    SolanaM.require ((← loadU64 data PflOff.capital) == 0 && (← loadU8 data PflOff.legCount) == 0 &&
+                     (← loadU64 data PflOff.totalMm) == 0 && (← loadU64 data PflOff.totalIm) == 0) PErr.nonzeroState
+  else if magic == MAGIC_INSURANCE then
+    SolanaM.require (dlen >= InsOff.size) Err.accountDataTooSmall
+    requireKeyEq (AccountView.keyPtr authority) (data + InsOff.owner) PErr.ownerMismatch
+    SolanaM.require ((← loadU64 data InsOff.shares) == 0) PErr.nonzeroState
+  else if magic == MAGIC_MARKET then
+    SolanaM.require (dlen >= MktOff.size) Err.accountDataTooSmall
+    SolanaM.require ((← loadU8 data MktOff.status) == STATUS_TOMBSTONED) PErr.invalidStatus
+    if !(← pubkeyIsZero (data + MktOff.marketAdmin)) then
+      requireKeyEq (AccountView.keyPtr authority) (data + MktOff.marketAdmin) PErr.unauthorized
+  else
+    SolanaM.fail PErr.invalidMagic
+
+  storeU32 data 0 0
+  let accLam  ← AccountView.lamports acc
+  let destLam ← AccountView.lamports dest
+  AccountView.setLamports dest (← checkedAdd64 destLam accLam)
+  AccountView.setLamports acc 0
+
+/-! ### Top-Level Solana Entrypoint (`lean-svm` lowers opcode dispatch to O(log2 20) binary search!) -/
 
 def dispatch (input : Ptr) : SolanaM Unit := do
   let (_, _, ix, _) ← parseIxOnly input
@@ -1142,7 +1213,7 @@ def dispatch (input : Ptr) : SolanaM Unit := do
   if op == IxOp.initDex                 then handleInitDex input
   else if op == IxOp.updateCreateFee    then handleUpdateCreateFee input
   else if op == IxOp.createMarket       then handleCreateMarket input
-  else if op == IxOp.burnMarketAdmin    then handleBurnMarketAdmin input
+  else if op == IxOp.updateMarketAuth   then handleUpdateMarketAuth input
   else if op == IxOp.updateOracle       then handleUpdateOracle input
   else if op == IxOp.initPortfolio      then handleInitPortfolio input
   else if op == IxOp.depositCollateral  then handleDepositCollateral input
@@ -1158,6 +1229,7 @@ def dispatch (input : Ptr) : SolanaM Unit := do
   else if op == IxOp.resolveMarket      then handleResolveMarket input
   else if op == IxOp.claimResolved      then handleClaimResolved input
   else if op == IxOp.tombstoneMarket    then handleTombstoneMarket input
+  else if op == IxOp.closeAccount       then handleCloseAccount input
   else SolanaM.fail PErr.invalidInstruction
 
 def entrypoint (input : Ptr) (s : SvmState) : UInt64 × SvmState :=

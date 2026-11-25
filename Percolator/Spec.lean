@@ -189,8 +189,12 @@ def resolvedLegPayout (m : MarketState) (legPnl : Nat) : Nat :=
 def updateFn {α β : Type} [DecidableEq α] (f : α → β) (k : α) (v : β) : α → β :=
   fun x => if x = k then v else f x
 
-def stepUpdateCreateFee (st : DexState) (signer newFee : Nat) : Option DexState :=
-  if signer = st.protocolAdmin then some { st with createFee := newFee } else none
+def stepUpdateCreateFee (st : DexState) (signer newFee newAdmin : Nat) : Option DexState :=
+  if signer = st.protocolAdmin then
+    some { st with
+      createFee := newFee
+      protocolAdmin := if newAdmin = 0 then st.protocolAdmin else newAdmin }
+  else none
 
 def stepCreateMarket (st : DexState)
     (admin initPrice exitWin maxStale imBps mmBps liqBps tradeBps maxMove maxIns maxOi curSlot : Nat) :
@@ -215,10 +219,16 @@ def stepCreateMarket (st : DexState)
       markets := updateFn st.markets mid (some m) }
   else none
 
-def stepBurnMarketAdmin (st : DexState) (mid signer : Nat) : Option DexState := do
+/-- Burn or transfer `marketAdmin` (`role = 0`) or rotate `oracleAuth` (`role = 1`).
+    Never modifies balances, OI, positions, or other markets; rejected on tombstoned markets. -/
+def stepUpdateMarketAuth (st : DexState) (mid signer role newKey : Nat) : Option DexState := do
   let m ← st.markets mid
   if m.status ≠ .tombstoned ∧ m.marketAdmin ≠ 0 ∧ signer = m.marketAdmin then
-    some { st with markets := updateFn st.markets mid (some { m with marketAdmin := 0 }) }
+    if role = 0 then
+      some { st with markets := updateFn st.markets mid (some { m with marketAdmin := newKey }) }
+    else if newKey ≠ 0 then
+      some { st with markets := updateFn st.markets mid (some m) }
+    else none
   else none
 
 def stepDepositCollateral (st : DexState) (pid amount : Nat) : Option DexState := do
@@ -248,19 +258,26 @@ def stepWithdrawCollateral (st : DexState) (pid amount curSlot : Nat) : Option D
       portfolios   := updateFn st.portfolios pid (some pfl') }
   else none
 
-def stepDepositInsurance (st : DexState) (mid lp amount : Nat) : Option DexState := do
+def stepDepositInsurance (st : DexState) (mid lp amount : Nat) (donate : Bool := false) : Option DexState := do
   let m ← st.markets mid
   if (m.status = .active ∨ m.status = .windDown) ∧ amount > 0 then
-    let minted :=
-      if m.totalInsShares = 0 ∨ m.insurance = 0 then amount
-      else (amount * m.totalInsShares) / m.insurance
-    if minted = 0 then none
-    let m' := { m with insurance := m.insurance + amount, totalInsShares := m.totalInsShares + minted }
-    some { st with
-      vault          := st.vault + amount
-      totalInsurance := st.totalInsurance + amount
-      markets        := updateFn st.markets mid (some m')
-      insShares      := updateFn st.insShares mid (updateFn (st.insShares mid) lp (st.insShares mid lp + minted)) }
+    if donate then
+      let m' := { m with insurance := m.insurance + amount }
+      some { st with
+        vault          := st.vault + amount
+        totalInsurance := st.totalInsurance + amount
+        markets        := updateFn st.markets mid (some m') }
+    else
+      let minted :=
+        if m.totalInsShares = 0 ∨ m.insurance = 0 then amount
+        else (amount * m.totalInsShares) / m.insurance
+      if minted = 0 then none
+      let m' := { m with insurance := m.insurance + amount, totalInsShares := m.totalInsShares + minted }
+      some { st with
+        vault          := st.vault + amount
+        totalInsurance := st.totalInsurance + amount
+        markets        := updateFn st.markets mid (some m')
+        insShares      := updateFn st.insShares mid (updateFn (st.insShares mid) lp (st.insShares mid lp + minted)) }
   else none
 
 def stepWithdrawInsurance (st : DexState) (mid lp burnShares : Nat) : Option DexState := do
@@ -325,10 +342,11 @@ def stepSettleContainedLoss (st : DexState) (mid pid loss : Nat) : Option DexSta
       portfolios    := updateFn st.portfolios pid (some pfl') }
   else none
 
-/-- Bilateral matched open/increase trade on Market `mid` between `pidL ≠ pidS`:
-    Fees move from `totalCapital` into Market `mid`'s isolated `insurance`, preserving exact
-    `C_tot + I_tot + R_tot + S_tot = V` and `oiLong = oiShort`! -/
-def stepTradeOpen (st : DexState) (mid pidL pidS qty : Nat) : Option DexState := do
+/-- Bilateral matched open/increase trade on Market `mid` between `pidL ≠ pidS` with optional
+    bounded `execPrice` spread (`spreadLToS` / `spreadSToL` transferred strictly between `pL` and `pS`):
+    Fees move from `totalCapital` into Market `mid`'s isolated `insurance`; spread transfer leaves
+    `totalCapital` unchanged — preserving exact `C_tot + I_tot + R_tot + S_tot = V` and `oiLong = oiShort`! -/
+def stepTradeOpen (st : DexState) (mid pidL pidS qty spreadLToS spreadSToL : Nat) : Option DexState := do
   if pidL = pidS then none
   let m ← st.markets mid
   let pL ← st.portfolios pidL
@@ -337,15 +355,17 @@ def stepTradeOpen (st : DexState) (mid pidL pidS qty : Nat) : Option DexState :=
   if m.status = .active ∧ qty > 0 ∧
      m.adlLong = adlOneNat ∧ m.adlShort = adlOneNat ∧
      m.oiLong + qty ≤ m.maxOi ∧ m.oiShort + qty ≤ m.maxOi ∧
-     pL.capital ≥ fee ∧ pS.capital ≥ fee ∧ st.totalCapital ≥ 2 * fee then
+     pL.capital + spreadSToL ≥ fee + spreadLToS ∧
+     pS.capital + spreadLToS ≥ fee + spreadSToL ∧
+     st.totalCapital ≥ 2 * fee then
     let m' := { m with
       insurance     := m.insurance + 2 * fee
       oiLong        := m.oiLong + qty
       oiShort       := m.oiShort + qty
       rawBasisLong  := m.rawBasisLong + qty
       rawBasisShort := m.rawBasisShort + qty }
-    let pL' := { pL with capital := pL.capital - fee }
-    let pS' := { pS with capital := pS.capital - fee }
+    let pL' := { pL with capital := pL.capital + spreadSToL - spreadLToS - fee }
+    let pS' := { pS with capital := pS.capital + spreadLToS - spreadSToL - fee }
     let ps1 := updateFn st.portfolios pidL (some pL')
     let ps2 := updateFn ps1 pidS (some pS')
     some { st with
