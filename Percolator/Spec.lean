@@ -794,4 +794,25 @@ def stepLiquidateChecked (st : DexState) (mid pid curSlot liqFeeCap loss : Nat) 
     stepLiquidate st mid pid liqFeeCap loss
   else none
 
+/-- Sweep orphan donated insurance (`totalInsShares = 0`) on a `Resolved` market into `totalSurplus`,
+    preserving exact `C_tot + I_tot + R_tot + S_tot = V` and enabling clean market tombstoning. -/
+def stepSweepOrphanInsurance (st : DexState) (mid : Nat) : Option DexState := do
+  let m ← st.markets mid
+  if m.status = .resolved ∧ m.totalPosPnl = 0 ∧ m.totalInsShares = 0 ∧
+     m.insurance > 0 ∧ st.totalInsurance ≥ m.insurance then
+    let m' := { m with insurance := 0 }
+    some { st with
+      totalInsurance := st.totalInsurance - m.insurance
+      totalSurplus   := st.totalSurplus + m.insurance
+      markets        := updateFn st.markets mid (some m') }
+  else none
+
+/-- Permissionless `StartWindDown` gate (adminless/stale path): succeeds iff active and `curSlot - lastOracleSlot > maxStaleness`. -/
+def canPermissionlessWindDown (m : MarketState) (curSlot : Nat) : Prop :=
+  m.status = .active ∧ (curSlot - m.lastOracleSlot) > m.maxStaleness
+
+/-- `RefreshLeg` oracle-freshness gate: succeeds immediately when active with fresh oracle OR already in `WindDown`. -/
+def canRefreshAtSlot (m : MarketState) (curSlot : Nat) : Prop :=
+  (m.status = .active ∧ (curSlot - m.lastOracleSlot) ≤ m.maxStaleness) ∨ m.status = .windDown
+
 end Percolator.Spec

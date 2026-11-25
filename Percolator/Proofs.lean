@@ -425,9 +425,10 @@ theorem tradeOpen_sound (st st' : DexState) (mid pidL pidS qty spreadLToS spread
     st'.markets otherMid = st.markets otherMid ∧
     st'.portfolios otherPid = st.portfolios otherPid := by
   unfold stepTradeOpen at h
-  split at h
-  · cases h
-  · cases hm : st.markets mid with
+  by_cases heq : pidL = pidS
+  · simp [heq] at h
+  · simp only [heq, ↓reduceIte] at h
+    cases hm : st.markets mid with
     | none => simp [hm] at h
     | some m =>
       cases hpL : st.portfolios pidL with
@@ -436,19 +437,28 @@ theorem tradeOpen_sound (st st' : DexState) (mid pidL pidS qty spreadLToS spread
         cases hpS : st.portfolios pidS with
         | none => simp [hm, hpL, hpS] at h
         | some pS =>
-          simp [hm, hpL, hpS] at h
-          rcases h with ⟨⟨hstat, _, _, _, hoiLMax, _, _, _, htc⟩, hst⟩; subst hst
-          have hmWf := hwf m hm
-          refine ⟨?_, ?_, updateFn_ne _ _ _ _ hneM, ?_⟩
-          · unfold DexState.stockExact at *; dsimp only; omega
-          · intro m' hm'
-            dsimp only at hm'; rw [updateFn_eq] at hm'; cases hm'
-            rcases hmWf with ⟨hoi, hadl, henv⟩
-            have hoiAct := hoi (Or.inl hstat)
-            unfold MarketState.wf MarketState.oiBalanced MarketState.adlValid at *
-            exact ⟨fun _ => by dsimp only; exact ⟨by omega, hoiLMax⟩,
-                   by dsimp only; exact ⟨by omega, by omega, hadl.2.2.1, hadl.2.2.2⟩, henv⟩
-          · dsimp only; rw [updateFn_ne _ _ _ _ hneS, updateFn_ne _ _ _ _ hneL]
+          simp only [hm, hpL, hpS, Bind.bind, Option.bind] at h
+          by_cases hc : m.status = .active ∧ qty > 0 ∧
+              m.adlLong = adlOneNat ∧ m.adlShort = adlOneNat ∧
+              m.oiLong + qty ≤ m.maxOi ∧ m.oiShort + qty ≤ m.maxOi ∧
+              pL.capital + spreadSToL ≥ marginReq (marginNotional qty m.markPrice) m.tradeFeeBps + spreadLToS ∧
+              pS.capital + spreadLToS ≥ marginReq (marginNotional qty m.markPrice) m.tradeFeeBps + spreadSToL ∧
+              st.totalCapital ≥ 2 * marginReq (marginNotional qty m.markPrice) m.tradeFeeBps
+          · simp only [hc, and_self, ↓reduceIte, Option.some.injEq] at h
+            subst h
+            rcases hc with ⟨hstat, _, _, _, hoiLMax, _, _, _, htc⟩
+            have hmWf := hwf m hm
+            refine ⟨?_, ?_, updateFn_ne _ _ _ _ hneM, ?_⟩
+            · unfold DexState.stockExact at *; dsimp only; omega
+            · intro m' hm'
+              dsimp only at hm'; rw [updateFn_eq] at hm'; cases hm'
+              rcases hmWf with ⟨hoi, hadl, henv⟩
+              have hoiAct := hoi (Or.inl hstat)
+              unfold MarketState.wf MarketState.oiBalanced MarketState.adlValid at *
+              exact ⟨fun _ => by dsimp only; exact ⟨by omega, hoiLMax⟩,
+                     by dsimp only; exact ⟨by omega, by omega, Nat.le_refl _, Nat.le_refl _⟩, henv⟩
+            · dsimp only; rw [updateFn_ne _ _ _ _ hneS, updateFn_ne _ _ _ _ hneL]
+          · simp only [hc, ↓reduceIte] at h; cases h
 
 theorem tradeReduce_sound (st st' : DexState) (mid pidL pidS qty otherMid otherPid : Nat)
     (hstock : st.stockExact) (hwf : ∀ m, st.markets mid = some m → m.wf)
@@ -1241,10 +1251,16 @@ theorem tradeOpenPostAdl_sound
         | none => simp [hm, hpL, hpS] at h
         | some pS =>
           simp only [hm, hpL, hpS, Bind.bind, Option.bind] at h
-          split at h
-          · next hc =>
+          by_cases hc : m.status = .active ∧ qty > 0 ∧
+              (m.rawBasisLong = 0 ∨ m.oiLong > 0) ∧
+              (m.rawBasisShort = 0 ∨ m.oiShort > 0) ∧
+              m.oiLong + qty ≤ m.maxOi ∧ m.oiShort + qty ≤ m.maxOi ∧
+              pL.capital + spSL ≥ marginReq (marginNotional qty m.markPrice) m.tradeFeeBps + spLS ∧
+              pS.capital + spLS ≥ marginReq (marginNotional qty m.markPrice) m.tradeFeeBps + spSL ∧
+              st.totalCapital ≥ 2 * marginReq (marginNotional qty m.markPrice) m.tradeFeeBps
+          · simp only [hc, and_self, ↓reduceIte, Option.some.injEq] at h
             rcases hc with ⟨hact, _, _, _, hmaxL, _, _, _, htotCap⟩
-            cases h
+            subst h
             have hmWf := hwf m hm
             rcases hmWf with ⟨hoi, hadl, henv⟩
             have ⟨hbal, _⟩ := hoi (Or.inl hact)
@@ -1259,7 +1275,7 @@ theorem tradeOpenPostAdl_sound
                 ⟨by dsimp only; omega, by dsimp only; omega, deriveAdl_le_one _ _, deriveAdl_le_one _ _⟩, henv⟩
             · dsimp only
               rw [updateFn_ne _ _ _ _ hneS, updateFn_ne _ _ _ _ hneL]
-          · cases h
+          · simp only [hc, ↓reduceIte] at h; cases h
 
 /-- B4 Soundness Theorem (`Trade` mode = 2/3 Same-Side Position Hand-Off):
     Preserves `stockExact`, leaves the ENTIRE `MarketState` (`oiLong`, `oiShort`, `rawBasisLong`,

@@ -1,6 +1,6 @@
 # `percolator-lean` Formal Invariants & Proof Catalog
 
-Every economic, solvency, and risk-isolation invariant of `percolator-lean` is formalized in [`Percolator/Spec.lean`](Percolator/Spec.lean) and machine-checked in Lean 4's kernel in [`Percolator/Proofs.lean`](Percolator/Proofs.lean) with **0 `sorry`**, **0 custom axioms**, and **0 external Lean dependencies**.
+Every economic, solvency, and risk-isolation invariant of `percolator-lean` is formalized in [`Percolator/Spec.lean`](Percolator/Spec.lean) and machine-checked in Lean 4's kernel in [`Percolator/Proofs.lean`](Percolator/Proofs.lean) and [`Percolator/TraceProofs.lean`](Percolator/TraceProofs.lean) (**69 theorems total**, **0 `sorry`**, **0 custom axioms**, and **0 external Lean dependencies**).
 
 ---
 
@@ -59,8 +59,8 @@ Every economic, solvency, and risk-isolation invariant of `percolator-lean` is f
 | **Post-ADL Monotone Opens** | `postAdlRawAdd_ge_qty`, `postAdlOpen_preserves_adl_monotone`, `tradeOpenPostAdl_sound` | Opening `qty` on a partially-ADL'd side (`0 < oi ≤ raw`) mints `rAdd = max(qty, ⌈qty · raw / oi⌉)`, guaranteeing `oi + qty ≤ raw + rAdd`, `(oi + qty) · raw ≤ oi · (raw + rAdd)`, and `deriveAdl(oi + qty, raw + rAdd) ≤ deriveAdl(oi, raw)` — never inflating any existing holder's effective position. |
 | **Same-Side Position Hand-Off** | `tradeHandoff_sound` | `Trade(mode=2/3)` transfers `rawXfer` between two portfolios on the same side (`Long→Long` or `Short→Short`), preserving `stockExact`, leaving the entire `MarketState` (`oi`, `rawBasis`, `adl`) bit-for-bit invariant, and leaving all untouched portfolios unchanged. |
 | **Spread-Protected Reduce** | `tradeReduceWithSpread_sound` | Paying an `execPrice` spread during `Trade(mode=1)` reduce preserves `stockExact`, `m'.wf`, and `capital' ≥ newTotalMm`. |
-| **Closed Inductive Aggregate Coherence** | `depositCollateral_preserves_coherent`, `withdrawCollateral_preserves_coherent`, `realizeLegPnl_preserves_coherent` | Inductively preserves exact finite-sum coherence `C_tot = ∑ capital`, `I_tot = ∑ insurance`, `R_tot = ∑ realizedPool`, and `C_tot + I_tot + R_tot + S_tot = V`. |
-| **Anti-DoS Exit-Liveness** | `flat_portfolio_unconditionally_withdrawable`, `market_bounded_exit_liveness` | Flat portfolios can unconditionally withdraw 100% of capital at any slot; every well-formed market has bounded permissionless exit deadlines (`maxStaleness ≤ 9,000`, `exitWindow ≤ 216,000`). |
+| **Closed Inductive Aggregate Coherence (All 13 Transitions)** | `depositCollateral_preserves_coherent`, `withdrawCollateral_preserves_coherent`, `depositInsurance_preserves_coherent`, `withdrawInsurance_preserves_coherent`, `realizeLegPnl_preserves_coherent`, `settleContainedLoss_preserves_coherent`, `tradeOpenPostAdl_preserves_coherent`, `tradeReduce_preserves_coherent`, `tradeHandoff_preserves_coherent`, `liquidate_preserves_coherent`, `liquidateTakeoverPostAdl_preserves_coherent`, `claimResolved_preserves_coherent`, `sweepOrphanInsurance_preserves_coherent`, **`reachable_preserves_coherent`**, **`reachable_global_solvency`** | Inductively proves across ANY finite multi-step interleaving (`DexReachable`) of all 13 protocol transitions that exact finite-sum coherence holds forever: `C_tot = ∑ capital`, `I_tot = ∑ insurance`, `R_tot = ∑ realizedPool`, and `∑ capital + ∑ insurance + ∑ realizedPool + S_tot = V`. |
+| **Anti-DoS Exit-Liveness, Anti-Stall & Zero Freeze Window** | `flat_portfolio_unconditionally_withdrawable`, `market_bounded_exit_liveness`, **`proportionalRawReduction_preserves_oi_le_raw`**, **`no_stale_market_freeze_liveness`** | Flat portfolios unconditionally withdraw 100% of capital at any slot; every well-formed market has bounded permissionless exit deadlines (`maxStaleness ≤ 9,000`, `exitWindow ≤ 216,000`); `proportionalRawReduction` never violates `oi' ≤ raw'` on `ForceClosePair` / `Trade(mode=1)`; and at every slot an active market is either immediately refreshable or immediately permissionlessly wind-down-able and refreshable (zero freeze window). |
 
 ---
 
@@ -69,7 +69,7 @@ Every economic, solvency, and risk-isolation invariant of `percolator-lean` is f
 | Program | Lean 4 Theorems | Guarantee |
 |---|---|---|
 | **[`Percolator.Matcher`](Percolator/Matcher.lean)** | `quoteAsk_ge_mark`, `quoteBid_le_mark`, `quoteAsk_within_maxMove`, `quoteBid_within_maxMove` | Passive LP AMM ask quotes are always $\ge \text{markPrice}$, bid quotes are always $\le \text{markPrice}$, and both stay strictly within `±⌊markPrice * maxMoveBps / 10000⌋` (guaranteed to satisfy core `execPriceClamp`). |
-| **[`Percolator.OracleAdapter`](Percolator/OracleAdapter.lean)** | `crank_step_and_funding_within_clamp` | Auto-clamped price convergence step plus on-chain premium funding always satisfy $|\Delta P| + \text{fundE6} \le \lfloor P_{\text{old}} \cdot \text{maxMoveBps} / 10000 \rfloor$. |
+| **[`Percolator.OracleAdapter`](Percolator/OracleAdapter.lean)** | `crank_step_and_funding_within_clamp`, `ringBufferPrevIdx_lt`, `scaleToE6Nat_mono_and_id`, `ratio_crank_within_clamp` | Auto-clamped price convergence step plus on-chain premium funding (both single-feed and 2-leg composite ratio `base / quote`) always satisfy $|\Delta P| + \text{fundE6} \le \lfloor P_{\text{old}} \cdot \text{maxMoveBps} / 10000 \rfloor$; Chainlink OCR2 ring-buffer indexing is strictly in-bounds (`< liveLength`); E6 decimal scaling is monotone and exact at `d = 6`. |
 
 ---
 

@@ -1456,9 +1456,9 @@ fn main() {
     svm.add_program(matcher_prog, &matcher_elf).expect("matcher ELF load failed");
     svm.add_program(adapter_prog, &adapter_elf).expect("adapter ELF load failed");
 
-    // 9A: OracleAdapter CPI composition
+    // 9A: OracleAdapter CPI composition (Custom + Pyth V2 + Chainlink OCR2 + Switchboard + 2-Leg Ratio!)
     let comp_mkt2 = create_prog_acc(&mut svm, &prog_id, MKT_SIZE);
-    let adp_acc = create_prog_acc(&mut svm, &adapter_prog, 192);
+    let adp_acc = create_prog_acc(&mut svm, &adapter_prog, 320);
     let (orac_pda, orac_bump) = Address::find_program_address(&[b"orac", adp_acc.as_ref()], &adapter_prog);
     // External on-chain price feed account (32B: magic="FEED", price, conf, publishSlot)
     let feed_acc = Keypair::new().pubkey();
@@ -1543,6 +1543,170 @@ fn main() {
         cu_crank = send_ok_assert_log(&mut svm, ix_crank(), &payer, &[&payer], "Program log: 0x1,");
     }
     assert_eq!(read_u64(&svm, &comp_mkt2, 112), 115 * POS_SCALE, "OracleAdapter converged smoothly to $115!");
+
+    // 9A-2: Native Pyth V2 (`PriceUpdateV2`), Chainlink OCR2 (`Transmissions`),
+    //       Switchboard On-Demand (`PullFeedAccountData`), AND 2-Leg Composite Ratio (`Pyth / Chainlink`)!
+    let mut clock_now: Clock = svm.get_sysvar();
+    clock_now.slot = s0 + 30;
+    clock_now.unix_timestamp = 1_750_000_000;
+    svm.set_sysvar(&clock_now);
+    svm.expire_blockhash();
+
+    let pyth_prog_id = Address::from_str_const("rec5EKMGg6MxZYaMdyBfgwp4d5rB9T1VQH5pJv5LtFJ");
+    let cl_prog_id   = Address::from_str_const("HEvSKofvBgfaexv23kMabbYqxasxU3mQ4ibBMEmJWHny");
+    let sb_prog_id   = Address::from_str_const("SBondMDrcV3K4kxZR1HNVT7osZxAHVHgYXL5Ze1oMUv");
+
+    let make_pyth_v2 = |feed_id: [u8; 32], price: i64, conf: u64, expo: i32, pub_ts: i64, posted_slot: u64, ver: u8| -> Vec<u8> {
+        let mut d = vec![0u8; 133];
+        d[0..8].copy_from_slice(&[34, 241, 35, 99, 157, 126, 244, 205]);
+        d[40] = ver;
+        d[41..73].copy_from_slice(&feed_id);
+        d[73..81].copy_from_slice(&price.to_le_bytes());
+        d[81..89].copy_from_slice(&conf.to_le_bytes());
+        d[89..93].copy_from_slice(&expo.to_le_bytes());
+        d[93..101].copy_from_slice(&pub_ts.to_le_bytes());
+        d[125..133].copy_from_slice(&posted_slot.to_le_bytes());
+        d
+    };
+    let make_chainlink_ocr2 = |decimals: u8, live_len: u32, live_cur: u32, slot: u64, answer: i128| -> Vec<u8> {
+        let mut d = vec![0u8; 200 + (live_len as usize) * 48];
+        d[0..8].copy_from_slice(&[96, 179, 69, 66, 128, 129, 73, 117]);
+        d[8] = 2;
+        d[138] = decimals;
+        d[143..147].copy_from_slice(&7u32.to_le_bytes());
+        d[148..152].copy_from_slice(&live_len.to_le_bytes());
+        d[152..156].copy_from_slice(&live_cur.to_le_bytes());
+        let idx = ((live_cur + live_len - 1) % live_len) as usize;
+        let off = 200 + idx * 48;
+        d[off..off + 8].copy_from_slice(&slot.to_le_bytes());
+        d[off + 16..off + 32].copy_from_slice(&answer.to_le_bytes());
+        d
+    };
+    let make_switchboard = |value: i128, std_dev: i128, num_samples: u8, slot: u64| -> Vec<u8> {
+        let mut d = vec![0u8; 3208];
+        d[0..8].copy_from_slice(&[196, 27, 108, 196, 10, 215, 219, 40]);
+        d[2264..2280].copy_from_slice(&value.to_le_bytes());
+        d[2280..2296].copy_from_slice(&std_dev.to_le_bytes());
+        d[2360] = num_samples;
+        d[2368..2376].copy_from_slice(&slot.to_le_bytes());
+        d
+    };
+
+    // (a) Pyth V2 Parser Test ($100 -> $103.00 at expo = -8, pinned feed_id & owner)
+    let pyth_fid = [0xABu8; 32];
+    let pyth_feed = Keypair::new().pubkey();
+    let pyth_mkt = create_prog_acc(&mut svm, &prog_id, MKT_SIZE);
+    let pyth_adp = create_prog_acc(&mut svm, &adapter_prog, 320);
+    let (pyth_pda, pyth_bump) = Address::find_program_address(&[b"orac", pyth_adp.as_ref()], &adapter_prog);
+    svm.set_account(pyth_feed, Account { lamports: 10_000_000, data: make_pyth_v2(pyth_fid, 10_300_000_000, 5_000_000, -8, 1_750_000_000, s0 + 30, 1), owner: pyth_prog_id, executable: false, rent_epoch: 0 }).unwrap();
+    send_ok(&mut svm, ix_create_market(prog_id, dex, pyth_mkt, mint, pyth_pda, lp.pubkey(), lp_tok, fee_vault, 100 * POS_SCALE, 10, 50, 0, 1000, 500, 100, 0, 400, 2500, 1_000_000 * POS_SCALE), &payer, &[&payer, &lp]);
+    let mut pyth_init = vec![0u8; 60];
+    pyth_init[0] = 0; pyth_init[1] = pyth_bump; pyth_init[2] = 1;
+    pyth_init[4..12].copy_from_slice(&30u64.to_le_bytes());
+    pyth_init[12..20].copy_from_slice(&100u64.to_le_bytes());
+    pyth_init[28..60].copy_from_slice(&pyth_fid);
+    send_ok(&mut svm, Instruction { program_id: adapter_prog, accounts: vec![
+        AccountMeta::new(pyth_adp, false), AccountMeta::new_readonly(lp.pubkey(), true),
+        AccountMeta::new_readonly(prog_id, false), AccountMeta::new_readonly(pyth_mkt, false),
+        AccountMeta::new_readonly(pyth_feed, false),
+    ], data: pyth_init }, &payer, &[&payer, &lp]);
+    let ix_pyth_crank = || Instruction { program_id: adapter_prog, accounts: vec![
+        AccountMeta::new_readonly(pyth_adp, false), AccountMeta::new(pyth_mkt, false),
+        AccountMeta::new_readonly(pyth_feed, false), AccountMeta::new_readonly(pyth_pda, false),
+        AccountMeta::new_readonly(prog_id, false),
+    ], data: vec![1] };
+    let mut c1: Clock = svm.get_sysvar(); c1.slot = s0 + 31; c1.unix_timestamp = 1_750_000_005; svm.set_sysvar(&c1);
+    svm.set_account(pyth_feed, Account { lamports: 10_000_000, data: make_pyth_v2(pyth_fid, 10_300_000_000, 5_000_000, -8, 1_750_000_000, s0 + 31, 0), owner: pyth_prog_id, executable: false, rent_epoch: 0 }).unwrap();
+    send_err_custom(&mut svm, ix_pyth_crank(), &payer, &[&payer], 304, "Pyth rejects VerificationLevel::Partial");
+    svm.set_account(pyth_feed, Account { lamports: 10_000_000, data: make_pyth_v2([0xCDu8; 32], 10_300_000_000, 5_000_000, -8, 1_750_000_000, s0 + 31, 1), owner: pyth_prog_id, executable: false, rent_epoch: 0 }).unwrap();
+    send_err_custom(&mut svm, ix_pyth_crank(), &payer, &[&payer], 305, "Pyth rejects mismatched feed_id");
+    svm.set_account(pyth_feed, Account { lamports: 10_000_000, data: make_pyth_v2(pyth_fid, 10_300_000_000, 5_000_000, -8, 1_749_999_900, s0 + 31, 1), owner: pyth_prog_id, executable: false, rent_epoch: 0 }).unwrap();
+    send_err_custom(&mut svm, ix_pyth_crank(), &payer, &[&payer], 300, "Pyth rejects stale publish_time");
+    svm.set_account(pyth_feed, Account { lamports: 10_000_000, data: make_pyth_v2(pyth_fid, 10_300_000_000, 5_000_000, -8, 1_750_000_004, s0 + 31, 1), owner: pyth_prog_id, executable: false, rent_epoch: 0 }).unwrap();
+    let cu_pyth = send_ok_assert_log(&mut svm, ix_pyth_crank(), &payer, &[&payer], "Program log: 0x1,");
+    assert_eq!(read_u64(&svm, &pyth_mkt, 112), 103 * POS_SCALE, "Pyth V2 parsed $103.00 (expo -8 -> E6)!");
+
+    // (b) Chainlink OCR2 Parser Test ($100 -> $102.50, ring-buffer wraparound live_cursor=0, live_len=4, decimals=8)
+    let cl_feed = Keypair::new().pubkey();
+    let cl_mkt = create_prog_acc(&mut svm, &prog_id, MKT_SIZE);
+    let cl_adp = create_prog_acc(&mut svm, &adapter_prog, 320);
+    let (cl_pda, cl_bump) = Address::find_program_address(&[b"orac", cl_adp.as_ref()], &adapter_prog);
+    svm.set_account(cl_feed, Account { lamports: 10_000_000, data: make_chainlink_ocr2(8, 4, 0, s0 + 31, 10_250_000_000i128), owner: cl_prog_id, executable: false, rent_epoch: 0 }).unwrap();
+    send_ok(&mut svm, ix_create_market(prog_id, dex, cl_mkt, mint, cl_pda, lp.pubkey(), lp_tok, fee_vault, 100 * POS_SCALE, 10, 50, 0, 1000, 500, 100, 0, 400, 2500, 1_000_000 * POS_SCALE), &payer, &[&payer, &lp]);
+    let mut cl_init = vec![0u8; 28];
+    cl_init[0] = 0; cl_init[1] = cl_bump; cl_init[2] = 2;
+    cl_init[4..12].copy_from_slice(&10u64.to_le_bytes());
+    cl_init[12..20].copy_from_slice(&100u64.to_le_bytes());
+    send_ok(&mut svm, Instruction { program_id: adapter_prog, accounts: vec![
+        AccountMeta::new(cl_adp, false), AccountMeta::new_readonly(lp.pubkey(), true),
+        AccountMeta::new_readonly(prog_id, false), AccountMeta::new_readonly(cl_mkt, false),
+        AccountMeta::new_readonly(cl_feed, false),
+    ], data: cl_init }, &payer, &[&payer, &lp]);
+    let mut c2: Clock = svm.get_sysvar(); c2.slot = s0 + 32; c2.unix_timestamp = 1_750_000_006; svm.set_sysvar(&c2);
+    let cu_cl = send_ok_assert_log(&mut svm, Instruction { program_id: adapter_prog, accounts: vec![
+        AccountMeta::new_readonly(cl_adp, false), AccountMeta::new(cl_mkt, false),
+        AccountMeta::new_readonly(cl_feed, false), AccountMeta::new_readonly(cl_pda, false),
+        AccountMeta::new_readonly(prog_id, false),
+    ], data: vec![1] }, &payer, &[&payer], "Program log: 0x1,");
+    assert_eq!(read_u64(&svm, &cl_mkt, 112), 102_500_000, "Chainlink OCR2 parsed $102.50 with ring wraparound!");
+
+    // (c) Switchboard On-Demand Parser Test ($100 -> $104.00, full 128-bit PRECISION=18 scaling!)
+    let sb_feed = Keypair::new().pubkey();
+    let sb_mkt = create_prog_acc(&mut svm, &prog_id, MKT_SIZE);
+    let sb_adp = create_prog_acc(&mut svm, &adapter_prog, 320);
+    let (sb_pda, sb_bump) = Address::find_program_address(&[b"orac", sb_adp.as_ref()], &adapter_prog);
+    let sb_val: i128 = 104i128 * 1_000_000_000_000_000_000i128;
+    let sb_std: i128 = 100_000_000_000_000_000i128;
+    svm.set_account(sb_feed, Account { lamports: 10_000_000, data: make_switchboard(sb_val, sb_std, 5, s0 + 32), owner: sb_prog_id, executable: false, rent_epoch: 0 }).unwrap();
+    send_ok(&mut svm, ix_create_market(prog_id, dex, sb_mkt, mint, sb_pda, lp.pubkey(), lp_tok, fee_vault, 100 * POS_SCALE, 10, 50, 0, 1000, 500, 100, 0, 400, 2500, 1_000_000 * POS_SCALE), &payer, &[&payer, &lp]);
+    let mut sb_init = vec![0u8; 28];
+    sb_init[0] = 0; sb_init[1] = sb_bump; sb_init[2] = 3;
+    sb_init[4..12].copy_from_slice(&10u64.to_le_bytes());
+    sb_init[12..20].copy_from_slice(&100u64.to_le_bytes());
+    send_ok(&mut svm, Instruction { program_id: adapter_prog, accounts: vec![
+        AccountMeta::new(sb_adp, false), AccountMeta::new_readonly(lp.pubkey(), true),
+        AccountMeta::new_readonly(prog_id, false), AccountMeta::new_readonly(sb_mkt, false),
+        AccountMeta::new_readonly(sb_feed, false),
+    ], data: sb_init }, &payer, &[&payer, &lp]);
+    let mut c3: Clock = svm.get_sysvar(); c3.slot = s0 + 33; c3.unix_timestamp = 1_750_000_007; svm.set_sysvar(&c3);
+    let cu_sb = send_ok_assert_log(&mut svm, Instruction { program_id: adapter_prog, accounts: vec![
+        AccountMeta::new_readonly(sb_adp, false), AccountMeta::new(sb_mkt, false),
+        AccountMeta::new_readonly(sb_feed, false), AccountMeta::new_readonly(sb_pda, false),
+        AccountMeta::new_readonly(prog_id, false),
+    ], data: vec![1] }, &payer, &[&payer], "Program log: 0x1,");
+    assert_eq!(read_u64(&svm, &sb_mkt, 112), 104 * POS_SCALE, "Switchboard On-Demand parsed $104.00 (128-bit E18 -> E6)!");
+
+    // (d) 2-Leg Composite Ratio Market (`Pyth V2 $500` / `Chainlink OCR2 $125` = `4.00` — e.g. STOXX/SOL!)
+    let rat_mkt = create_prog_acc(&mut svm, &prog_id, MKT_SIZE);
+    let rat_adp = create_prog_acc(&mut svm, &adapter_prog, 320);
+    let (rat_pda, rat_bump) = Address::find_program_address(&[b"orac", rat_adp.as_ref()], &adapter_prog);
+    let stoxx_feed = Keypair::new().pubkey();
+    let sol_feed   = Keypair::new().pubkey();
+    let stoxx_fid  = [0x55u8; 32];
+    svm.set_account(stoxx_feed, Account { lamports: 10_000_000, data: make_pyth_v2(stoxx_fid, 50_000_000_000, 10_000_000, -8, 1_750_000_007, s0 + 33, 1), owner: pyth_prog_id, executable: false, rent_epoch: 0 }).unwrap();
+    svm.set_account(sol_feed,   Account { lamports: 10_000_000, data: make_chainlink_ocr2(8, 4, 2, s0 + 33, 12_500_000_000i128), owner: cl_prog_id, executable: false, rent_epoch: 0 }).unwrap();
+    send_ok(&mut svm, ix_create_market(prog_id, dex, rat_mkt, mint, rat_pda, lp.pubkey(), lp_tok, fee_vault, 3_950_000, 10, 50, 0, 1000, 500, 100, 0, 400, 2500, 1_000_000 * POS_SCALE), &payer, &[&payer, &lp]);
+    let mut rat_init = vec![0u8; 60];
+    rat_init[0] = 0; rat_init[1] = rat_bump; rat_init[2] = 1; rat_init[3] = 2;
+    rat_init[4..12].copy_from_slice(&30u64.to_le_bytes());
+    rat_init[12..20].copy_from_slice(&100u64.to_le_bytes());
+    rat_init[28..60].copy_from_slice(&stoxx_fid);
+    send_ok(&mut svm, Instruction { program_id: adapter_prog, accounts: vec![
+        AccountMeta::new(rat_adp, false), AccountMeta::new_readonly(lp.pubkey(), true),
+        AccountMeta::new_readonly(prog_id, false), AccountMeta::new_readonly(rat_mkt, false),
+        AccountMeta::new_readonly(stoxx_feed, false), AccountMeta::new_readonly(sol_feed, false),
+    ], data: rat_init }, &payer, &[&payer, &lp]);
+    let mut c4: Clock = svm.get_sysvar(); c4.slot = s0 + 34; c4.unix_timestamp = 1_750_000_008; svm.set_sysvar(&c4);
+    let cu_ratio = send_ok_assert_log(&mut svm, Instruction { program_id: adapter_prog, accounts: vec![
+        AccountMeta::new_readonly(rat_adp, false), AccountMeta::new(rat_mkt, false),
+        AccountMeta::new_readonly(stoxx_feed, false), AccountMeta::new_readonly(rat_pda, false),
+        AccountMeta::new_readonly(prog_id, false), AccountMeta::new_readonly(sol_feed, false),
+    ], data: vec![1] }, &payer, &[&payer], "Program log: 0x1,");
+    assert_eq!(read_u64(&svm, &rat_mkt, 112), 4 * POS_SCALE, "2-Leg Ratio Pyth($500)/Chainlink($125) converged to exact 4.00!");
+    println!(
+        "       Oracle Parsers: PythV2={} CU, ChainlinkOCR2={} CU, Switchboard128={} CU, Ratio(Pyth/CL)={} CU",
+        cu_pyth, cu_cl, cu_sb, cu_ratio
+    );
 
     // 9B: Passive LP AMM Matcher CPI composition (Single-Signer Taker Open & Close!)
     let mtch_cfg = create_prog_acc(&mut svm, &matcher_prog, 128);
@@ -1793,7 +1957,7 @@ fn main() {
             &[&payer, &lp],
         );
         // Also wire an OracleAdapter CPI feed on a second set of adapters? We can rotate oracleAuth later for crank test!
-        let adp = create_prog_acc(&mut svm, &adapter_prog, 192);
+        let adp = create_prog_acc(&mut svm, &adapter_prog, 320);
         let (opda, obump) = Address::find_program_address(&[b"orac", adp.as_ref()], &adapter_prog);
         let feed = Keypair::new().pubkey();
         let mut fd = vec![0u8; 32];
