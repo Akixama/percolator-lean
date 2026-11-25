@@ -1,0 +1,10 @@
+name = "percolator-lean"
+version = "0.1.0"
+defaultTargets = ["Percolator"]
+
+[[require]]
+name = "lean-svm"
+path = "../lean-svm"
+
+[[lean_lib]]
+name = "Percolator"

@@ -1,0 +1,14 @@
+{"version": "1.3.0",
+ "packagesDir": ".lake/packages",
+ "packages":
+ [{"type": "path",
+   "scope": "",
+   "name": "«lean-svm»",
+   "manifestFile": "lake-manifest.json",
+   "inherited": false,
+   "dir": "../lean-svm",
+   "copy": false,
+   "configFile": "lakefile.toml"}],
+ "name": "«percolator-lean»",
+ "lakeDir": ".lake",
+ "fixedToolchain": false}
