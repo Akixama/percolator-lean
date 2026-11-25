@@ -49,7 +49,22 @@ Every economic, solvency, and risk-isolation invariant of `percolator-lean` is f
 
 ---
 
-## 5. External Composable Program Proofs
+## 5. Fair Liquidations, Anti-Selective-Liquidation, Post-ADL Recovery, Position Hand-Off & Exit-Liveness
+
+| Invariant | Lean 4 Theorem | Guarantee |
+|---|---|---|
+| **Anti-Selective-Liquidation (All-Leg Freshness)** | `hedged_portfolio_immune_to_selective_liquidation` | `Liquidate` unconditionally rejects if ANY active leg on the portfolio was not refreshed in `curSlot`, and unconditionally rejects once all legs are fresh and `cap1 + pnl1 ≥ totalMm` with `shortfall = 0` — hedged cross-margin spreads cannot be selectively liquidated without crediting winning legs. |
+| **Fair Gradual Liquidation Fee** | `gradualLiqFee_bounded`, `proportionalOiForRaw_preserves_oi_le_raw` | `gradualLiqFee(maxFee, deficit)` stays strictly in `[min(maxFee, maxFee/4), maxFee]`, and ceiling proportional OI reduction preserves `oi' ≤ raw'` unconditionally even on 1-atom post-ADL dust. |
+| **Counterparty Takeover (Zero ADL & Post-ADL Safe)** | `liquidateTakeover_sound`, `liquidateTakeoverPostAdl_sound` | `Liquidate(mode=1)` transfers `rawClose` within the same side, preserving `stockExact`, `m'.wf`, victim `otherMm` containment, cross-market isolation, and leaving `oiLong/Short`, `rawBasisLong/Short`, and `adlLong/Short` bit-for-bit invariant — even during active partial ADL! |
+| **Post-ADL Monotone Opens** | `postAdlRawAdd_ge_qty`, `postAdlOpen_preserves_adl_monotone`, `tradeOpenPostAdl_sound` | Opening `qty` on a partially-ADL'd side (`0 < oi ≤ raw`) mints `rAdd = max(qty, ⌈qty · raw / oi⌉)`, guaranteeing `oi + qty ≤ raw + rAdd`, `(oi + qty) · raw ≤ oi · (raw + rAdd)`, and `deriveAdl(oi + qty, raw + rAdd) ≤ deriveAdl(oi, raw)` — never inflating any existing holder's effective position. |
+| **Same-Side Position Hand-Off** | `tradeHandoff_sound` | `Trade(mode=2/3)` transfers `rawXfer` between two portfolios on the same side (`Long→Long` or `Short→Short`), preserving `stockExact`, leaving the entire `MarketState` (`oi`, `rawBasis`, `adl`) bit-for-bit invariant, and leaving all untouched portfolios unchanged. |
+| **Spread-Protected Reduce** | `tradeReduceWithSpread_sound` | Paying an `execPrice` spread during `Trade(mode=1)` reduce preserves `stockExact`, `m'.wf`, and `capital' ≥ newTotalMm`. |
+| **Closed Inductive Aggregate Coherence** | `depositCollateral_preserves_coherent`, `withdrawCollateral_preserves_coherent`, `realizeLegPnl_preserves_coherent` | Inductively preserves exact finite-sum coherence `C_tot = ∑ capital`, `I_tot = ∑ insurance`, `R_tot = ∑ realizedPool`, and `C_tot + I_tot + R_tot + S_tot = V`. |
+| **Anti-DoS Exit-Liveness** | `flat_portfolio_unconditionally_withdrawable`, `market_bounded_exit_liveness` | Flat portfolios can unconditionally withdraw 100% of capital at any slot; every well-formed market has bounded permissionless exit deadlines (`maxStaleness ≤ 9,000`, `exitWindow ≤ 216,000`). |
+
+---
+
+## 6. External Composable Program Proofs
 
 | Program | Lean 4 Theorems | Guarantee |
 |---|---|---|
@@ -58,12 +73,12 @@ Every economic, solvency, and risk-isolation invariant of `percolator-lean` is f
 
 ---
 
-## 6. Runtime Boundary Checks Enforced On-Chain (`Percolator/Program.lean`)
+## 7. Runtime Boundary Checks Enforced On-Chain (`Percolator/Program.lean`)
 
 Beyond the pure mathematical transitions, the compiled sBPF program enforces the Solana execution boundary:
 
 1. **Canonical Program Pinning:** All SPL CPIs require exact 32-byte match with `TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA`, and `InitDex` pins `SystemProgram` (`11111111111111111111111111111111`).
 2. **On-Chain `DexVault` PDA Creation & Integrity:** `InitDex` creates and initializes `vaultPda` on-chain via `SystemProgram::Transfer + Allocate + Assign` (signed by PDA `["dvlt", dex, bump]`) + `SPL Token InitializeAccount3`, cryptographically enforcing PDA derivation, clean zero-balance SPL state, no delegate, no close authority, and immunity to 1-lamport pre-funding griefing.
 3. **Per-Slot Oracle Rate Limit:** `UpdateOracle` enforces `curSlot > lastOracleSlot`, ensuring single-step clamped moves per slot.
-4. **Same-Slot Multi-Leg Freshness:** `WithdrawCollateral` and `Trade(mode=0)` enforce `leg.lastRefreshSlot == curSlot` for every active open leg, preventing stale-oracle collateral extraction while keeping flat withdrawals unconditional and `Liquidate` strictly $O(1)$.
+4. **Same-Slot Multi-Leg Freshness:** `WithdrawCollateral`, `Trade(mode=0)`, buyer legs in `Trade(mode=2/3)`, and `Liquidate` enforce `leg.lastRefreshSlot == curSlot` for every active open leg, preventing both stale-oracle collateral extraction and selective single-leg liquidation of hedged spreads while keeping flat withdrawals unconditional.
 5. **Post-ADL Insurance, Resolution & Safe Rent Reclaim:** `WithdrawInsurance` requires `oiLong == 0 ∧ oiShort == 0 ∧ rawBasisLong == 0 ∧ rawBasisShort == 0`; `ResolveMarket` additionally requires `activeLegs == 0`; `CloseAccount` only closes empty `Portfolio`/`InsReceipt` or `Tombstoned` `Market` and zeroes the magic word before draining lamports to prevent same-tx revival.

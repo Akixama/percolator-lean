@@ -16,10 +16,13 @@ def POS_SCALE        : UInt64 := 1_000_000          -- 10^6 (size & price fixed-
 def ADL_ONE          : UInt64 := 1_000_000_000      -- 10^9 (derived side ADL index scale)
 def BPS_DEN          : UInt64 := 10_000             -- basis points denominator
 def K_ZERO           : UInt64 := 0x4000000000000000 -- 2^62 unbiased zero for cumulative K_side
-def MAX_PRICE        : UInt64 := 1_000_000_000_000  -- $1,000,000 at E6
-def MAX_OI           : UInt64 := 10_000_000_000_000 -- 10,000,000 units at E6
+def MAX_PRICE        : UInt64 := 1_000_000_000_000      -- $1,000,000 at E6
+def MAX_OI           : UInt64 := 10_000_000_000_000     -- 10,000,000 units at E6
+def MAX_RAW          : UInt64 := 10_000_000_000_000_000 -- 1000x MAX_OI post-ADL rawBasis cap
 def MAX_CREATE_FEE   : UInt64 := 10_000_000_000     -- 10,000 quote units at E6
 def MIN_EXIT_WINDOW  : UInt64 := 10                 -- minimum wind-down exit window (slots)
+def MAX_EXIT_WINDOW  : UInt64 := 216_000            -- maximum wind-down exit window (~24h at 400ms/slot)
+def MAX_STALENESS    : UInt64 := 9_000              -- maximum oracle staleness (~1h at 400ms/slot)
 def MAX_LEGS         : UInt64 := 8                  -- max cross-margin legs per Portfolio
 
 /-! ### Pinned Canonical SPL Token Program ID (`TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA`) -/

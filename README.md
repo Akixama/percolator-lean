@@ -5,14 +5,14 @@
 It achieves **full cross-margin capital efficiency on healthy markets** (hedged spreads net 1:1 with zero warmup drag) while maintaining **machine-checked per-market risk isolation**: permissionlessly created or adversarial markets cannot drain other markets, untouched users, or other markets' insurance pools.
 
 The repository ships a minimal core clearinghouse ([`percolator.so`](Percolator/Program.lean)) plus two tiny, formally verified composable external programs that integrate via CPI without bloating the core:
-- **[`Percolator.Matcher`](Percolator/Matcher.lean)** (`8,752 B`) — permissionless passive-LP AMM / spread matcher enabling single-signer taker opens & closes against resting PDA-owned LP portfolios.
-- **[`Percolator.OracleAdapter`](Percolator/OracleAdapter.lean)** (`6,280 B`) — permissionless external price-feed bridge with confidence/staleness checks, smooth multi-slot auto-clamped convergence, and on-chain premium funding.
+- **[`Percolator.Matcher`](Percolator/Matcher.lean)** (`8,744 B`) — permissionless passive-LP AMM / spread matcher enabling single-signer taker opens & closes against resting PDA-owned LP portfolios.
+- **[`Percolator.OracleAdapter`](Percolator/OracleAdapter.lean)** (`6,272 B`) — permissionless external price-feed bridge with confidence/staleness checks, smooth multi-slot auto-clamped convergence, and on-chain premium funding.
 
-| Program | ELF `.so` Size | sBPF Insns | Stack | Heap | Formal Lean 4 Proofs (`0 sorry`) |
+| Program | ELF `.so` Size | sBPF Insns | Stack | Heap | Formal Lean 4 Proofs (`0 sorry`, `0` custom axioms) |
 |---|---:|---:|---:|---:|---|
-| **[`Percolator.Program`](Percolator/Program.lean)** (Core DEX) | **52,304 B** | 6,406 | 384 B | 0 B | 24 theorems (`Spec.lean` / `Proofs.lean`) |
-| **[`Percolator.Matcher`](Percolator/Matcher.lean)** (LP AMM CPI) | **8,752 B** | 974 | 712 B | 0 B | 4 theorems (`quoteAsk/Bid` bounds & clamp) |
-| **[`Percolator.OracleAdapter`](Percolator/OracleAdapter.lean)** (Feed + Funding CPI) | **6,280 B** | 661 | 368 B | 0 B | `crank_step_and_funding_within_clamp` |
+| **[`Percolator.Program`](Percolator/Program.lean)** (Core DEX) | **69,152 B** | 8,512 | 536 B | 0 B | 47 theorems (`Spec.lean` / `Proofs.lean`) |
+| **[`Percolator.Matcher`](Percolator/Matcher.lean)** (LP AMM CPI) | **8,744 B** | 973 | 712 B | 0 B | 4 theorems (`quoteAsk/Bid` bounds & clamp) |
+| **[`Percolator.OracleAdapter`](Percolator/OracleAdapter.lean)** (Feed + Funding CPI) | **6,272 B** | 660 | 368 B | 0 B | `crank_step_and_funding_within_clamp` |
 
 ---
 
@@ -20,17 +20,18 @@ The repository ships a minimal core clearinghouse ([`percolator.so`](Percolator/
 
 ```
 ┌─────────────────────────────────┐     ┌──────────────────────────────────┐
-│  Percolator.Matcher (8,752 B)   │     │ Percolator.OracleAdapter         │
-│  • Passive LP AMM / Spreads     │     │ (6,280 B)                        │
+│  Percolator.Matcher (8,744 B)   │     │ Percolator.OracleAdapter         │
+│  • Passive LP AMM / Spreads     │     │ (6,272 B)                        │
 │  • Single-Signer Taker Fill     │     │ • External Feed + Conf/Age Gate  │
 │  • PDA-Owned LP Portfolio       │     │ • Auto-Clamped Step + Funding    │
 └───────────────┬─────────────────┘     └───────────────┬──────────────────┘
                 │ CPI (invoke_signed)                   │ CPI (invoke_signed)
                 ▼  InitPortfolio / Trade / Withdraw     ▼  UpdateOracle
 ┌──────────────────────────────────────────────────────────────────────────┐
-│                percolator-lean Core (52,304 B · 20 ops · 0 heap)         │
+│                percolator-lean Core (69,152 B · 20 ops · 0 heap)         │
 │  • Realizable Shared Cross-Margin      • On-Chain PDA Vault Creation     │
 │  • Per-Market Isolated R_m / I_m / A_m • Exact C + I + R + S = V         │
+│  • Fair Partial Takeover & Hand-Off    • Post-ADL Monotone Recovery      │
 │  • Bounded execPrice Spreads           • Unified CloseAccount Reclaim    │
 └──────────────────────────────────────────────────────────────────────────┘
 ```
@@ -64,17 +65,22 @@ This single rule proves both halves of `cross_margin_isolation_envelope`:
 
 Each market may also set an immutable nonzero maintenance-margin floor `minMm` (`computeMarginWithFloor`), eliminating dust-position liquidation griefing while strictly strengthening solvency (`minMm_strengthens_solvency`).
 
-### 2.3 Same-Slot Multi-Leg Freshness
+### 2.3 Same-Slot Multi-Leg Freshness & Anti-Selective-Liquidation
 
-- `RefreshLeg(dex, mkt, pfl)` is $O(1)$ and permissionless: verifies fresh oracle, settles `entryK → kSide`, realizes backed `posPnl`, updates `cachedMm`/`cachedIm`, and stamps `leg.lastRefreshSlot = curSlot`.
-- `WithdrawCollateral` and risk-increasing `Trade(mode=0)` verify that every active open leg has `lastRefreshSlot == curSlot` (satisfied atomically in one transaction `[RefreshLeg(m1), ..., Withdraw/Trade]`). Flat portfolios withdraw unconditionally.
-- Risk-reducing `Trade(mode=1)` and `Liquidate` remain strictly $O(1)$ without touching other markets.
+- `RefreshLeg(dex, mkt, pfl)` is $O(1)$ and permissionless: verifies fresh oracle (on `Active` markets; works unconditionally during `WindDown`), settles `entryK → kSide`, realizes backed `posPnl`, updates `cachedMm`/`cachedIm`, and stamps `leg.lastRefreshSlot = curSlot`.
+- `WithdrawCollateral`, risk-increasing `Trade(mode=0)`, buyer legs in `Trade(mode=2/3)`, and **`Liquidate`** all enforce `leg.lastRefreshSlot == curSlot` across every active open leg on the portfolio (`hedged_portfolio_immune_to_selective_liquidation`).
+  - Prevents stale-oracle collateral extraction AND prevents selective single-leg liquidation of a net-healthy hedged cross-margin spread without first crediting winning legs.
+  - Even in the worst case (`MAX_LEGS = 8` on BOTH parties = 16 legs), `[16× RefreshLeg + Trade]` or `[14× RefreshLeg + Liquidate(mode=1)]` fits inside **one single legacy Solana transaction** (`≤ 876 B / 1,232 B`, `≤ 20,068 CU`).
+  - Flat portfolios withdraw unconditionally (`flat_portfolio_unconditionally_withdrawable`).
 
-### 2.4 Clamped Oracle Accounting, Derived Side ADL & Lifecycle
+### 2.4 Fair Transparent Liquidations (No TTP), Post-ADL Recovery & Position Hand-Off
 
-- **Per-slot rate limit & clamp:** `UpdateOracle` enforces `curSlot > lastOracleSlot` and $|\Delta P| + \text{fundE6} \le \lfloor P_{\text{old}} \cdot \text{maxMoveBps} / 10000 \rfloor$, with directional rounding guaranteeing credited gains $\le$ debited losses (`oracle_step_zero_sum`).
-- **Derived side ADL & recovery:** $A_{\text{side}} = \max(1, \lfloor 10^9 \cdot \text{OI}_{\text{side}} / \text{rawBasis}_{\text{side}} \rfloor)$ (default $10^9$ when `rawBasis == 0` or `OI >= rawBasis`), ensuring effective exposure never exceeds OI (`deriveAdl_exposure_le_oi`). Post-ADL reductions deduct proportional raw basis, and `ClearDeadLeg` clears zero-OI legs and resets $A_{\text{side}} \to 10^9$.
-- **Permissionless lifecycle:** `Active` → `WindDown` (by admin or permissionlessly when oracle is stale) → `ForceClosePair` (permissionless after `exitWindow`) → `ResolveMarket` (once `oi = rawBasis = activeLegs = 0`, snapshotting immutable `(resolvedNum, resolvedDen)`) → `ClaimResolved` (order-independent payout bounded in aggregate by `sum_resolved_payouts_le_realizedPool`) → `TombstoneMarket` (`insurance = totalPosPnl = 0`) → `CloseAccount` (zeroes magic and reclaims 100% rent).
+- **Zero trusted liquidation oracle:** Liquidations require no TTP — solvency, partial sizing, and ADL haircuts derive purely from on-chain mark prices and exact `oiLong == oiShort` vs `rawBasis` ratios.
+- **Gradual deficit-scaled fee & partial liquidations:** `Liquidate` supports partial (`reqQty > 0`, respecting `minMm` dust floor) or full closes, with a fair deficit-scaled fee `min(maxFee, max(maxFee/4, deficit))` strictly bounded above `otherMm` (anti-reverse-contagion).
+- **Tiered takeover before ADL (`mode=1`):** Any well-collateralized counterparty or HLP vault can take over a distressed leg at mark (`mode=1`) with **zero OI destruction and zero ADL**, leaving `oiSide`, `rawBasisSide`, and `adlSide` bit-for-bit invariant — and working **even during active partial ADL** (`liquidateTakeoverPostAdl_sound`).
+- **Tier-3 fallback & post-ADL monotone recovery:** When no taker steps in (`mode=0`), `Liquidate` symmetrically reduces `oiLong`/`oiShort` using ceiling proportional OI removal (`proportionalOiForRawU64`) and updates `adlSide = deriveAdl(oi, rawBasis)`. Markets with `0 < oiSide < rawBasisSide` remain open for new bilateral trades (`Trade mode=0`) by minting `rawAdd = max(qty, ⌈qty · rawSide / oiSide⌉)` (`postAdlOpen_preserves_adl_monotone`), never inflating any existing holder's effective position. Only 100%-wiped-out sides (`oiSide == 0 ∧ rawSide > 0`) wait for permissionless `ClearDeadLeg` to reset `adlSide → ADL_ONE`.
+- **Same-side position hand-off (`Trade` `mode=2` Long→Long, `mode=3` Short→Short):** Any position holder can directly transfer part or all of a Long or Short leg to a new holder (with optional bounded `execPrice` spread) in both `Active` and `WindDown` states, leaving `oiLong`, `oiShort`, `rawBasisLong`, `rawBasisShort`, and `adlLong/Short` bit-for-bit invariant (`tradeHandoff_sound`).
+- **Bounded permissionless lifecycle:** Market creation caps `maxStaleness ≤ 9,000` (~1h) and `exitWindow ≤ 216,000` (~24h) (`market_bounded_exit_liveness`), and enforces `warmupSlots == 0`. `Active` → `WindDown` (admin or permissionless on stale oracle) → `ForceClosePair` (permissionless after `exitWindow`) → `ResolveMarket` (once `oi = rawBasis = activeLegs = 0`) → `ClaimResolved` (order-independent payout) → `TombstoneMarket` → `CloseAccount` (reclaims 100% rent).
 
 ---
 
@@ -104,8 +110,8 @@ Each market may also set an immutable nonzero maintenance-margin floor `minMm` (
 | 8 | `DepositInsurance` | Mint isolated LP shares for `I_m`, or permanently donate (`donate=1`, 0 shares minted) |
 | 9 | `WithdrawInsurance` | Burn LP shares for pro-rata `I_m` (requires `OI == 0 ∧ rawBasis == 0`) |
 | 10 | `RefreshLeg` | Permissionless $O(1)$ settle, backed `posPnl` realization, margin sync & slot stamp |
-| 11 | `Trade` | Bilateral open (`mode=0`) or proportional reduce (`mode=1`) with optional clamped `execPrice` spread |
-| 12 | `Liquidate` | Permissionless $O(1)$ liquidation with per-leg loss containment & capped `I_m` draw |
+| 11 | `Trade` | Bilateral open (`mode=0`, post-ADL safe), proportional reduce (`mode=1`), or same-side position hand-off (`mode=2` L→L, `mode=3` S→S) with optional clamped `execPrice` spread |
+| 12 | `Liquidate` | Permissionless partial/full liquidation with all-leg freshness, gradual deficit fee, per-leg loss containment, post-ADL-safe counterparty takeover (`mode=1`), and capped `I_m` + derived ADL fallback (`mode=0`) |
 | 13 | `ClearDeadLeg` | Permissionlessly clear zero-OI post-ADL leg & reset `adlSide → ADL_ONE` |
 | 14 | `StartWindDown` | Admin or permissionless stale-oracle transition to `WindDown` |
 | 15 | `ForceClosePair` | Permissionless post-`exitWindow` forced bilateral close |
@@ -116,39 +122,47 @@ Each market may also set an immutable nonzero maintenance-margin floor `minMm` (
 
 ---
 
-## 5. Verification & Benchmarks (LiteSVM / Agave 3.1.3)
+## 5. Verification & Worst-Case Multi-Leg Benchmarks (LiteSVM / Agave 3.1.3)
 
-See [`INVARIANTS.md`](INVARIANTS.md) for all **29 kernel-checked Lean 4 theorems** (`0 sorry`, `0` custom axioms). All 9 end-to-end suites in [`svm-runner/src/main.rs`](svm-runner/src/main.rs) pass 100% with **zero vault mocks**:
+See [`INVARIANTS.md`](INVARIANTS.md) for all **52 kernel-checked Lean 4 theorems** (`0 sorry`, `0` custom axioms). All **11 end-to-end suites** in [`svm-runner/src/main.rs`](svm-runner/src/main.rs) pass 100% with **zero vault mocks**:
+
+### Worst-Case 8-Leg (`MAX_LEGS = 8`) & Double-8-Leg (16-Leg) CU and Wire-MTU Stress Benchmarks (Suite 11)
+
+Every worst-case actor path (users, cranks, and liquidation keepers) executes in **one single legacy Solana transaction** (`≤ 876 B / 1,232 B` UDP MTU, zero LUT required) at **≤ 10.0% of Solana's 200,000 default CU budget**:
+
+| Role & Worst-Case Transaction | Compute Units | % of 200k Default CU | Legacy Wire Size | % of 1,232 B MTU |
+|---|---:|---:|---:|---:|
+| **User — 8-Leg Atomic Withdraw** `[8× RefreshLeg + WithdrawCollateral]` | **11,580 CU** | 5.8% | **793 B** | 64.4% |
+| **User — Double-8-Leg Trade** `[16× RefreshLeg + Trade]` (both parties at 8 legs) | **20,068 CU** | 10.0% | **865 B** | 70.2% |
+| **User — Position Hand-Off** `[7× RefreshLeg + Trade(mode=2 / mode=3)]` | **10,355 / 11,268 CU** | 5.2% / 5.6% | **793 B** | 64.4% |
+| **User — Post-ADL Open** `[15× RefreshLeg + Trade(mode=0)]` | **20,036 CU** | 10.0% | **857 B** | 69.6% |
+| **Liquidation Keeper — 8-Leg Fallback** `[7× RefreshLeg + Liquidate(mode=0)]` | **10,421 CU** | 5.2% | **690 B** | 56.0% |
+| **Liquidation Keeper — Double-8-Leg Post-ADL Takeover** `[14× RefreshLeg + Liquidate(mode=1)]` | **17,903 CU** | 9.0% | **876 B** | 71.1% |
+| **Crank — 8-Market Oracle Batch** `[8× UpdateOracle]` (1 tx) | **4,112 CU** | 2.1% | **702 B** | 57.0% |
+| **Crank — 8-Market CPI & Wind-Down** (`OracleAdapter` max/8×, `ForceClosePair`, `ResolveMarket`) | **2,114** (16,891 total) / **2,622** / **312 CU** | 1.1%–1.3% | — | — |
+
+### Full 11-Suite Verification Summary
 
 1. **Suite 1 — On-Chain `InitDex` PDA Vault Creation (`5,303 CU`)**: Creates real SPL Token `DexVault` PDA on-chain despite 1-lamport pre-funding griefing; rejects fake `tokenProg`, fake `sysProg`, and wrong PDA bump.
-2. **Suite 2 — Multi-Market Creation (`1,959 CU`)**: Rejects solvency-envelope violations; creates isolated `BTC`, `ETH`, `SCAM` markets.
-3. **Suite 3 — Cross-Margin Capital Efficiency (`trade 2,532 CU`, `refresh 1,161 CU`, `oracle 517 CU`)**: Long $500 BTC + Short $500 ETH on $100 shared capital survives a 7.84% parallel drop via atomic `[RefreshLeg(ETH), RefreshLeg(BTC)]` with `$100` intact and zero liquidation; verifies stale-leg withdrawal rejection and atomic withdrawal (`4,062 CU`).
-4. **Suite 4 — Anti-Reverse-Contagion (`liquidate 1,799 CU`)**: 15-step malicious `SCAM` pump liquidates `SCAM` leaving Alice with exact `capital == BTC_MM`, `I_BTC`/`I_ETH` untouched, and attacker capped at `R_SCAM`.
+2. **Suite 2 — Multi-Market Creation (`1,965 CU`)**: Rejects solvency-envelope violations; creates isolated `BTC`, `ETH`, `SCAM` markets.
+3. **Suite 3 — Cross-Margin Capital Efficiency (`trade 2,640 CU`, `refresh 1,158 CU`, `oracle 517 CU`)**: Long $500 BTC + Short $500 ETH on $100 shared capital survives a 7.84% parallel drop via atomic `[RefreshLeg(ETH), RefreshLeg(BTC)]` with `$100` intact and zero liquidation; verifies stale-leg withdrawal rejection and atomic withdrawal (`4,060 CU`).
+4. **Suite 4 — Anti-Reverse-Contagion & All-Leg Freshness (`liq 3,300 CU`)**: Rejects bare `Liquidate(SCAM)` while `BTC` leg is stale; atomic `[RefreshLeg(BTC), Liquidate(SCAM)]` liquidates `SCAM` leaving Alice with exact `capital == BTC_MM`, `I_BTC`/`I_ETH` untouched, and attacker capped at `R_SCAM`.
 5. **Suite 5 — Runtime Security Regressions**: Rejects same-slot oracle spam, unclamped jumps, fake `tokenProg`, aliased trades, and live-OI insurance withdrawals.
-6. **Suite 6 — Post-ADL Recovery, Full Lifecycle & Rent Reclaim (`clearDeadLeg 1,032 CU`, `closeAccount 248 CU`)**: Full ADL → `ClearDeadLeg` → `WindDown` → `ForceClosePair` → `Resolve` → `Tombstone` → `CloseAccount` reclaiming 100% rent across Portfolio, InsReceipt, and Market.
+6. **Suite 6 — Post-ADL Recovery, Full Lifecycle & Rent Reclaim (`clearDeadLeg 1,031 CU`, `closeAccount 248 CU`)**: Full ADL → `ClearDeadLeg` → `WindDown` → `ForceClosePair` → `Resolve` → `Tombstone` → `CloseAccount` reclaiming 100% rent across Portfolio, InsReceipt, and Market.
 7. **Suite 7 — Core Composability**: Bounded `execPrice` spread transfer (rejects out-of-band), `oracleAuth`/`marketAdmin` rotation, `minMm` dust floor rejection, and permissionless insurance donation.
-8. **Suite 8 — 1,000-Step Stateful Fuzzer**: 458 valid randomized cross-margin transactions (including liquidations and `ClearDeadLeg`s) checking exact `C_tot + I_tot + R_tot + S_tot == V == SPL_balance` and all per-market/per-portfolio invariants after every tx — 0 violations.
+8. **Suite 8 — 1,000-Step Stateful Fuzzer**: 474 valid randomized cross-margin transactions checking exact `C_tot + I_tot + R_tot + S_tot == V == SPL_balance` and all per-market/per-portfolio invariants after every tx — 0 violations.
 9. **Suite 9 — External Multi-Program CPI Composition**:
-   - `oracle_adapter.so` (`6,280 B`, `crank 2,111 CU`): rejects stale/wide-confidence feeds and smoothly converges `$100 → $115` over 4 permissionless slots via PDA-signed CPI into `UpdateOracle`.
-   - `matcher.so` (`8,752 B`, `open 4,277 CU`, `close 3,804 CU`, `withdrawLp 3,809 CU`): PDA-owned LP portfolio executes single-signer taker opens & closes with exact spread earned by LP and PDA-signed LP withdrawals.
+   - `oracle_adapter.so` (`6,272 B`, `crank 2,111 CU`): rejects stale/wide-confidence feeds and smoothly converges `$100 → $115` over 4 permissionless slots via PDA-signed CPI into `UpdateOracle`.
+   - `matcher.so` (`8,744 B`, `open 4,385 CU`, `close 3,849 CU`, `withdrawLp 3,809 CU`): PDA-owned LP portfolio executes single-signer taker opens & closes with exact spread earned by LP and PDA-signed LP withdrawals.
+10. **Suite 10 — Core Hardening & Fair Partial Takeover (`4,667 CU`)**: Rejects unbounded `exitWindow`/`maxStaleness`, nonzero `warmupSlots`, and `Trade(mode=1)` spread draining below `totalMm`; verifies partial takeover with gradual deficit fee (`< maxFee`) and zero ADL on innocent counterparties.
+11. **Suite 11 — Worst-Case 8-Leg CU/MTU Exhaustion + Anti-Selective-Liquidation + Post-ADL Recovery + Position Hand-Off**: Full 8-market, double-8-leg stress test verifying every role above, rejecting selective single-leg liquidation on an 8-leg hedged spread, verifying same-side Long→Long & Short→Short hand-off, post-ADL opens, post-ADL double-8-leg takeover, and full 8-market CPI/wind-down sweeps with zero invariant violations.
 
 ---
 
 ## 6. Build & Reproduce
 
 ```bash
-# 1. Verify all 29 Lean 4 theorems (0 sorry, 0 custom axioms)
-lake build
-
-# 2. Compile core DEX + both composable external programs to sBPF (.so)
-LEAN_PATH=../lean-svm/.lake/build/lib/lean:.lake/build/lib/lean \
-  ../lean-svm/.lake/build/bin/lean-svm build Percolator.Program Percolator.Program.entrypoint -o build/percolator.so
-LEAN_PATH=../lean-svm/.lake/build/lib/lean:.lake/build/lib/lean \
-  ../lean-svm/.lake/build/bin/lean-svm build Percolator.Matcher Percolator.Matcher.entrypoint -o build/matcher.so
-LEAN_PATH=../lean-svm/.lake/build/lib/lean:.lake/build/lib/lean \
-  ../lean-svm/.lake/build/bin/lean-svm build Percolator.OracleAdapter Percolator.OracleAdapter.entrypoint -o build/oracle_adapter.so
-
-# 3. Run all 9 LiteSVM verification, CPI composition, and 1,000-step fuzz suites
-cargo run --manifest-path svm-runner/Cargo.toml --release -- \
-  build/percolator.so build/matcher.so build/oracle_adapter.so
+# Run full Lean 4 kernel proof verification (52 theorems, 0 sorry, 0 custom axioms),
+# compile all 3 sBPF .so binaries, and execute all 11 LiteSVM suites:
+./scripts/build-and-test.sh
 ```

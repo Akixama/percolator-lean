@@ -278,8 +278,9 @@ theorem createMarket_sound (st st' : DexState)
     dsimp only at hm'; rw [updateFn_eq] at hm'; cases hm'
     unfold MarketState.wf MarketState.oiBalanced MarketState.adlValid MarketState.solvencyEnvelope
     dsimp only
+    rcases hc with ⟨_, hEWMin, hEWMax, hStMin, hStMax, _, hMmIm, hImDen, hEnv, _⟩
     exact ⟨fun _ => ⟨rfl, Nat.zero_le _⟩, ⟨Nat.le_refl _, Nat.le_refl _, Nat.le_refl _, Nat.le_refl _⟩,
-      hc.2.2.2.2.2.2.1, hc.2.2.2.2.1, hc.2.2.2.2.2.1, hc.2.1⟩
+      hEnv, hMmIm, hImDen, hEWMin, hEWMax, hStMin, hStMax⟩
   · cases h
 
 theorem depositCollateral_sound (st st' : DexState) (pid amount otherPid : Nat)
@@ -712,5 +713,652 @@ theorem tombstone_rejects_updateMarketAuth (st : DexState) (mid signer role newK
     (m : MarketState) (hm : st.markets mid = some m) (htomb : m.status = .tombstoned) :
     stepUpdateMarketAuth st mid signer role newKey = none := by
   unfold stepUpdateMarketAuth; simp [hm, htomb]
+
+/-! ### 6. Post-ADL Dust-Leg Safety, Fair Gradual Fee, Delegate Containment & Takeover -/
+
+/-- Bug Fix #3 Theorem: Ceiling proportional OI removal ALWAYS preserves `oiSide - eff ≤ rawSide - rawClose`,
+    even for 1-atom post-ADL dust legs (eliminating stuck-leg liquidation DoS!). -/
+theorem ceil_proportional_preserves_oi_le_raw (rawClose oiSide rawSide : Nat)
+    (hOiLe : oiSide ≤ rawSide) (hCloseLe : rawClose ≤ rawSide) :
+    oiSide - proportionalOiForRaw rawClose oiSide rawSide ≤ rawSide - rawClose := by
+  unfold proportionalOiForRaw
+  by_cases h0 : oiSide = 0 ∨ rawSide = 0
+  · simp only [h0, ↓reduceIte]; rcases h0 with rfl | rfl <;> omega
+  · simp only [h0, ↓reduceIte]
+    by_cases heq : oiSide = rawSide
+    · simp only [heq, ↓reduceIte]; omega
+    · simp only [heq, ↓reduceIte]
+      have hrawPos : 0 < rawSide := by omega
+      have hceil : rawClose * oiSide ≤ mulDivUp rawClose oiSide rawSide * rawSide := by
+        unfold mulDivUp
+        simp only [Nat.ne_of_gt hrawPos, ↓reduceIte]
+        exact le_mulDivUp_mul (rawClose * oiSide) rawSide hrawPos
+      let c := max 1 (mulDivUp rawClose oiSide rawSide)
+      have hcGe : mulDivUp rawClose oiSide rawSide ≤ c := Nat.le_max_right _ _
+      by_cases hcap : c ≥ oiSide
+      · have hmin : min oiSide c = oiSide := Nat.min_eq_left hcap
+        change oiSide - min oiSide c ≤ rawSide - rawClose
+        rw [hmin]; omega
+      · have hmin : min oiSide c = c := Nat.min_eq_right (by omega)
+        change oiSide - min oiSide c ≤ rawSide - rawClose
+        rw [hmin]
+        -- Goal: oiSide - c ≤ rawSide - rawClose. Prove via multiplying by `rawSide > 0`!
+        have h1 : (oiSide - c) * rawSide ≤ (rawSide - rawClose) * rawSide := by
+          have h2 : rawClose * oiSide ≤ c * rawSide :=
+            Nat.le_trans hceil (Nat.mul_le_mul_right rawSide hcGe)
+          have h3 : (oiSide - c) * rawSide = oiSide * rawSide - c * rawSide := Nat.sub_mul _ _ _
+          have h4 : (rawSide - rawClose) * rawSide = rawSide * rawSide - rawClose * rawSide := Nat.sub_mul _ _ _
+          have h5 : rawClose * oiSide ≤ rawClose * rawSide := Nat.mul_le_mul_left rawClose hOiLe
+          have h6 : oiSide * rawSide + rawClose * rawSide ≤ rawSide * rawSide + c * rawSide := by
+            have hle1 : oiSide * rawClose ≤ oiSide * rawSide := Nat.mul_le_mul_left oiSide hCloseLe
+            have ha : rawClose * oiSide + oiSide * (rawSide - rawClose) = oiSide * rawSide := by
+              rw [Nat.mul_sub_left_distrib, Nat.mul_comm rawClose oiSide]; omega
+            have hb : oiSide * (rawSide - rawClose) ≤ rawSide * (rawSide - rawClose) :=
+              Nat.mul_le_mul_right _ hOiLe
+            rw [Nat.mul_sub_left_distrib, Nat.mul_sub_left_distrib, Nat.mul_comm rawSide rawClose, Nat.mul_comm oiSide rawClose] at hb
+            have hrr : rawClose * rawSide ≤ rawSide * rawSide := Nat.mul_le_mul_right rawSide hCloseLe
+            omega
+          have hcm : c * rawSide ≤ oiSide * rawSide := Nat.mul_le_mul_right rawSide (by omega)
+          have hrr : rawClose * rawSide ≤ rawSide * rawSide := Nat.mul_le_mul_right rawSide hCloseLe
+          have hsub : oiSide * rawSide - c * rawSide ≤ rawSide * rawSide - rawClose * rawSide := by omega
+          rwa [h3, h4]
+        exact Nat.le_of_mul_le_mul_right h1 hrawPos
+
+/-- Fair Gradual Liquidation Fee Bound: `gradualLiqFee maxFee deficit ≤ maxFee`,
+    so `oracle_clamp_zero_bad_debt` holds unconditionally with gradual deficit-scaled fees! -/
+theorem gradualLiqFee_le_max (maxFee deficit : Nat) :
+    gradualLiqFee maxFee deficit ≤ maxFee := by
+  unfold gradualLiqFee; exact Nat.min_le_left _ _
+
+theorem gradual_liqFee_zero_bad_debt
+    (qty oldP newP equity maxMoveBps liqFeeBps mmBps deficit : Nat)
+    (henv : maxMoveBps + liqFeeBps ≤ mmBps)
+    (hclamp : oracleClampOk oldP newP maxMoveBps)
+    (hhealthy : equity ≥ marginReq (marginNotional qty oldP) mmBps) :
+    let diff := if newP ≥ oldP then newP - oldP else oldP - newP
+    let maxFee := mulDivDown (marginNotional qty oldP) liqFeeBps bpsDenNat
+    mulDivDown qty diff posScaleNat + gradualLiqFee maxFee deficit ≤ equity := by
+  dsimp only
+  have hbase := oracle_clamp_zero_bad_debt qty oldP newP equity maxMoveBps liqFeeBps mmBps henv hclamp hhealthy
+  have hfee := gradualLiqFee_le_max (mulDivDown (marginNotional qty oldP) liqFeeBps bpsDenNat) deficit
+  dsimp only at hbase
+  omega
+
+/-- Delegate Custody Isolation: a non-owner delegate can NEVER withdraw collateral! -/
+theorem delegate_cannot_withdraw (st : DexState) (pid signer amount curSlot : Nat)
+    (pfl : PortfolioState) (hp : st.portfolios pid = some pfl) (hne : signer ≠ pfl.owner) :
+    stepWithdrawCollateralAuth st pid signer amount curSlot = none := by
+  unfold stepWithdrawCollateralAuth; simp [hp, hne]
+
+/-- Bug Fix #1 Theorem: `Trade(mode=1)` with bounded `execPrice` spread preserves `stockExact`,
+    market well-formedness, AND leaves both portfolios above their `newMm` (zero cross-margin bypass!). -/
+theorem tradeReduceWithSpread_preserves_isolation
+    (st st' : DexState) (mid pidL pidS qty sLToS sSToL newMmL newMmS otherMid otherPid : Nat)
+    (hstock : st.stockExact) (hwf : ∀ m, st.markets mid = some m → m.wf)
+    (h : stepTradeReduceWithSpread st mid pidL pidS qty sLToS sSToL newMmL newMmS = some st')
+    (hneM : otherMid ≠ mid) (hneL : otherPid ≠ pidL) (hneS : otherPid ≠ pidS) :
+    st'.stockExact ∧
+    (∀ m', st'.markets mid = some m' → m'.wf) ∧
+    (∀ pL', st'.portfolios pidL = some pL' → pL'.capital ≥ newMmL) ∧
+    (∀ pS', st'.portfolios pidS = some pS' → pS'.capital ≥ newMmS) ∧
+    st'.markets otherMid = st.markets otherMid ∧
+    st'.portfolios otherPid = st.portfolios otherPid := by
+  unfold stepTradeReduceWithSpread at h
+  split at h
+  · cases h
+  · next hneLS =>
+    cases hpL : st.portfolios pidL with
+    | none => simp [hpL] at h
+    | some pL =>
+      cases hpS : st.portfolios pidS with
+      | none => simp [hpL, hpS] at h
+      | some pS =>
+        simp only [hpL, hpS, Bind.bind, Option.bind] at h
+        split at h
+        · next hchk =>
+          cases htr : stepTradeReduce st mid pidL pidS qty with
+          | none => simp [htr] at h
+          | some st1 =>
+            simp only [htr] at h
+            cases hpL1 : st1.portfolios pidL with
+            | none => simp [hpL1] at h
+            | some pL1 =>
+              cases hpS1 : st1.portfolios pidS with
+              | none => simp [hpL1, hpS1] at h
+              | some pS1 =>
+                simp only [hpL1, hpS1] at h
+                cases h
+                have hred := tradeReduce_sound st st1 mid pidL pidS qty otherMid otherPid hstock hwf htr hneM hneL hneS
+                refine ⟨hred.1, hred.2.1, ?_, ?_, hred.2.2.1, ?_⟩
+                · intro pL' hpL'
+                  dsimp only at hpL'
+                  rw [updateFn_ne _ _ _ _ hneLS, updateFn_eq] at hpL'
+                  cases hpL'; exact hchk.2.2.1
+                · intro pS' hpS'
+                  dsimp only at hpS'
+                  rw [updateFn_eq] at hpS'
+                  cases hpS'; exact hchk.2.2.2
+                · dsimp only
+                  rw [updateFn_ne _ _ _ _ hneS, updateFn_ne _ _ _ _ hneL]
+                  exact hred.2.2.2
+        · cases h
+
+/-- Fair Liquidation Takeover (HLP / Counterparty Tier Before ADL) Soundness Theorem:
+    Preserves `stockExact`, `m'.wf` with ZERO ADL (`adlLong' = ADL_ONE ∧ adlShort' = ADL_ONE`),
+    victim anti-reverse-contagion (`capital' ≥ totalMm - leg.cachedMm`), and cross-market isolation! -/
+theorem liquidateTakeover_sound
+    (st st' : DexState) (mid pid liqPid rawClose liqFeeCap loss otherMid otherPid : Nat)
+    (hstock : st.stockExact) (hwf : ∀ m, st.markets mid = some m → m.wf)
+    (h : stepLiquidateTakeover st mid pid liqPid rawClose liqFeeCap loss = some st')
+    (hneM : otherMid ≠ mid) (hneP : otherPid ≠ pid) (hneLiq : otherPid ≠ liqPid) :
+    st'.stockExact ∧
+    (∀ m', st'.markets mid = some m' → m'.wf ∧ m'.adlLong = adlOneNat ∧ m'.adlShort = adlOneNat) ∧
+    (∀ pfl pfl' leg, st.portfolios pid = some pfl → pfl.legs mid = some leg →
+      pfl.capital ≥ pfl.totalMm - leg.cachedMm → st'.portfolios pid = some pfl' →
+      pfl'.capital ≥ pfl.totalMm - leg.cachedMm) ∧
+    st'.markets otherMid = st.markets otherMid ∧
+    st'.portfolios otherPid = st.portfolios otherPid := by
+  unfold stepLiquidateTakeover at h
+  split at h
+  · cases h
+  · next hnePL =>
+    cases hm : st.markets mid with
+    | none => simp [hm] at h
+    | some m =>
+      cases hp : st.portfolios pid with
+      | none => simp [hm, hp] at h
+      | some pfl =>
+        cases hlp : st.portfolios liqPid with
+        | none => simp [hm, hp, hlp] at h
+        | some liqPfl =>
+          cases hl : pfl.legs mid with
+          | none => simp [hm, hp, hlp, hl] at h
+          | some leg =>
+            simp only [hm, hp, hlp, hl, Bind.bind, Option.bind] at h
+            split at h
+            · next hc =>
+              split at h
+              · next hchk =>
+                cases h
+                have hmWf := hwf m hm
+                refine ⟨?_, ?_, ?_, updateFn_ne _ _ _ _ hneM, ?_⟩
+                · unfold DexState.stockExact at *; dsimp only; omega
+                · intro m' hm'
+                  dsimp only at hm'; rw [updateFn_eq] at hm'; cases hm'
+                  rcases hmWf with ⟨hoi, hadl, henv⟩
+                  exact ⟨⟨hoi, hadl, henv⟩, hc.2.2.2.2.1, hc.2.2.2.2.2⟩
+                · intro pfl0 pfl' leg0 hp0 hl0 hother hp'
+                  have heqP : pfl = pfl0 := Option.some.inj hp0
+                  subst heqP
+                  have heqL : leg = leg0 := Option.some.inj (hl.symm.trans hl0)
+                  subst heqL
+                  simp [updateFn, hnePL] at hp'
+                  subst hp'
+                  unfold applyContainedLoss capAvailableForLeg; dsimp only; omega
+                · dsimp only
+                  rw [updateFn_ne _ _ _ _ hneLiq, updateFn_ne _ _ _ _ hneP]
+              · cases h
+            · cases h
+
+/-! ### 7. Closed Inductive Aggregate-Sum Coherence & Bounded Exit-Liveness (Anti-DoS!) -/
+
+/-- Exact list-sum update lemma for `Nodup` ID lists: changing `f k` from `old` to `new`
+    shifts `(ids.map f).sum` by exactly `new - old` (or `old - new`). -/
+private theorem sum_map_update_add (ids : List Nat) (f : Nat → Nat) (k delta : Nat)
+    (hnd : ids.Nodup) (hmem : k ∈ ids) :
+    (ids.map (fun x => if x = k then f k + delta else f x)).sum = (ids.map f).sum + delta := by
+  induction ids with
+  | nil => cases hmem
+  | cons a tl ih =>
+    simp only [List.nodup_cons, List.mem_cons] at hnd hmem
+    simp only [List.map_cons, List.sum_cons]
+    rcases hmem with rfl | htl
+    · have hrest : tl.map (fun x => if x = k then f k + delta else f x) = tl.map f := by
+        apply List.map_congr_left
+        intro x hx
+        have hne : x ≠ k := fun h => hnd.1 (h ▸ hx)
+        simp [hne]
+      simp only [↓reduceIte, hrest]; omega
+    · have hne : a ≠ k := fun h => hnd.1 (h ▸ htl)
+      simp only [hne, ↓reduceIte]; rw [ih hnd.2 htl]; omega
+
+private theorem sum_map_update_sub (ids : List Nat) (f : Nat → Nat) (k delta : Nat)
+    (hnd : ids.Nodup) (hmem : k ∈ ids) (hle : delta ≤ f k) :
+    (ids.map (fun x => if x = k then f k - delta else f x)).sum = (ids.map f).sum - delta ∧
+    delta ≤ (ids.map f).sum := by
+  induction ids with
+  | nil => cases hmem
+  | cons a tl ih =>
+    simp only [List.nodup_cons, List.mem_cons] at hnd hmem
+    simp only [List.map_cons, List.sum_cons]
+    rcases hmem with rfl | htl
+    · have hrest : tl.map (fun x => if x = k then f k - delta else f x) = tl.map f := by
+        apply List.map_congr_left
+        intro x hx
+        have hne : x ≠ k := fun h => hnd.1 (h ▸ hx)
+        simp [hne]
+      simp only [↓reduceIte, hrest]; omega
+    · have hne : a ≠ k := fun h => hnd.1 (h ▸ htl)
+      have ⟨h1, h2⟩ := ih hnd.2 htl
+      simp only [hne, ↓reduceIte, h1]; omega
+
+/-- Inductive Coherence Preservation: `DepositCollateral` preserves exact `C_tot = ∑ capital`,
+    `I_tot = ∑ insurance`, `R_tot = ∑ realizedPool`, AND `C_tot + I_tot + R_tot + S_tot = V`! -/
+theorem depositCollateral_preserves_coherent (st st' : DexState) (mids pids : List Nat) (pid amount : Nat)
+    (hcoh : st.coherent mids pids) (hndP : pids.Nodup) (hmemP : pid ∈ pids)
+    (h : stepDepositCollateral st pid amount = some st') :
+    st'.coherent mids pids := by
+  unfold stepDepositCollateral at h
+  cases hp : st.portfolios pid with
+  | none => simp [hp] at h
+  | some pfl =>
+    simp [hp] at h
+    rcases h with ⟨_, hst⟩; subst hst
+    rcases hcoh with ⟨hstock, hC, hI, hR⟩
+    refine ⟨by unfold DexState.stockExact at *; dsimp only; omega, ?_, hI, hR⟩
+    unfold sumCaps at *; dsimp only
+    rw [hC]; symm
+    have hmap : pids.map (getCap (updateFn st.portfolios pid (some { pfl with capital := pfl.capital + amount }))) =
+                pids.map (fun x => if x = pid then getCap st.portfolios pid + amount else getCap st.portfolios x) := by
+      apply List.map_congr_left; intro x _
+      by_cases hx : x = pid
+      · subst hx; simp [getCap, updateFn, hp]
+      · simp [getCap, updateFn, hx]
+    rw [hmap, sum_map_update_add pids (getCap st.portfolios) pid amount hndP hmemP]
+
+theorem withdrawCollateral_preserves_coherent (st st' : DexState) (mids pids : List Nat) (pid amount curSlot : Nat)
+    (hcoh : st.coherent mids pids) (hndP : pids.Nodup) (hmemP : pid ∈ pids)
+    (h : stepWithdrawCollateral st pid amount curSlot = some st') :
+    st'.coherent mids pids := by
+  unfold stepWithdrawCollateral at h
+  cases hp : st.portfolios pid with
+  | none => simp [hp] at h
+  | some pfl =>
+    simp [hp] at h
+    rcases h with ⟨⟨_, hcap, htc, hv, _, _⟩, hst⟩; subst hst
+    rcases hcoh with ⟨hstock, hC, hI, hR⟩
+    refine ⟨by unfold DexState.stockExact at *; dsimp only; omega, ?_, hI, hR⟩
+    unfold sumCaps at *; dsimp only
+    rw [hC]; symm
+    have hmap : pids.map (getCap (updateFn st.portfolios pid (some { pfl with capital := pfl.capital - amount }))) =
+                pids.map (fun x => if x = pid then getCap st.portfolios pid - amount else getCap st.portfolios x) := by
+      apply List.map_congr_left; intro x _
+      by_cases hx : x = pid
+      · subst hx; simp [getCap, updateFn, hp]
+      · simp [getCap, updateFn, hx]
+    have hle : amount ≤ getCap st.portfolios pid := by simp [getCap, hp]; exact hcap
+    rw [hmap, (sum_map_update_sub pids (getCap st.portfolios) pid amount hndP hmemP hle).1]
+
+theorem realizeLegPnl_preserves_coherent (st st' : DexState) (mids pids : List Nat) (mid pid : Nat)
+    (hcoh : st.coherent mids pids) (hndM : mids.Nodup) (hmemM : mid ∈ mids)
+    (hndP : pids.Nodup) (hmemP : pid ∈ pids)
+    (h : stepRealizeLegPnl st mid pid = some st') :
+    st'.coherent mids pids := by
+  unfold stepRealizeLegPnl at h
+  cases hm : st.markets mid with
+  | none => simp [hm] at h
+  | some m =>
+    cases hp : st.portfolios pid with
+    | none => simp [hm, hp] at h
+    | some pfl =>
+      cases hl : pfl.legs mid with
+      | none => simp [hm, hp, hl] at h
+      | some leg =>
+        simp [hm, hp, hl] at h
+        rcases h with ⟨⟨_, _, hleP, hleR⟩, hst⟩; subst hst
+        have hpayLe : haircutPayout leg.posPnl m.realizedPool m.totalPosPnl ≤ m.realizedPool :=
+          haircutPayout_le_residual _ _ _ hleP
+        rcases hcoh with ⟨hstock, hC, hI, hR⟩
+        let pay := haircutPayout leg.posPnl m.realizedPool m.totalPosPnl
+        refine ⟨by unfold DexState.stockExact at *; dsimp only; omega, ?_, ?_, ?_⟩
+        · unfold sumCaps at *; dsimp only
+          rw [hC]; symm
+          have hmap : pids.map (getCap (updateFn st.portfolios pid (some { pfl with capital := pfl.capital + pay, legs := updateFn pfl.legs mid (some { leg with posPnl := 0 }) }))) =
+                      pids.map (fun x => if x = pid then getCap st.portfolios pid + pay else getCap st.portfolios x) := by
+            apply List.map_congr_left; intro x _
+            by_cases hx : x = pid
+            · subst hx; simp [getCap, updateFn, hp]
+            · simp [getCap, updateFn, hx]
+          rw [hmap, sum_map_update_add pids (getCap st.portfolios) pid pay hndP hmemP]
+        · unfold sumIns at *; dsimp only
+          have hmap : mids.map (getIns (updateFn st.markets mid (some { m with realizedPool := m.realizedPool - pay, totalPosPnl := m.totalPosPnl - leg.posPnl }))) =
+                      mids.map (getIns st.markets) := by
+            apply List.map_congr_left; intro x _
+            by_cases hx : x = mid
+            · subst hx; simp [getIns, updateFn, hm]
+            · simp [getIns, updateFn, hx]
+          rw [hmap, hI]
+        · unfold sumRes at *; dsimp only
+          rw [hR]; symm
+          have hmap : mids.map (getRes (updateFn st.markets mid (some { m with realizedPool := m.realizedPool - pay, totalPosPnl := m.totalPosPnl - leg.posPnl }))) =
+                      mids.map (fun x => if x = mid then getRes st.markets mid - pay else getRes st.markets x) := by
+            apply List.map_congr_left; intro x _
+            by_cases hx : x = mid
+            · subst hx; simp [getRes, updateFn, hm]
+            · simp [getRes, updateFn, hx]
+          have hle : pay ≤ getRes st.markets mid := by simp [getRes, hm]; exact hpayLe
+          rw [hmap, (sum_map_update_sub mids (getRes st.markets) mid pay hndM hmemM hle).1]
+
+/-- Anti-DoS Exit-Liveness Theorem #1: ANY flat portfolio (`totalIm = 0`, all legs empty)
+    in a coherent DEX can unconditionally withdraw `100%` of its `capital > 0` at ANY slot! -/
+theorem flat_portfolio_unconditionally_withdrawable
+    (st : DexState) (mids pids : List Nat) (pid curSlot : Nat) (pfl : PortfolioState)
+    (hcoh : st.coherent mids pids) (hndP : pids.Nodup) (hmemP : pid ∈ pids)
+    (hp : st.portfolios pid = some pfl)
+    (hpos : pfl.capital > 0) (him : pfl.totalIm = 0)
+    (hflat : ∀ mid, pfl.legs mid = none) :
+    ∃ st', stepWithdrawCollateralAuth st pid pfl.owner pfl.capital curSlot = some st' ∧
+           st'.coherent mids pids := by
+  rcases hcoh with ⟨hstock, hC, hI, hR⟩
+  have hcapLeC : pfl.capital ≤ st.totalCapital := by
+    rw [hC]; unfold sumCaps
+    exact (sum_map_update_sub pids (getCap st.portfolios) pid pfl.capital hndP hmemP (by simp [getCap, hp])).2
+  have hcapLeV : pfl.capital ≤ st.vault := by unfold DexState.stockExact at hstock; omega
+  have hw : stepWithdrawCollateral st pid pfl.capital curSlot =
+            some { st with vault := st.vault - pfl.capital, totalCapital := st.totalCapital - pfl.capital,
+                           portfolios := updateFn st.portfolios pid (some { pfl with capital := 0 }) } := by
+    unfold stepWithdrawCollateral
+    simp [hp, hpos, hcapLeC, hcapLeV, him, hflat, legFreshAt]
+  refine ⟨_, ?_, withdrawCollateral_preserves_coherent st _ mids pids pid pfl.capital curSlot ⟨hstock, hC, hI, hR⟩ hndP hmemP hw⟩
+  unfold stepWithdrawCollateralAuth
+  simp [hp, hw]
+
+/-- Anti-DoS Exit-Liveness Theorem #2: ANY well-formed market `m` has bounded permissionless
+    exit deadlines (`maxStaleness ≤ maxStaleNat`, `exitWindow ≤ maxExitWinNat`), so a dead/hostile
+    oracle cannot freeze wind-down or force-close beyond `maxStaleNat + maxExitWinNat + 1` slots! -/
+theorem market_bounded_exit_liveness (m : MarketState) (hwf : m.wf) :
+    m.maxStaleness ≤ maxStaleNat ∧
+    m.exitWindow ≤ maxExitWinNat ∧
+    m.maxStaleness + m.exitWindow + 1 ≤ maxStaleNat + maxExitWinNat + 1 := by
+  rcases hwf with ⟨_, _, henv⟩
+  unfold MarketState.solvencyEnvelope at henv
+  omega
+
+/-! ### 8. Fair Cross-Margin Liquidation Freshness (A1), Post-ADL Recovery (A2), and Position Hand-Off (B4) -/
+
+/-- A1 Theorem (Anti-Selective-Liquidation):
+    1. If ANY active leg `k < st.nextMarketId` on `pfl` was NOT refreshed in `curSlot`,
+       `stepLiquidateChecked` unconditionally REJECTS (`= none`), preventing selective single-leg
+       liquidation of a hedged cross-margin portfolio without crediting winning legs!
+    2. Once all legs are fresh and `cap1 + pnl1 ≥ totalMm` with `shortfall = 0`, `stepLiquidateChecked`
+       also REJECTS (`= none`)! -/
+theorem hedged_portfolio_immune_to_selective_liquidation
+    (st : DexState) (mid pid curSlot liqFeeCap loss : Nat)
+    (pfl : PortfolioState) (leg : LegState)
+    (hp : st.portfolios pid = some pfl) (hl : pfl.legs mid = some leg) :
+    ((∃ k, k < st.nextMarketId ∧ legFreshAt (pfl.legs k) curSlot = false) →
+      stepLiquidateChecked st mid pid curSlot liqFeeCap loss = none) ∧
+    (let (cap1, pnl1, _, _, shortfall) := applyContainedLoss pfl.capital pfl.totalMm leg loss
+     shortfall = 0 → cap1 + pnl1 ≥ pfl.totalMm →
+      stepLiquidateChecked st mid pid curSlot liqFeeCap loss = none) := by
+  constructor
+  · rintro ⟨k, hk, hstale⟩
+    unfold stepLiquidateChecked
+    simp only [hp, hl, Bind.bind, Option.bind]
+    have hnotAll : (List.range st.nextMarketId).all (fun j => legFreshAt (pfl.legs j) curSlot) = false := by
+      rw [List.all_eq_false]
+      exact ⟨k, List.mem_range.mpr hk, by simp [hstale]⟩
+    simp [hnotAll]
+  · intro hsf hhealthy
+    unfold stepLiquidateChecked
+    simp only [hp, hl, Bind.bind, Option.bind]
+    split
+    · next hcond =>
+      rcases hcond with ⟨_, hbad⟩
+      unfold applyContainedLoss at hbad
+      dsimp only at hbad
+      omega
+    · rfl
+
+/-- Helper: `postAdlRawAdd` ALWAYS mints at least `qty` raw basis. -/
+theorem postAdlRawAdd_ge_qty (qty oi raw : Nat) :
+    qty ≤ postAdlRawAdd qty oi raw := by
+  unfold postAdlRawAdd
+  split
+  · omega
+  · exact Nat.le_max_left _ _
+
+/-- A2 Core Monotonicity Theorem: Opening `qty` on a partially-ADL'd side (`0 < oi ≤ raw`)
+    by minting `rAdd := postAdlRawAdd qty oi raw`:
+    1. Preserves `oi + qty ≤ raw + rAdd` (never creates unbacked OI),
+    2. Preserves the exact rational ratio `(oi + qty) * raw ≤ oi * (raw + rAdd)` (NEVER inflates
+       any existing holder's effective position!),
+    3. Guarantees `deriveAdl (oi + qty) (raw + rAdd) ≤ deriveAdl oi raw`! -/
+theorem postAdlOpen_preserves_adl_monotone (qty oi raw : Nat)
+    (hoi : 0 < oi) (hle : oi ≤ raw) :
+    let rAdd := postAdlRawAdd qty oi raw
+    oi + qty ≤ raw + rAdd ∧
+    (oi + qty) * raw ≤ oi * (raw + rAdd) ∧
+    deriveAdl (oi + qty) (raw + rAdd) ≤ deriveAdl oi raw := by
+  dsimp only
+  have hge : qty ≤ postAdlRawAdd qty oi raw := postAdlRawAdd_ge_qty qty oi raw
+  have hle' : oi + qty ≤ raw + postAdlRawAdd qty oi raw := by omega
+  have hrat : (oi + qty) * raw ≤ oi * (raw + postAdlRawAdd qty oi raw) := by
+    unfold postAdlRawAdd
+    split
+    · next hor =>
+      rcases hor with rfl | heq
+      · omega
+      · subst heq; exact Nat.le_of_eq (Nat.mul_comm _ _)
+    · have hceil : qty * raw ≤ mulDivUp qty raw oi * oi := by
+        unfold mulDivUp
+        have hne : oi ≠ 0 := by omega
+        simp only [hne, ↓reduceIte]
+        have hdiv := Nat.div_add_mod (qty * raw + oi - 1) oi
+        have hmod : (qty * raw + oi - 1) % oi < oi := Nat.mod_lt _ hoi
+        have hcomm : oi * ((qty * raw + oi - 1) / oi) = ((qty * raw + oi - 1) / oi) * oi :=
+          Nat.mul_comm _ _
+        omega
+      have hmax : mulDivUp qty raw oi ≤ max qty (mulDivUp qty raw oi) := Nat.le_max_right _ _
+      have hmul : mulDivUp qty raw oi * oi ≤ max qty (mulDivUp qty raw oi) * oi :=
+        Nat.mul_le_mul_right oi hmax
+      have h1 : (oi + qty) * raw = oi * raw + qty * raw := Nat.add_mul oi qty raw
+      have h2 : oi * (raw + max qty (mulDivUp qty raw oi)) = oi * raw + max qty (mulDivUp qty raw oi) * oi := by
+        rw [Nat.mul_add, Nat.mul_comm oi (max _ _)]
+      omega
+  refine ⟨hle', hrat, ?_⟩
+  have hrawPos : raw > 0 := by omega
+  have hraw'Pos : raw + postAdlRawAdd qty oi raw > 0 := by omega
+  by_cases hEq : oi = raw
+  · subst hEq
+    have h1 : deriveAdl oi oi = adlOneNat := by
+      unfold deriveAdl; simp [Nat.ne_of_gt hrawPos]
+    rw [h1]
+    exact deriveAdl_le_one _ _
+  · have hlt : oi < raw := by omega
+    have hdivLe : (adlOneNat * (oi + qty)) / (raw + postAdlRawAdd qty oi raw) ≤ (adlOneNat * oi) / raw := by
+      let raw' := raw + postAdlRawAdd qty oi raw
+      let q := (adlOneNat * oi) / raw
+      change (adlOneNat * (oi + qty)) / raw' ≤ q
+      rw [Nat.div_le_iff_le_mul_add_pred hraw'Pos]
+      have hdm := Nat.div_add_mod (adlOneNat * oi) raw
+      have hmod : (adlOneNat * oi) % raw < raw := Nat.mod_lt _ hrawPos
+      have hcross : adlOneNat * (oi + qty) * raw ≤ adlOneNat * oi * raw' := by
+        calc adlOneNat * (oi + qty) * raw
+            = adlOneNat * ((oi + qty) * raw) := Nat.mul_assoc _ _ _
+          _ ≤ adlOneNat * (oi * raw') := Nat.mul_le_mul_left _ hrat
+          _ = adlOneNat * oi * raw' := (Nat.mul_assoc _ _ _).symm
+      have hub : adlOneNat * oi ≤ q * raw + (raw - 1) := by
+        have hmul : raw * ((adlOneNat * oi) / raw) = q * raw := Nat.mul_comm _ _
+        rw [hmul] at hdm
+        omega
+      have hmulub : adlOneNat * oi * raw' ≤ (q * raw + (raw - 1)) * raw' :=
+        Nat.mul_le_mul_right raw' hub
+      have hexp : (q * raw + (raw - 1)) * raw' = q * raw' * raw + (raw - 1) * raw' := by
+        rw [Nat.add_mul, Nat.mul_assoc, Nat.mul_comm raw raw', ← Nat.mul_assoc]
+      have hstep3 : (raw - 1) * raw' ≤ (raw' - 1) * raw := by
+        have hA : (raw - 1) * raw' + raw' = raw * raw' := by
+          calc (raw - 1) * raw' + raw' = (raw - 1 + 1) * raw' := by rw [Nat.add_mul, Nat.one_mul]
+            _ = raw * raw' := by rw [Nat.sub_add_cancel hrawPos]
+        have hB : (raw' - 1) * raw + raw = raw' * raw := by
+          calc (raw' - 1) * raw + raw = (raw' - 1 + 1) * raw := by rw [Nat.add_mul, Nat.one_mul]
+            _ = raw' * raw := by rw [Nat.sub_add_cancel hraw'Pos]
+        have hC : raw * raw' = raw' * raw := Nat.mul_comm raw raw'
+        have hleR : raw ≤ raw' := by omega
+        omega
+      have hbound : adlOneNat * (oi + qty) * raw ≤ (raw' * q + (raw' - 1)) * raw := by
+        have hstep1 : adlOneNat * (oi + qty) * raw ≤ q * raw' * raw + (raw - 1) * raw' := by omega
+        have hstep2 : (raw' * q + (raw' - 1)) * raw = q * raw' * raw + (raw' - 1) * raw := by
+          rw [Nat.add_mul, Nat.mul_comm raw' q]
+        omega
+      exact Nat.le_of_mul_le_mul_right hbound hrawPos
+    unfold deriveAdl
+    have hrawNe : raw ≠ 0 := by omega
+    have hraw'Ne : raw + postAdlRawAdd qty oi raw ≠ 0 := by omega
+    have hnotge : ¬ (oi ≥ raw) := by omega
+    have hnotge' : ¬ (oi + qty ≥ raw + postAdlRawAdd qty oi raw) := by
+      intro hge'
+      have heq' : oi + qty = raw + postAdlRawAdd qty oi raw := by omega
+      rw [heq'] at hrat
+      rw [Nat.mul_comm oi _] at hrat
+      have : raw ≤ oi := Nat.le_of_mul_le_mul_left hrat hraw'Pos
+      omega
+    simp only [hrawNe, hraw'Ne, hnotge, hnotge', ↓reduceIte]
+    omega
+
+/-- A2 Soundness Theorem (`Trade` mode = 0 Post-ADL Open):
+    Preserves `stockExact`, `m'.wf` (including `oiLong' = oiShort' ≤ maxOi` and `adlValid`),
+    and cross-market/portfolio isolation! -/
+theorem tradeOpenPostAdl_sound
+    (st st' : DexState) (mid pidL pidS qty spLS spSL otherMid otherPid : Nat)
+    (hstock : st.stockExact) (hwf : ∀ m, st.markets mid = some m → m.wf)
+    (h : stepTradeOpenPostAdl st mid pidL pidS qty spLS spSL = some st')
+    (hneM : otherMid ≠ mid) (hneL : otherPid ≠ pidL) (hneS : otherPid ≠ pidS) :
+    st'.stockExact ∧
+    (∀ m', st'.markets mid = some m' → m'.wf) ∧
+    st'.markets otherMid = st.markets otherMid ∧
+    st'.portfolios otherPid = st.portfolios otherPid := by
+  unfold stepTradeOpenPostAdl at h
+  split at h
+  · cases h
+  · cases hm : st.markets mid with
+    | none => simp [hm] at h
+    | some m =>
+      cases hpL : st.portfolios pidL with
+      | none => simp [hm, hpL] at h
+      | some pL =>
+        cases hpS : st.portfolios pidS with
+        | none => simp [hm, hpL, hpS] at h
+        | some pS =>
+          simp only [hm, hpL, hpS, Bind.bind, Option.bind] at h
+          split at h
+          · next hc =>
+            rcases hc with ⟨hact, _, _, _, hmaxL, _, _, _, htotCap⟩
+            cases h
+            have hmWf := hwf m hm
+            rcases hmWf with ⟨hoi, hadl, henv⟩
+            have ⟨hbal, _⟩ := hoi (Or.inl hact)
+            rcases hadl with ⟨hleL, hleS, _, _⟩
+            refine ⟨?_, ?_, updateFn_ne _ _ _ _ hneM, ?_⟩
+            · unfold DexState.stockExact at *; dsimp only; omega
+            · intro m' hm'
+              dsimp only at hm'; rw [updateFn_eq] at hm'; cases hm'
+              have hgeL := postAdlRawAdd_ge_qty qty m.oiLong m.rawBasisLong
+              have hgeS := postAdlRawAdd_ge_qty qty m.oiShort m.rawBasisShort
+              refine ⟨fun _ => ⟨by dsimp only; omega, by dsimp only; omega⟩,
+                ⟨by dsimp only; omega, by dsimp only; omega, deriveAdl_le_one _ _, deriveAdl_le_one _ _⟩, henv⟩
+            · dsimp only
+              rw [updateFn_ne _ _ _ _ hneS, updateFn_ne _ _ _ _ hneL]
+          · cases h
+
+/-- B4 Soundness Theorem (`Trade` mode = 2/3 Same-Side Position Hand-Off):
+    Preserves `stockExact`, leaves the ENTIRE `MarketState` (`oiLong`, `oiShort`, `rawBasisLong`,
+    `rawBasisShort`, `adlLong`, `adlShort`) BIT-FOR-BIT INVARIANT, and leaves all other portfolios untouched! -/
+theorem tradeHandoff_sound
+    (st st' : DexState) (mid pidSell pidBuy qty spBS spSB otherPid : Nat)
+    (hstock : st.stockExact)
+    (h : stepTradeHandoff st mid pidSell pidBuy qty spBS spSB = some st')
+    (hneSell : otherPid ≠ pidSell) (hneBuy : otherPid ≠ pidBuy) :
+    st'.stockExact ∧
+    st'.markets = st.markets ∧
+    st'.portfolios otherPid = st.portfolios otherPid := by
+  unfold stepTradeHandoff at h
+  split at h
+  · cases h
+  · cases hm : st.markets mid with
+    | none => simp [hm] at h
+    | some m =>
+      cases hp1 : st.portfolios pidSell with
+      | none => simp [hm, hp1] at h
+      | some pSell =>
+        cases hp2 : st.portfolios pidBuy with
+        | none => simp [hm, hp1, hp2] at h
+        | some pBuy =>
+          cases hl : pSell.legs mid with
+          | none => simp [hm, hp1, hp2, hl] at h
+          | some lSell =>
+            simp only [hm, hp1, hp2, hl, Bind.bind, Option.bind] at h
+            split at h
+            · by_cases hSide : lSell.side = .long
+              · simp only [hSide, ↓reduceIte] at h
+                split at h
+                · cases h
+                · cases h; refine ⟨hstock, rfl, ?_⟩; dsimp only; rw [updateFn_ne _ _ _ _ hneBuy, updateFn_ne _ _ _ _ hneSell]
+              · simp only [hSide, ↓reduceIte] at h
+                split at h
+                · cases h
+                · cases h; refine ⟨hstock, rfl, ?_⟩; dsimp only; rw [updateFn_ne _ _ _ _ hneBuy, updateFn_ne _ _ _ _ hneSell]
+            · cases h
+
+/-- A2 Takeover Soundness Theorem (`Liquidate` mode = 1 Post-ADL Takeover):
+    Even during active partial ADL, transfers `rawClose` within the same side while keeping
+    `oiLong`, `oiShort`, `rawBasisLong`, `rawBasisShort`, `adlLong`, `adlShort` BIT-FOR-BIT INVARIANT,
+    preserving `stockExact`, `m'.wf`, victim `otherMm` containment, and cross-market isolation! -/
+theorem liquidateTakeoverPostAdl_sound
+    (st st' : DexState) (mid pid liqPid rawClose liqFeeCap loss otherMid otherPid : Nat)
+    (hstock : st.stockExact) (hwf : ∀ m, st.markets mid = some m → m.wf)
+    (h : stepLiquidateTakeoverPostAdl st mid pid liqPid rawClose liqFeeCap loss = some st')
+    (hneM : otherMid ≠ mid) (hneP : otherPid ≠ pid) (hneLiq : otherPid ≠ liqPid) :
+    st'.stockExact ∧
+    (∀ m m', st.markets mid = some m → st'.markets mid = some m' →
+      m'.wf ∧ m'.oiLong = m.oiLong ∧ m'.oiShort = m.oiShort ∧
+      m'.rawBasisLong = m.rawBasisLong ∧ m'.rawBasisShort = m.rawBasisShort ∧
+      m'.adlLong = m.adlLong ∧ m'.adlShort = m.adlShort) ∧
+    (∀ pfl pfl' leg, st.portfolios pid = some pfl → pfl.legs mid = some leg →
+      pfl.capital ≥ pfl.totalMm - leg.cachedMm → st'.portfolios pid = some pfl' →
+      pfl'.capital ≥ pfl.totalMm - leg.cachedMm) ∧
+    st'.markets otherMid = st.markets otherMid ∧
+    st'.portfolios otherPid = st.portfolios otherPid := by
+  unfold stepLiquidateTakeoverPostAdl at h
+  split at h
+  · cases h
+  · next hnePL =>
+    cases hm : st.markets mid with
+    | none => simp [hm] at h
+    | some m =>
+      cases hp : st.portfolios pid with
+      | none => simp [hm, hp] at h
+      | some pfl =>
+        cases hlp : st.portfolios liqPid with
+        | none => simp [hm, hp, hlp] at h
+        | some liqPfl =>
+          cases hl : pfl.legs mid with
+          | none => simp [hm, hp, hlp, hl] at h
+          | some leg =>
+            simp only [hm, hp, hlp, hl, Bind.bind, Option.bind] at h
+            split at h
+            · split at h
+              · cases h
+                have hmWf := hwf m hm
+                refine ⟨?_, ?_, ?_, updateFn_ne _ _ _ _ hneM, ?_⟩
+                · unfold DexState.stockExact at *; dsimp only; omega
+                · intro m0 m' hm0 hm'
+                  have heqM : m = m0 := Option.some.inj hm0
+                  subst heqM
+                  dsimp only at hm'; rw [updateFn_eq] at hm'; cases hm'
+                  rcases hmWf with ⟨hoi, hadl, henv⟩
+                  exact ⟨⟨hoi, hadl, henv⟩, rfl, rfl, rfl, rfl, rfl, rfl⟩
+                · intro pfl0 pfl' leg0 hp0 hl0 hother hp'
+                  have heqP : pfl = pfl0 := Option.some.inj hp0
+                  subst heqP
+                  have heqL : leg = leg0 := Option.some.inj (hl.symm.trans hl0)
+                  subst heqL
+                  simp [updateFn, hnePL] at hp'
+                  subst hp'
+                  unfold applyContainedLoss capAvailableForLeg; dsimp only; omega
+                · dsimp only
+                  rw [updateFn_ne _ _ _ _ hneLiq, updateFn_ne _ _ _ _ hneP]
+              · cases h
+            · cases h
 
 end Percolator.Proofs

@@ -4,9 +4,15 @@ set -euo pipefail
 echo "=== 1. Build Lean 4 formal model, verify all kernel proofs (0 sorry, 0 axioms) ==="
 lake build
 
-echo "=== 2. Compile unified Percolator.Program directly to Solana sBPF (.so) ==="
+echo "=== 2. Compile core Percolator + external Matcher & OracleAdapter to Solana sBPF (.so) ==="
 mkdir -p build
-lake exe lean-svm build Percolator.Program Percolator.Program.entrypoint -o build/percolator.so
+LEAN_PATH=../lean-svm/.lake/build/lib/lean:.lake/build/lib/lean \
+  ../lean-svm/.lake/build/bin/lean-svm build Percolator.Program Percolator.Program.entrypoint -o build/percolator.so
+LEAN_PATH=../lean-svm/.lake/build/lib/lean:.lake/build/lib/lean \
+  ../lean-svm/.lake/build/bin/lean-svm build Percolator.Matcher Percolator.Matcher.entrypoint -o build/matcher.so
+LEAN_PATH=../lean-svm/.lake/build/lib/lean:.lake/build/lib/lean \
+  ../lean-svm/.lake/build/bin/lean-svm build Percolator.OracleAdapter Percolator.OracleAdapter.entrypoint -o build/oracle_adapter.so
 
-echo "=== 3. Execute full lifecycle & adversarial security suite on LiteSVM (Agave 3.1.3) ==="
-cargo run --manifest-path svm-runner/Cargo.toml --release -- build/percolator.so
+echo "=== 3. Execute all 11 LiteSVM verification, 8-leg CU stress, CPI & fuzz suites (Agave 3.1.3) ==="
+cargo run --manifest-path svm-runner/Cargo.toml --release -- \
+  build/percolator.so build/matcher.so build/oracle_adapter.so

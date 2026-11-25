@@ -15,6 +15,8 @@ def posScaleNat   : Nat := 1_000_000
 def adlOneNat     : Nat := 1_000_000_000
 def bpsDenNat     : Nat := 10_000
 def minExitWinNat : Nat := 10
+def maxExitWinNat : Nat := 216_000
+def maxStaleNat   : Nat := 9_000
 def maxLegsNat    : Nat := 8
 
 /-! ### Core Exact Arithmetic Primitives -/
@@ -48,6 +50,16 @@ def proportionalRawReduction (qty rawLeg rawSide oiSide : Nat) : Nat :=
   else if oiSide = rawSide then min qty rawLeg
   else min rawLeg (max 1 (mulDivUp qty rawSide oiSide))
 
+/-- Proportional OI removal for liquidating `rawClose` rawBasis on a side with `(oiSide, rawSide)`.
+    Uses ceiling division so `oiSide - eff ≤ rawSide - rawClose` holds ALWAYS (even for 1-atom dust!). -/
+def proportionalOiForRaw (rawClose oiSide rawSide : Nat) : Nat :=
+  if oiSide = 0 ∨ rawSide = 0 then 0
+  else if oiSide = rawSide then min rawClose oiSide
+  else min oiSide (max 1 (mulDivUp rawClose oiSide rawSide))
+
+/-- Fair gradual liquidation fee: scales smoothly from `maxFee / 4` up to `maxFee` with margin deficit. -/
+def gradualLiqFee (maxFee deficit : Nat) : Nat :=
+  min maxFee (max (maxFee / 4) deficit)
 def marginNotional (qty price : Nat) : Nat :=
   mulDivUp qty price posScaleNat
 
@@ -153,7 +165,10 @@ def MarketState.solvencyEnvelope (m : MarketState) : Prop :=
   m.maxMoveBps + m.liqFeeBps ≤ m.mmBps ∧
   m.mmBps < m.imBps ∧
   m.imBps ≤ bpsDenNat ∧
-  m.exitWindow ≥ minExitWinNat
+  m.exitWindow ≥ minExitWinNat ∧
+  m.exitWindow ≤ maxExitWinNat ∧
+  m.maxStaleness ≥ 1 ∧
+  m.maxStaleness ≤ maxStaleNat
 
 def MarketState.wf (m : MarketState) : Prop :=
   m.oiBalanced ∧ m.adlValid ∧ m.solvencyEnvelope
@@ -199,7 +214,8 @@ def stepUpdateCreateFee (st : DexState) (signer newFee newAdmin : Nat) : Option 
 def stepCreateMarket (st : DexState)
     (admin initPrice exitWin maxStale imBps mmBps liqBps tradeBps maxMove maxIns maxOi curSlot : Nat) :
     Option DexState :=
-  if initPrice > 0 ∧ exitWin ≥ minExitWinNat ∧ maxStale ≥ 1 ∧
+  if initPrice > 0 ∧ exitWin ≥ minExitWinNat ∧ exitWin ≤ maxExitWinNat ∧
+     maxStale ≥ 1 ∧ maxStale ≤ maxStaleNat ∧
      mmBps > 0 ∧ mmBps < imBps ∧ imBps ≤ bpsDenNat ∧
      maxMove + liqBps ≤ mmBps ∧ maxOi > 0 then
     let mid := st.nextMarketId
@@ -567,6 +583,215 @@ def stepTombstone (st : DexState) (mid : Nat) : Option DexState := do
      m.rawBasisLong = 0 ∧ m.rawBasisShort = 0 ∧
      m.insurance = 0 ∧ m.activeLegs = 0 ∧ m.totalPosPnl = 0 then
     some { st with markets := updateFn st.markets mid (some { m with status := .tombstoned }) }
+  else none
+
+/-- Owner-only collateral withdrawal (delegates CANNOT withdraw!). -/
+def stepWithdrawCollateralAuth (st : DexState) (pid signer amount curSlot : Nat) : Option DexState := do
+  let pfl ← st.portfolios pid
+  if signer = pfl.owner then
+    stepWithdrawCollateral st pid amount curSlot
+  else none
+
+/-- Aggregate-sum coherence predicate over finite lists of active portfolio & market IDs. -/
+def getCap (ps : Nat → Option PortfolioState) (pid : Nat) : Nat :=
+  match ps pid with | some p => p.capital | none => 0
+
+def getIns (ms : Nat → Option MarketState) (mid : Nat) : Nat :=
+  match ms mid with | some m => m.insurance | none => 0
+
+def getRes (ms : Nat → Option MarketState) (mid : Nat) : Nat :=
+  match ms mid with | some m => m.realizedPool | none => 0
+
+def sumCaps (st : DexState) (pids : List Nat) : Nat := (pids.map (getCap st.portfolios)).sum
+def sumIns  (st : DexState) (mids : List Nat) : Nat := (mids.map (getIns st.markets)).sum
+def sumRes  (st : DexState) (mids : List Nat) : Nat := (mids.map (getRes st.markets)).sum
+
+def DexState.coherent (st : DexState) (mids pids : List Nat) : Prop :=
+  st.stockExact ∧
+  st.totalCapital = sumCaps st pids ∧
+  st.totalInsurance = sumIns st mids ∧
+  st.totalResidual = sumRes st mids
+
+/-- HLP / Counterparty Liquidation Takeover (ZERO ADL!): transfers `rawClose` from victim `pid`
+    to well-collateralized liquidator `liqPid ≠ pid`, preserving `oiLong == oiShort` and `stockExact`! -/
+def stepLiquidateTakeover (st : DexState) (mid pid liqPid rawClose liqFeeCap loss : Nat) : Option DexState := do
+  if pid = liqPid then none
+  let m ← st.markets mid
+  let pfl ← st.portfolios pid
+  let liqPfl ← st.portfolios liqPid
+  let leg ← pfl.legs mid
+  if m.status = .active ∧ leg.side ≠ .flat ∧ rawClose > 0 ∧ rawClose ≤ leg.rawBasis ∧
+     m.adlLong = adlOneNat ∧ m.adlShort = adlOneNat then
+    let (cap1, pnl1, pnlBurned, capDeb, shortfall) := applyContainedLoss pfl.capital pfl.totalMm leg loss
+    let availForFee := cap1 - (pfl.totalMm - leg.cachedMm)
+    let liqFee := min liqFeeCap availForFee
+    let cap2 := cap1 - liqFee
+    let maxInsDraw := (m.insurance * m.maxInsDrawBps) / bpsDenNat
+    let insDraw := min shortfall (min maxInsDraw m.insurance)
+    if st.totalCapital ≥ capDeb + liqFee ∧ st.vault ≥ liqFee ∧
+       st.totalInsurance ≥ insDraw ∧ m.totalPosPnl ≥ pnlBurned then
+      let m' := { m with
+        realizedPool := m.realizedPool + capDeb + insDraw
+        insurance    := m.insurance - insDraw
+        totalPosPnl  := m.totalPosPnl - pnlBurned }
+      let remRaw := leg.rawBasis - rawClose
+      let leg' := { leg with rawBasis := remRaw, side := if remRaw = 0 then .flat else leg.side, posPnl := pnl1 }
+      let pfl' := { pfl with capital := cap2, legs := updateFn pfl.legs mid (some leg') }
+      let ps1 := updateFn st.portfolios pid (some pfl')
+      let ps2 := updateFn ps1 liqPid (some liqPfl)
+      some { st with
+        vault          := st.vault - liqFee
+        totalCapital   := st.totalCapital - capDeb - liqFee
+        totalInsurance := st.totalInsurance - insDraw
+        totalResidual  := st.totalResidual + capDeb + insDraw
+        markets        := updateFn st.markets mid (some m')
+        portfolios     := ps2 }
+    else none
+  else none
+
+/-- Bounded `execPrice` spread check for `Trade(mode=1)` reduce: payer MUST keep `capital - spread ≥ newTotalMm`! -/
+def stepTradeReduceWithSpread (st : DexState) (mid pidL pidS qty spreadLToS spreadSToL newMmL newMmS : Nat) :
+    Option DexState := do
+  if pidL = pidS then none
+  let pL ← st.portfolios pidL
+  let pS ← st.portfolios pidS
+  if pL.capital + spreadSToL ≥ spreadLToS ∧
+     pS.capital + spreadLToS ≥ spreadSToL ∧
+     pL.capital + spreadSToL - spreadLToS ≥ newMmL ∧
+     pS.capital + spreadLToS - spreadSToL ≥ newMmS then
+    let st1 ← stepTradeReduce st mid pidL pidS qty
+    let pL1 ← st1.portfolios pidL
+    let pS1 ← st1.portfolios pidS
+    let ps1 := updateFn st1.portfolios pidL (some { pL1 with capital := pL.capital + spreadSToL - spreadLToS })
+    let ps2 := updateFn ps1 pidS (some { pS1 with capital := pS.capital + spreadLToS - spreadSToL })
+    some { st1 with portfolios := ps2 }
+  else none
+
+/-- Raw-basis minted when opening `qty` effective OI on a side with `(oiSide, rawSide)`.
+    On partially-ADL'd sides (`0 < oiSide < rawSide`), mints `max(qty, ⌈qty * rawSide / oiSide⌉)`. -/
+def postAdlRawAdd (qty oiSide rawSide : Nat) : Nat :=
+  if rawSide = 0 ∨ oiSide = rawSide then qty
+  else max qty (mulDivUp qty rawSide oiSide)
+
+/-- Post-ADL bilateral open (`Trade` mode = 0): allows opening even when `0 < oiSide < rawSide`
+    (rejecting only 100%-wiped-out sides `oiSide = 0 ∧ rawSide > 0`), minting `postAdlRawAdd`! -/
+def stepTradeOpenPostAdl (st : DexState) (mid pidL pidS qty spreadLToS spreadSToL : Nat) : Option DexState := do
+  if pidL = pidS then none
+  let m ← st.markets mid
+  let pL ← st.portfolios pidL
+  let pS ← st.portfolios pidS
+  let fee := marginReq (marginNotional qty m.markPrice) m.tradeFeeBps
+  if m.status = .active ∧ qty > 0 ∧
+     (m.rawBasisLong = 0 ∨ m.oiLong > 0) ∧
+     (m.rawBasisShort = 0 ∨ m.oiShort > 0) ∧
+     m.oiLong + qty ≤ m.maxOi ∧ m.oiShort + qty ≤ m.maxOi ∧
+     pL.capital + spreadSToL ≥ fee + spreadLToS ∧
+     pS.capital + spreadLToS ≥ fee + spreadSToL ∧
+     st.totalCapital ≥ 2 * fee then
+    let rAddL := postAdlRawAdd qty m.oiLong m.rawBasisLong
+    let rAddS := postAdlRawAdd qty m.oiShort m.rawBasisShort
+    let oiL' := m.oiLong + qty
+    let oiS' := m.oiShort + qty
+    let rL'  := m.rawBasisLong + rAddL
+    let rS'  := m.rawBasisShort + rAddS
+    let m' := { m with
+      insurance     := m.insurance + 2 * fee
+      oiLong        := oiL'
+      oiShort       := oiS'
+      rawBasisLong  := rL'
+      rawBasisShort := rS'
+      adlLong       := deriveAdl oiL' rL'
+      adlShort      := deriveAdl oiS' rS' }
+    let pL' := { pL with capital := pL.capital + spreadSToL - spreadLToS - fee }
+    let pS' := { pS with capital := pS.capital + spreadLToS - spreadSToL - fee }
+    let ps1 := updateFn st.portfolios pidL (some pL')
+    let ps2 := updateFn ps1 pidS (some pS')
+    some { st with
+      totalCapital   := st.totalCapital - 2 * fee
+      totalInsurance := st.totalInsurance + 2 * fee
+      markets        := updateFn st.markets mid (some m')
+      portfolios     := ps2 }
+  else none
+
+/-- Same-side position hand-off (`Trade` mode = 2 Long→Long / mode = 3 Short→Short):
+    transfers `rawXfer` within the same side between `pidSell ≠ pidBuy`, leaving
+    `oiLong`, `oiShort`, `rawBasisLong`, `rawBasisShort`, `adlLong`, `adlShort` BIT-FOR-BIT INVARIANT! -/
+def stepTradeHandoff (st : DexState) (mid pidSell pidBuy qty spreadBuyToSell spreadSellToBuy : Nat) :
+    Option DexState := do
+  if pidSell = pidBuy then none
+  let m ← st.markets mid
+  let pSell ← st.portfolios pidSell
+  let pBuy  ← st.portfolios pidBuy
+  let lSell ← pSell.legs mid
+  if (m.status = .active ∨ m.status = .windDown) ∧ qty > 0 ∧
+     lSell.side ≠ .flat ∧ lSell.rawBasis > 0 ∧
+     (lSell.side = .long → m.oiLong ≥ qty) ∧
+     (lSell.side = .short → m.oiShort ≥ qty) ∧
+     pBuy.capital + spreadSellToBuy ≥ spreadBuyToSell ∧
+     pSell.capital + spreadBuyToSell ≥ spreadSellToBuy then
+    let (oiSide, rMktSide) :=
+      if lSell.side = .long then (m.oiLong, m.rawBasisLong) else (m.oiShort, m.rawBasisShort)
+    let rawXfer := proportionalRawReduction qty lSell.rawBasis rMktSide oiSide
+    if rawXfer = 0 ∨ rawXfer > lSell.rawBasis then none
+    let remSell := lSell.rawBasis - rawXfer
+    let lSell' := { lSell with rawBasis := remSell, side := if remSell = 0 then .flat else lSell.side }
+    let pSell' := { pSell with
+      capital := pSell.capital + spreadBuyToSell - spreadSellToBuy
+      legs    := updateFn pSell.legs mid (some lSell') }
+    let pBuy' := { pBuy with
+      capital := pBuy.capital + spreadSellToBuy - spreadBuyToSell }
+    let ps1 := updateFn st.portfolios pidSell (some pSell')
+    let ps2 := updateFn ps1 pidBuy (some pBuy')
+    some { st with portfolios := ps2 }
+  else none
+
+/-- Post-ADL Liquidation Takeover (`Liquidate` mode = 1): transfers `rawClose` within the same side
+    even during active partial ADL (`oiSide > 0`), leaving `oi`/`rawBasis`/`adl` BIT-FOR-BIT INVARIANT! -/
+def stepLiquidateTakeoverPostAdl (st : DexState) (mid pid liqPid rawClose liqFeeCap loss : Nat) : Option DexState := do
+  if pid = liqPid then none
+  let m ← st.markets mid
+  let pfl ← st.portfolios pid
+  let liqPfl ← st.portfolios liqPid
+  let leg ← pfl.legs mid
+  if m.status = .active ∧ leg.side ≠ .flat ∧ rawClose > 0 ∧ rawClose ≤ leg.rawBasis ∧
+     (leg.side = .long → m.oiLong > 0) ∧ (leg.side = .short → m.oiShort > 0) then
+    let (cap1, pnl1, pnlBurned, capDeb, shortfall) := applyContainedLoss pfl.capital pfl.totalMm leg loss
+    let availForFee := cap1 - (pfl.totalMm - leg.cachedMm)
+    let liqFee := min liqFeeCap availForFee
+    let cap2 := cap1 - liqFee
+    let maxInsDraw := (m.insurance * m.maxInsDrawBps) / bpsDenNat
+    let insDraw := min shortfall (min maxInsDraw m.insurance)
+    if st.totalCapital ≥ capDeb + liqFee ∧ st.vault ≥ liqFee ∧
+       st.totalInsurance ≥ insDraw ∧ m.totalPosPnl ≥ pnlBurned then
+      let m' := { m with
+        realizedPool := m.realizedPool + capDeb + insDraw
+        insurance    := m.insurance - insDraw
+        totalPosPnl  := m.totalPosPnl - pnlBurned }
+      let remRaw := leg.rawBasis - rawClose
+      let leg' := { leg with rawBasis := remRaw, side := if remRaw = 0 then .flat else leg.side, posPnl := pnl1 }
+      let pfl' := { pfl with capital := cap2, legs := updateFn pfl.legs mid (some leg') }
+      let ps1 := updateFn st.portfolios pid (some pfl')
+      let ps2 := updateFn ps1 liqPid (some liqPfl)
+      some { st with
+        vault          := st.vault - liqFee
+        totalCapital   := st.totalCapital - capDeb - liqFee
+        totalInsurance := st.totalInsurance - insDraw
+        totalResidual  := st.totalResidual + capDeb + insDraw
+        markets        := updateFn st.markets mid (some m')
+        portfolios     := ps2 }
+    else none
+  else none
+
+/-- Same-slot freshness + solvency-checked liquidation gate (A1 Fix):
+    requires EVERY open leg of `pid` to be refreshed at `curSlot`, AND requires
+    `shortfall > 0 ∨ cap1 + pnl1 < pfl.totalMm`! -/
+def stepLiquidateChecked (st : DexState) (mid pid curSlot liqFeeCap loss : Nat) : Option DexState := do
+  let pfl ← st.portfolios pid
+  let leg ← pfl.legs mid
+  let (cap1, pnl1, _, _, shortfall) := applyContainedLoss pfl.capital pfl.totalMm leg loss
+  if (List.range st.nextMarketId).all (fun k => legFreshAt (pfl.legs k) curSlot) = true ∧
+     (shortfall > 0 ∨ cap1 + pnl1 < pfl.totalMm) then
+    stepLiquidate st mid pid liqFeeCap loss
   else none
 
 end Percolator.Spec
