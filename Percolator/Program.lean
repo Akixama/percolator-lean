@@ -95,7 +95,9 @@ def checkDexVaultAndMint (dexData : Ptr) (mint vaultPda tokProg : AccountView) :
   requireKeyEq (AccountView.keyPtr vaultPda) (dexData + DexOff.vaultPda)  PErr.vaultMismatch
 
 /-- Sweep any floor-division dust from `m.realizedPool` once `m.totalPosPnl == 0`:
-    credits `m.insurance` when LP shares exist, else `dex.totalSurplus`. -/
+    credits `m.insurance` when LP shares exist, else `dex.totalSurplus`.
+    On `STATUS_RESOLVED` markets with `totalInsShares == 0`, also sweeps orphan donated
+    `m.insurance` into `dex.totalSurplus` so donated-only markets can cleanly tombstone! -/
 def sweepResolvedDust (dData mData : Ptr) : SolanaM Unit := do
   if (← loadU64 mData MktOff.totalPosPnl) == 0 then
     let dust ← loadU64 mData MktOff.realizedPool
@@ -107,6 +109,13 @@ def sweepResolvedDust (dData mData : Ptr) : SolanaM Unit := do
         addU64At dData DexOff.totalInsurance dust
       else
         addU64At dData DexOff.totalSurplus dust
+    if (← loadU8 mData MktOff.status) == STATUS_RESOLVED &&
+       (← loadU64 mData MktOff.totalInsShares) == 0 then
+      let orphanIns ← loadU64 mData MktOff.insurance
+      if orphanIns > 0 then
+        storeU64 mData MktOff.insurance 0
+        subU64At dData DexOff.totalInsurance orphanIns
+        addU64At dData DexOff.totalSurplus orphanIns
 
 /-! ### Portfolio Multi-Leg Slot Helpers (Loop over `MAX_LEGS = 8`) -/
 
@@ -545,6 +554,7 @@ def handleUpdateOracle (input : Ptr) : SolanaM Unit := do
 
   storeU64 mData MktOff.markPrice newPrice
   storeU64 mData MktOff.lastOracleSlot curSlot
+  log64 EvtTag.oracle (← loadU64 mData MktOff.marketId) newPrice fundSign.toUInt64 fundE6
 
 def handleInitPortfolio (input : Ptr) : SolanaM Unit := do
   let (dex, pfl, owner, _, progId) ← parse3 input
@@ -581,6 +591,7 @@ def handleDepositCollateral (input : Ptr) : SolanaM Unit := do
   addU64At dData DexOff.vaultBalance amount
   addU64At dData DexOff.totalCapital amount
   addU64At fData PflOff.capital      amount
+  log64 EvtTag.deposit (← loadU64 fData PflOff.portfolioId) amount (← loadU64 fData PflOff.capital) 0
 
 def handleWithdrawCollateral (input : Ptr) : SolanaM Unit := do
   let (dex, pfl, owner, destTok, mint, vaultPda, tokProg, ix, progId) ← parse7 input
@@ -613,6 +624,7 @@ def handleWithdrawCollateral (input : Ptr) : SolanaM Unit := do
   let bump ← loadU8 dData DexOff.vaultBump
   tokenTransferCheckedSigned tokProg vaultPda mint destTok vaultPda amount dec
     TAG_DEX_VAULT (AccountView.keyPtr dex) bump
+  log64 EvtTag.withdraw (← loadU64 fData PflOff.portfolioId) amount remCap 0
 
 def handleDepositInsurance (input : Ptr) : SolanaM Unit := do
   let (dex, mkt, receipt, lp, lpTok, mint, vaultPda, tokProg, ix, progId) ← parse8 input
@@ -984,6 +996,7 @@ def handleTrade (input : Ptr) : SolanaM Unit := do
     freeLegIfEmpty fLData slotSell
   else
     SolanaM.fail PErr.invalidParams
+  log64 EvtTag.trade ((mid <<< 8) ||| mode.toUInt64) qty execPrice (← loadU64 mData MktOff.markPrice)
 
 /-- Fair, transparent $O(1)$ liquidation supporting:
     - Partial OR full liquidation (`reqQty = 0` → full leg; `reqQty > 0` → partial `min(reqQty, rawB)`),
@@ -1144,6 +1157,7 @@ def handleLiquidate (input : Ptr) : SolanaM Unit := do
     subU64At mData MktOff.activeLegs 1
   syncLegMargins mData fData slotIdx curSlot
   freeLegIfEmpty fData slotIdx
+  log64 EvtTag.liquidate ((mid <<< 8) ||| mode.toUInt64) rawClose liqFee shortfall
 
 def handleClearDeadLeg (input : Ptr) : SolanaM Unit := do
   let (dex, mkt, pfl, _, progId) ← parse3 input
@@ -1292,6 +1306,7 @@ def handleForceClosePair (input : Ptr) : SolanaM Unit := do
   syncLegMargins mData fSData slotS curSlot
   freeLegIfEmpty fLData slotL
   freeLegIfEmpty fSData slotS
+  log64 EvtTag.forceClose mid q oiL' curSlot
 
 def handleResolveMarket (input : Ptr) : SolanaM Unit := do
   let (dex, mkt, _, progId) ← parse2 input
@@ -1308,10 +1323,12 @@ def handleResolveMarket (input : Ptr) : SolanaM Unit := do
 
   let rPool  ← loadU64 mData MktOff.realizedPool
   let totPnl ← loadU64 mData MktOff.totalPosPnl
-  storeU64 mData MktOff.resolvedNum (if rPool < totPnl then rPool else totPnl)
+  let resNum := if rPool < totPnl then rPool else totPnl
+  storeU64 mData MktOff.resolvedNum resNum
   storeU64 mData MktOff.resolvedDen totPnl
   storeU8  mData MktOff.status STATUS_RESOLVED
   sweepResolvedDust dData mData
+  log64 EvtTag.resolve (← loadU64 mData MktOff.marketId) resNum totPnl 0
 
 def handleClaimResolved (input : Ptr) : SolanaM Unit := do
   let (dex, mkt, pfl, _, progId) ← parse3 input

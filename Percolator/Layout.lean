@@ -222,4 +222,24 @@ namespace IxOp
   def closeAccount       : UInt8 := 19
 end IxOp
 
+/-! ### Structured `sol_log_64_` Event Tags (0 heap, 0 `.rodata`, ~100 CU)
+    Format: `sol_log_64_(tag, arg1, arg2, arg3, arg4)`
+    - `1` (`oracle`)     : `(1, marketId, newPrice, fundSign, fundE6)`
+    - `2` (`trade`)      : `(2, (marketId << 8) | mode, qty, execPrice, markPrice)`
+    - `3` (`liquidate`)  : `(3, (marketId << 8) | mode, rawClose, liqFee, shortfall)`
+    - `4` (`deposit`)    : `(4, portfolioId, amount, newCapital, 0)`
+    - `5` (`withdraw`)   : `(5, portfolioId, amount, newCapital, 0)`
+    - `6` (`forceClose`) : `(6, marketId, closedQty, remainingOi, slot)`
+    - `7` (`resolve`)    : `(7, marketId, resolvedNum, resolvedDen, 0)` -/
+
+namespace EvtTag
+  def oracle     : UInt64 := 1
+  def trade      : UInt64 := 2
+  def liquidate  : UInt64 := 3
+  def deposit    : UInt64 := 4
+  def withdraw   : UInt64 := 5
+  def forceClose : UInt64 := 6
+  def resolve    : UInt64 := 7
+end EvtTag
+
 end Percolator

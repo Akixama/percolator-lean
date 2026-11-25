@@ -35,7 +35,7 @@ namespace OErr
 end OErr
 
 namespace AdpOff
-  def size              : UInt64 := 160
+  def size              : UInt64 := 192
   def magic             : UInt64 := 0   -- u32 ("OADP")
   def pdaBump           : UInt64 := 4   -- u8
   def admin             : UInt64 := 8   -- Pubkey (32)
@@ -45,6 +45,7 @@ namespace AdpOff
   def maxFeedAge        : UInt64 := 136 -- u64
   def maxConfBps        : UInt64 := 144 -- u64
   def fundingBpsPerStep : UInt64 := 152 -- u64
+  def feedOwner         : UInt64 := 160 -- Pubkey (32) — pinned owner of `feedAccount`
 end AdpOff
 
 namespace FeedOff
@@ -133,6 +134,7 @@ def handleInitAdapter (input : Ptr) : SolanaM Unit := do
   pubkeyCopy (aData + AdpOff.percProg)    (AccountView.keyPtr percProg)
   pubkeyCopy (aData + AdpOff.market)      (AccountView.keyPtr mkt)
   pubkeyCopy (aData + AdpOff.feedAccount) (AccountView.keyPtr feed)
+  pubkeyCopy (aData + AdpOff.feedOwner)   (AccountView.ownerPtr feed)
   storeU64 aData AdpOff.maxFeedAge        maxFeedAge
   storeU64 aData AdpOff.maxConfBps        maxConfBps
   storeU64 aData AdpOff.fundingBpsPerStep fundBpsStep
@@ -148,6 +150,7 @@ def handleCrank (input : Ptr) : SolanaM Unit := do
   SolanaM.require (← pubkeyEq (AccountView.keyPtr percProg) (aData + AdpOff.percProg))    OErr.progMismatch
   SolanaM.require (← pubkeyEq (AccountView.keyPtr mkt)      (aData + AdpOff.market))      PErr.marketMismatch
   SolanaM.require (← pubkeyEq (AccountView.keyPtr feed)     (aData + AdpOff.feedAccount)) OErr.feedMismatch
+  SolanaM.require (← pubkeyEq (AccountView.ownerPtr feed)   (aData + AdpOff.feedOwner))   Err.illegalOwner
 
   -- Validate `feed` account & read price/confidence/publishSlot
   SolanaM.require ((← AccountView.dataLen feed) >= FeedOff.size) Err.accountDataTooSmall

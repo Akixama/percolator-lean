@@ -112,6 +112,27 @@ fn send_ok(svm: &mut LiteSVM, ix: Instruction, payer: &Keypair, signers: &[&Keyp
     send_ixs_ok(svm, &[ix], payer, signers)
 }
 
+fn send_ok_assert_log(
+    svm: &mut LiteSVM,
+    ix: Instruction,
+    payer: &Keypair,
+    signers: &[&Keypair],
+    expected_prefix: &str,
+) -> u64 {
+    svm.expire_blockhash();
+    let bh = svm.latest_blockhash();
+    let msg = Message::new(&[ix], Some(&payer.pubkey()));
+    let tx = Transaction::new(signers, msg, bh);
+    let res = svm.send_transaction(tx).unwrap_or_else(|e| panic!("Expected OK, got {:?}", e));
+    assert!(
+        res.logs.iter().any(|l| l.contains(expected_prefix)),
+        "Expected structured log containing '{}' in logs: {:?}",
+        expected_prefix,
+        res.logs
+    );
+    res.compute_units_consumed
+}
+
 fn send_ixs_err(svm: &mut LiteSVM, ixs: &[Instruction], payer: &Keypair, signers: &[&Keypair], label: &str) {
     svm.expire_blockhash();
     let bh = svm.latest_blockhash();
@@ -1121,7 +1142,7 @@ fn main() {
         ap = (ap * 96) / 100;
         send_ok(&mut svm, ix_update_oracle(prog_id, adl_mkt, adl_oracle.pubkey(), ap, 0, 0), &payer, &[&payer, &adl_oracle]);
     }
-    send_ok(&mut svm, ix_liquidate(prog_id, dex, adl_mkt, t1_pfl, keeper_tok, mint, dex_vault, TOKEN_PROGRAM_ID), &payer, &[&payer]);
+    send_ok_assert_log(&mut svm, ix_liquidate(prog_id, dex, adl_mkt, t1_pfl, keeper_tok, mint, dex_vault, TOKEN_PROGRAM_ID), &payer, &[&payer], "Program log: 0x3,");
     assert_eq!(read_u64(&svm, &adl_mkt, 256), 0); // oiLong == 0
     assert_eq!(read_u64(&svm, &adl_mkt, 280), POS_SCALE); // rawBasisShort == 1.0 (dead leg!)
     // WithdrawInsurance MUST fail while dead leg rawBasis > 0!
@@ -1133,7 +1154,7 @@ fn main() {
 
     // Market recovered! Re-open a fresh pair (T1 adds collateral, opens Long 1 vs T2 Short 1),
     // then burn admin, go stale -> permissionless WindDown -> ForceClosePair -> Resolve -> WithdrawIns -> Tombstone!
-    send_ok(&mut svm, ix_deposit_collateral(prog_id, dex, t1_pfl, t1.pubkey(), t1_tok, mint, dex_vault, TOKEN_PROGRAM_ID, 50 * POS_SCALE), &payer, &[&payer, &t1]);
+    send_ok_assert_log(&mut svm, ix_deposit_collateral(prog_id, dex, t1_pfl, t1.pubkey(), t1_tok, mint, dex_vault, TOKEN_PROGRAM_ID, 50 * POS_SCALE), &payer, &[&payer, &t1], "Program log: 0x4,");
     send_ok(&mut svm, ix_trade(prog_id, dex, adl_mkt, t1_pfl, t1.pubkey(), t2_pfl, t2.pubkey(), 0, POS_SCALE), &payer, &[&payer, &t1, &t2]);
     send_ok(&mut svm, ix_burn_market_admin(prog_id, adl_mkt, lp.pubkey()), &payer, &[&payer, &lp]);
     send_err(&mut svm, ix_start_wind_down(prog_id, adl_mkt, keeper.pubkey()), &payer, &[&payer, &keeper], "StartWindDown while oracle fresh");
@@ -1144,8 +1165,8 @@ fn main() {
     send_err(&mut svm, ix_force_close_pair(prog_id, dex, adl_mkt, t1_pfl, t2_pfl), &payer, &[&payer], "ForceClosePair during exitWindow");
     // Advance past exitWindow (10) -> permissionless ForceClosePair!
     set_slot(&mut svm, 160);
-    send_ok(&mut svm, ix_force_close_pair(prog_id, dex, adl_mkt, t1_pfl, t2_pfl), &payer, &[&payer]);
-    send_ok(&mut svm, ix_resolve_market(prog_id, dex, adl_mkt), &payer, &[&payer]);
+    send_ok_assert_log(&mut svm, ix_force_close_pair(prog_id, dex, adl_mkt, t1_pfl, t2_pfl), &payer, &[&payer], "Program log: 0x6,");
+    send_ok_assert_log(&mut svm, ix_resolve_market(prog_id, dex, adl_mkt), &payer, &[&payer], "Program log: 0x7,");
     // If T2 still has any unclaimed posPnl leg on adl_mkt, claim it!
     let _ = send_ixs_try(&mut svm, &[ix_claim_resolved(prog_id, dex, adl_mkt, t2_pfl)], &payer, &[&payer]);
     send_ok(&mut svm, ix_withdraw_insurance(prog_id, dex, adl_mkt, adl_ins, lp.pubkey(), lp_tok, mint, dex_vault, TOKEN_PROGRAM_ID, 200 * POS_SCALE), &payer, &[&payer, &lp]);
@@ -1159,7 +1180,7 @@ fn main() {
     // 6b. Empty t1_pfl (withdraw remaining capital) and close it + reclaim rent!
     let t1_rem = read_u64(&svm, &t1_pfl, 88);
     if t1_rem > 0 {
-        send_ok(&mut svm, ix_withdraw_collateral(prog_id, dex, t1_pfl, t1.pubkey(), t1_tok, mint, dex_vault, TOKEN_PROGRAM_ID, t1_rem), &payer, &[&payer, &t1]);
+        send_ok_assert_log(&mut svm, ix_withdraw_collateral(prog_id, dex, t1_pfl, t1.pubkey(), t1_tok, mint, dex_vault, TOKEN_PROGRAM_ID, t1_rem), &payer, &[&payer, &t1], "Program log: 0x5,");
     }
     let keeper_lam_0 = svm.get_account(&keeper.pubkey()).unwrap().lamports;
     let cu_close = send_ok(&mut svm, ix_close_account(prog_id, t1_pfl, t1.pubkey(), keeper.pubkey()), &payer, &[&payer, &t1]);
@@ -1225,14 +1246,26 @@ fn main() {
     let dust_cap_0 = read_u64(&svm, &dust_pfl, 88);
     let t2_cap_0 = read_u64(&svm, &t2_pfl, 88);
     // In-band execPrice ($102 vs $101 mark, qty=1.0 -> Long pays $1.00 spread directly to Short!)
-    send_ok(&mut svm, ix_trade_ext(prog_id, dex, comp_mkt, dust_pfl, dust_kp.pubkey(), t2_pfl, t2.pubkey(), 0, POS_SCALE, 102 * POS_SCALE), &payer, &[&payer, &dust_kp, &t2]);
+    send_ok_assert_log(&mut svm, ix_trade_ext(prog_id, dex, comp_mkt, dust_pfl, dust_kp.pubkey(), t2_pfl, t2.pubkey(), 0, POS_SCALE, 102 * POS_SCALE), &payer, &[&payer, &dust_kp, &t2], "Program log: 0x2,");
     assert_eq!(read_u64(&svm, &dust_pfl, 88), dust_cap_0 - POS_SCALE, "Long must pay exact $1 spread to Short");
     assert_eq!(read_u64(&svm, &t2_pfl, 88), t2_cap_0 + POS_SCALE, "Short (LP/matcher) must receive exact $1 spread");
+
+    // 7e. Donated-only market clean lifecycle: close OI -> stale WindDown -> ResolveMarket sweeps orphan $25
+    //     donated insurance (totalInsShares == 0) into dex.totalSurplus -> TombstoneMarket succeeds!
+    send_ok_assert_log(&mut svm, ix_trade(prog_id, dex, comp_mkt, dust_pfl, dust_kp.pubkey(), t2_pfl, t2.pubkey(), 1, POS_SCALE), &payer, &[&payer, &dust_kp, &t2], "Program log: 0x2,");
+    let surp_before_donate_sweep = read_u64(&svm, &dex, 192);
+    set_slot(&mut svm, 215); // > comp_mkt lastOracleSlot(161) + maxStaleness(50)
+    send_ok(&mut svm, ix_start_wind_down(prog_id, comp_mkt, keeper.pubkey()), &payer, &[&payer, &keeper]);
+    send_ok_assert_log(&mut svm, ix_resolve_market(prog_id, dex, comp_mkt), &payer, &[&payer], "Program log: 0x7,");
+    assert_eq!(read_u64(&svm, &comp_mkt, 224), 0, "Orphan donated insurance must sweep to 0 on Resolve!");
+    assert_eq!(read_u64(&svm, &dex, 192), surp_before_donate_sweep + 25 * POS_SCALE, "Orphan donated insurance must credit dex.totalSurplus!");
+    send_ok(&mut svm, ix_tombstone_market(prog_id, comp_mkt), &payer, &[&payer]);
+    assert_eq!(read_u8(&svm, &comp_mkt, 4), 3, "Donated-only market must reach STATUS_TOMBSTONED!");
 
     let all_mkts3 = vec![btc_mkt, eth_mkt, scam_mkt, comp_mkt];
     let all_pfls3 = vec![alice_pfl, bob_pfl, attacker_pfl, t2_pfl, dust_pfl];
     assert_dex_invariants(&svm, &dex, &dex_vault, &all_mkts3, &all_pfls3, "post-suite7-composability");
-    println!("[PASS] Suite 7: External Matcher execPrice Spread + Authority Rotation + minMm Floor + Insurance Donation!");
+    println!("[PASS] Suite 7: External Matcher execPrice Spread + Authority Rotation + minMm Floor + Donated-Insurance Tombstone + Event Logs!");
 
     // =========================================================================
     // SUITE 8: 1,000-STEP RANDOMIZED STATEFUL FUZZER!
@@ -1425,7 +1458,7 @@ fn main() {
 
     // 9A: OracleAdapter CPI composition
     let comp_mkt2 = create_prog_acc(&mut svm, &prog_id, MKT_SIZE);
-    let adp_acc = create_prog_acc(&mut svm, &adapter_prog, 160);
+    let adp_acc = create_prog_acc(&mut svm, &adapter_prog, 192);
     let (orac_pda, orac_bump) = Address::find_program_address(&[b"orac", adp_acc.as_ref()], &adapter_prog);
     // External on-chain price feed account (32B: magic="FEED", price, conf, publishSlot)
     let feed_acc = Keypair::new().pubkey();
@@ -1483,11 +1516,23 @@ fn main() {
         ],
         data: vec![1],
     };
-    // Reject stale feed & wide confidence
+    // Reject stale feed, wide confidence, AND spoofed feed account owner!
     set_slot(&mut svm, s0 + 20);
     send_err(&mut svm, ix_crank(), &payer, &[&payer], "OracleAdapter rejects stale feed");
     write_feed(&mut svm, 115 * POS_SCALE, 5 * POS_SCALE, s0 + 20); // conf $5 > 1%
     send_err(&mut svm, ix_crank(), &payer, &[&payer], "OracleAdapter rejects wide confidence");
+    {
+        let mut spoofed = svm.get_account(&feed_acc).unwrap();
+        spoofed.owner = Keypair::new().pubkey();
+        let mut d = vec![0u8; 32];
+        d[0..4].copy_from_slice(&0x44454546u32.to_le_bytes());
+        d[8..16].copy_from_slice(&(115 * POS_SCALE).to_le_bytes());
+        d[16..24].copy_from_slice(&50_000u64.to_le_bytes());
+        d[24..32].copy_from_slice(&(s0 + 20).to_le_bytes());
+        spoofed.data = d;
+        svm.set_account(feed_acc, spoofed).unwrap();
+        send_err(&mut svm, ix_crank(), &payer, &[&payer], "OracleAdapter rejects spoofed feed owner");
+    }
 
     // Permissionless 4-slot smooth auto-clamped convergence ($100 -> $104 -> $108.16 -> $112.4864 -> $115.00)!
     let mut cu_crank = 0u64;
@@ -1495,7 +1540,7 @@ fn main() {
         let sl = s0 + 20 + step;
         set_slot(&mut svm, sl);
         write_feed(&mut svm, 115 * POS_SCALE, 50_000, sl);
-        cu_crank = send_ok(&mut svm, ix_crank(), &payer, &[&payer]);
+        cu_crank = send_ok_assert_log(&mut svm, ix_crank(), &payer, &[&payer], "Program log: 0x1,");
     }
     assert_eq!(read_u64(&svm, &comp_mkt2, 112), 115 * POS_SCALE, "OracleAdapter converged smoothly to $115!");
 
@@ -1748,7 +1793,7 @@ fn main() {
             &[&payer, &lp],
         );
         // Also wire an OracleAdapter CPI feed on a second set of adapters? We can rotate oracleAuth later for crank test!
-        let adp = create_prog_acc(&mut svm, &adapter_prog, 160);
+        let adp = create_prog_acc(&mut svm, &adapter_prog, 192);
         let (opda, obump) = Address::find_program_address(&[b"orac", adp.as_ref()], &adapter_prog);
         let feed = Keypair::new().pubkey();
         let mut fd = vec![0u8; 32];
