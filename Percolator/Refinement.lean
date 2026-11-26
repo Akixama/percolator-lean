@@ -2174,4 +2174,334 @@ theorem settleAndRefreshLeg_preserves_stock_and_containment
   · rw [ite_eq_right_of_eq_false _ _ (eq_false hact)] at h
     exact hPhase2 (s.readU64 (lp + LegOff.posPnl)) 0 s (by omega) (UInt64.le_refl _) hStock rfl rfl rfl hFirewall h
 
+/-! ### 4. Account Zero-Initialization & Same-Tx Revival Immunity (`SvmState.mem` Refinements #13–#17) -/
+
+private theorem mem_writeU64_zero_inside (s : SvmState) (a x : UInt64)
+    (_ha : a.toNat + 8 < 2 ^ 64)
+    (hx1 : a.toNat ≤ x.toNat) (hx2 : x.toNat < a.toNat + 8) :
+    (s.writeU64 a 0).mem x = 0 := by
+  let k := x - a
+  have hkLt : k < 8 := by
+    apply UInt64.lt_iff_toNat_lt.mpr
+    have h8 : (8 : UInt64).toNat = 8 := rfl
+    show (x - a).toNat < (8 : UInt64).toNat
+    rw [u64_sub_toNat_of_le x a hx1, h8]; omega
+  have hxk : x = a + k := by show x = a + (x - a); bv_decide
+  rw [hxk]
+  unfold SvmState.writeU64 SvmState.writeU32 SvmState.writeU16 SvmState.writeU8
+  simp only
+  have e7 : (a + k == a + 4 + 2 + 1) = (k == 7) := by bv_decide
+  have e6 : (a + k == a + 4 + 2)     = (k == 6) := by bv_decide
+  have e5 : (a + k == a + 4 + 1)     = (k == 5) := by bv_decide
+  have e4 : (a + k == a + 4)         = (k == 4) := by bv_decide
+  have e3 : (a + k == a + 2 + 1)     = (k == 3) := by bv_decide
+  have e2 : (a + k == a + 2)         = (k == 2) := by bv_decide
+  have e1 : (a + k == a + 1)         = (k == 1) := by bv_decide
+  have e0 : (a + k == a)             = (k == 0) := by bv_decide
+  simp only [e7, e6, e5, e4, e3, e2, e1, e0]
+  have hk8 : k = 0 ∨ k = 1 ∨ k = 2 ∨ k = 3 ∨ k = 4 ∨ k = 5 ∨ k = 6 ∨ k = 7 := by bv_decide
+  rcases hk8 with hk | hk | hk | hk | hk | hk | hk | hk <;> (rw [hk]; rfl)
+
+private theorem readU32_writeU32_same (s : SvmState) (a : UInt64) (v : UInt32) :
+    (s.writeU32 a v).readU32 a = v := by
+  unfold SvmState.readU32 SvmState.writeU32 SvmState.writeU16 SvmState.writeU8
+  simp only
+  have c33 : (a + 3 == a + 2 + 1) = true  := by rw [beq_iff_eq]; bv_decide
+  have c23 : (a + 2 == a + 2 + 1) = false := by rw [beq_eq_false_iff_ne]; bv_decide
+  have c13 : (a + 1 == a + 2 + 1) = false := by rw [beq_eq_false_iff_ne]; bv_decide
+  have c12 : (a + 1 == a + 2) = false     := by rw [beq_eq_false_iff_ne]; bv_decide
+  have c03 : (a == a + 2 + 1) = false     := by rw [beq_eq_false_iff_ne]; bv_decide
+  have c02 : (a == a + 2) = false         := by rw [beq_eq_false_iff_ne]; bv_decide
+  have c01 : (a == a + 1) = false         := by rw [beq_eq_false_iff_ne]; bv_decide
+  simp only [c33, c23, c13, c12, c03, c02, c01, beq_self_eq_true, ↓reduceIte]
+  bv_decide
+
+private theorem mem_writeU32_outside (s : SvmState) (a x : UInt64) (v : UInt32)
+    (ha : a.toNat + 4 < 2 ^ 64)
+    (hd : x.toNat < a.toNat ∨ a.toNat + 4 ≤ x.toNat) :
+    (s.writeU32 a v).mem x = s.mem x := by
+  have hmax : (0xFFFFFFFFFFFFFFFB : UInt64).toNat = 2 ^ 64 - 5 := by decide
+  have ha' : a ≤ 0xFFFFFFFFFFFFFFFB := UInt64.le_iff_toNat_le.mpr (by omega)
+  have h4 : (4 : UInt64).toNat = 4 := rfl
+  have hout : x < a ∨ a + 4 ≤ x := by
+    rcases hd with h1 | h2
+    · exact Or.inl (UInt64.lt_iff_toNat_lt.mpr h1)
+    · exact Or.inr (UInt64.le_iff_toNat_le.mpr (by rw [u64_add_toNat_of_lt a 4 (by omega), h4]; omega))
+  unfold SvmState.writeU32 SvmState.writeU16 SvmState.writeU8
+  simp only
+  have c3 : (x == a + 2 + 1) = false := by rw [beq_eq_false_iff_ne]; bv_decide
+  have c2 : (x == a + 2) = false     := by rw [beq_eq_false_iff_ne]; bv_decide
+  have c1 : (x == a + 1) = false     := by rw [beq_eq_false_iff_ne]; bv_decide
+  have c0 : (x == a) = false         := by rw [beq_eq_false_iff_ne]; bv_decide
+  simp only [c3, c2, c1, c0, Bool.false_eq_true, ↓reduceIte]
+
+private theorem mem_writeU8_outside (s : SvmState) (a x : UInt64) (v : UInt8) (hne : x ≠ a) :
+    (s.writeU8 a v).mem x = s.mem x := by
+  unfold SvmState.writeU8; simp only [beq_eq_false_iff_ne.mpr hne, Bool.false_eq_true, ↓reduceIte]
+
+private theorem readU64_of_mem_zero (s : SvmState) (a : UInt64)
+    (ha : a.toNat + 8 < 2 ^ 64)
+    (hz : ∀ x : UInt64, a.toNat ≤ x.toNat → x.toNat < a.toNat + 8 → s.mem x = 0) :
+    s.readU64 a = 0 := by
+  have hb : ∀ k : UInt64, k.toNat < 8 → s.mem (a + k) = 0 := fun k hk =>
+    hz (a + k) (by rw [u64_add_toNat_of_lt a k (by omega)]; omega)
+      (by rw [u64_add_toNat_of_lt a k (by omega)]; omega)
+  unfold SvmState.readU64 SvmState.readU32
+  have p41 : a + 4 + 1 = a + 5 := by bv_decide
+  have p42 : a + 4 + 2 = a + 6 := by bv_decide
+  have p43 : a + 4 + 3 = a + 7 := by bv_decide
+  have p0  : a + 0 = a := by bv_decide
+  have e0 := hb 0 (by decide); rw [p0] at e0
+  have e1 := hb 1 (by decide)
+  have e2 := hb 2 (by decide)
+  have e3 := hb 3 (by decide)
+  have e4 := hb 4 (by decide)
+  have e5 := hb 5 (by decide)
+  have e6 := hb 6 (by decide)
+  have e7 := hb 7 (by decide)
+  simp only [p41, p42, p43, e0, e1, e2, e3, e4, e5, e6, e7]; rfl
+
+private theorem pubkeyCopy_preserves_outside (dst src : Ptr) (s s' : SvmState)
+    (hdV : dst.toNat + 32 < 2 ^ 64)
+    (h : LeanSVM.pubkeyCopy dst src s = .ok () s') :
+    s'.stackSp = s.stackSp ∧
+    (∀ x : UInt64, x.toNat < dst.toNat ∨ dst.toNat + 32 ≤ x.toNat → s'.mem x = s.mem x) := by
+  unfold LeanSVM.pubkeyCopy rawLoadU64 rawStoreU64 at h
+  simp only [Bind.bind, SolanaM.bind] at h
+  generalize hs1 : s.writeU64 dst (s.readU64 src) = s1 at h
+  generalize hs2 : s1.writeU64 (dst + 8) (s1.readU64 (src + 8)) = s2 at h
+  generalize hs3 : s2.writeU64 (dst + 16) (s2.readU64 (src + 16)) = s3 at h
+  cases h
+  have hsp1 : s1.stackSp = s.stackSp := by rw [← hs1]; rfl
+  have hsp2 : s2.stackSp = s1.stackSp := by rw [← hs2]; rfl
+  have hsp3 : s3.stackSp = s2.stackSp := by rw [← hs3]; rfl
+  have h8  : (dst + 8).toNat  = dst.toNat + 8  := by have : (8 : UInt64).toNat = 8 := rfl; rw [u64_add_toNat_of_lt _ _ (by omega), this]
+  have h16 : (dst + 16).toNat = dst.toNat + 16 := by have : (16 : UInt64).toNat = 16 := rfl; rw [u64_add_toNat_of_lt _ _ (by omega), this]
+  have h24 : (dst + 24).toNat = dst.toNat + 24 := by have : (24 : UInt64).toNat = 24 := rfl; rw [u64_add_toNat_of_lt _ _ (by omega), this]
+  refine ⟨by change s3.stackSp = s.stackSp; rw [hsp3, hsp2, hsp1], fun x hx => ?_⟩
+  have e4 := readU8_writeU64_of_disjNat s3 (dst + 24) x (s3.readU64 (src + 24)) (by omega) (by omega)
+  have e3 : s3.mem x = s2.mem x := by rw [← hs3]; exact readU8_writeU64_of_disjNat s2 (dst + 16) x (s2.readU64 (src + 16)) (by omega) (by omega)
+  have e2 : s2.mem x = s1.mem x := by rw [← hs2]; exact readU8_writeU64_of_disjNat s1 (dst + 8) x (s1.readU64 (src + 8)) (by omega) (by omega)
+  have e1 : s1.mem x = s.mem x  := by rw [← hs1]; exact readU8_writeU64_of_disjNat s dst x (s.readU64 src) (by omega) (by omega)
+  exact e4.trans (e3.trans (e2.trans e1))
+
+/-- **Refinement #13 (`zeroWordsLoop` Exact Zeroing + Byte-Level Frame)**:
+    Starting from ANY arbitrary dirty `SvmState.mem`, `Program.zeroWordsLoop base off nWords`
+    zeroes **every single byte** in `[base + off, base + off + nWords * 8)`, leaves every byte
+    outside untouched, and preserves `stackSp`. -/
+theorem zeroWordsLoop_exact (base off nWords : UInt64) (s s' : SvmState)
+    (hvalid : base.toNat + off.toNat + nWords.toNat * 8 < 2 ^ 64)
+    (h : zeroWordsLoop base off nWords s = .ok () s') :
+    s'.stackSp = s.stackSp ∧
+    (∀ x : UInt64, base.toNat + off.toNat ≤ x.toNat →
+      x.toNat < base.toNat + off.toNat + nWords.toNat * 8 → s'.mem x = 0) ∧
+    (∀ x : UInt64, x.toNat < base.toNat + off.toNat ∨
+      base.toNat + off.toNat + nWords.toNat * 8 ≤ x.toNat → s'.mem x = s.mem x) := by
+  have hgen : ∀ (n : Nat) (off nWords : UInt64) (s s' : SvmState),
+      nWords.toNat = n →
+      base.toNat + off.toNat + nWords.toNat * 8 < 2 ^ 64 →
+      zeroWordsLoop base off nWords s = .ok () s' →
+      s'.stackSp = s.stackSp ∧
+      (∀ x : UInt64, base.toNat + off.toNat ≤ x.toNat →
+        x.toNat < base.toNat + off.toNat + nWords.toNat * 8 → s'.mem x = 0) ∧
+      (∀ x : UInt64, x.toNat < base.toNat + off.toNat ∨
+        base.toNat + off.toNat + nWords.toNat * 8 ≤ x.toNat → s'.mem x = s.mem x) := by
+    intro n
+    induction n with
+    | zero =>
+      intro off nWords s s' hn _ hrun
+      have hz : nWords = 0 := UInt64.toNat_inj.mp (by rw [hn]; rfl)
+      subst hz
+      rw [zeroWordsLoop.eq_def] at hrun
+      simp only [beq_self_eq_true, ↓reduceDIte, Pure.pure, SolanaM.pure] at hrun
+      cases hrun
+      exact ⟨rfl, fun _ h1 h2 => by omega, fun _ _ => rfl⟩
+    | succ k ih =>
+      intro off nWords s s' hn hv hrun
+      have hne : (nWords == 0) = false := by
+        rw [beq_eq_false_iff_ne]; intro heq; rw [heq] at hn; exact Nat.noConfusion hn
+      rw [zeroWordsLoop.eq_def] at hrun
+      simp only [hne, Bool.false_eq_true, ↓reduceDIte, storeU64, rawStoreU64, Bind.bind, SolanaM.bind] at hrun
+      have h1nat : (1 : UInt64).toNat = 1 := rfl
+      have h8nat : (8 : UInt64).toNat = 8 := rfl
+      have hsub : (nWords - 1).toNat = k := by
+        rw [u64_sub_toNat_of_le nWords 1 (by omega), h1nat, hn]; omega
+      have hoff8 : (off + 8).toNat = off.toNat + 8 := by
+        rw [u64_add_toNat_of_lt off 8 (by omega), h8nat]
+      have hbo : (base + off).toNat = base.toNat + off.toNat :=
+        u64_add_toNat_of_lt base off (by omega)
+      have ⟨hsp, hzero, hout⟩ := ih (off + 8) (nWords - 1) (s.writeU64 (base + off) 0) s'
+        hsub (by rw [hoff8, hsub]; omega) hrun
+      refine ⟨hsp, ?_, ?_⟩
+      · intro x hx1 hx2
+        by_cases hlt : x.toNat < base.toNat + off.toNat + 8
+        · have h1 := hout x (Or.inl (by rw [hoff8]; omega))
+          rw [h1]
+          exact mem_writeU64_zero_inside s (base + off) x (by rw [hbo]; omega) (by rw [hbo]; omega) (by rw [hbo]; omega)
+        · exact hzero x (by rw [hoff8]; omega) (by rw [hoff8, hsub]; omega)
+      · intro x hx
+        have h1 := hout x (by rw [hoff8, hsub]; omega)
+        rw [h1]
+        exact readU8_writeU64_of_disjNat s (base + off) x 0 (by rw [hbo]; omega) (by rw [hbo]; omega)
+  exact hgen nWords.toNat off nWords s s' rfl hvalid h
+
+private theorem bind_ok_elim {α β : Type} {m : SolanaM α} {f : α → SolanaM β}
+    {s s' : SvmState} {b : β}
+    (h : (m >>= f) s = .ok b s') :
+    ∃ a s0, m s = .ok a s0 ∧ f a s0 = .ok b s' := by
+  cases hm : m s with
+  | err c st => simp [Bind.bind, SolanaM.bind, hm] at h
+  | ok a s0 => exact ⟨a, s0, rfl, by simpa [Bind.bind, SolanaM.bind, hm] using h⟩
+
+/-- **Refinement #14 (`InsReceipt` Fresh Initialization Immune to Dirty / Cross-Type Residual Memory)**:
+    Even if `rData` was previously a `Portfolio` whose `owner` pubkey filled bytes `80..87` with
+    `8,536,876,367,605,870,429`, the exact fresh-init sequence in `Program.handleDepositInsurance`
+    (`zeroWordsLoop rData 0 11` + header stores + `addU64At rData InsOff.shares minted`) ALWAYS
+    yields **`s'.readU64 (rData + InsOff.shares) = minted`** EXACTLY! -/
+theorem initInsuranceReceipt_zero_inits_dirty_mem
+    (rData lpKey mktKey : Ptr) (mid minted : UInt64) (s s' : SvmState)
+    (hrV : regionValid rData InsOff.size)
+    (h : (do
+        zeroWordsLoop rData 0 (InsOff.size >>> 3)
+        storeU32 rData InsOff.magic MAGIC_INSURANCE
+        storeU64 rData InsOff.marketId mid
+        LeanSVM.pubkeyCopy (rData + InsOff.owner) lpKey
+        LeanSVM.pubkeyCopy (rData + InsOff.market) mktKey
+        addU64At rData InsOff.shares minted) s = .ok () s') :
+    s'.readU64 (rData + InsOff.shares) = minted := by
+  have hr88 : rData.toNat + 88 < 2 ^ 64 := hrV
+  obtain ⟨_, s0, hz, h⟩ := bind_ok_elim h
+  have hn11 : (InsOff.size >>> 3).toNat = 11 := by decide
+  have ⟨_, hzero0, _⟩ := zeroWordsLoop_exact rData 0 (InsOff.size >>> 3) s s0
+    (by have h0 : (0 : UInt64).toNat = 0 := rfl; omega) hz
+  obtain ⟨_, s1, hs1, h⟩ := bind_ok_elim h
+  obtain ⟨_, s2, hs2, h⟩ := bind_ok_elim h
+  obtain ⟨_, s3, hp1, h⟩ := bind_ok_elim h
+  obtain ⟨_, s4, hp2, h⟩ := bind_ok_elim h
+  dsimp only [storeU32, storeU64, rawStoreU32, rawStoreU64] at hs1 hs2
+  have heq1 : s1 = s0.writeU32 (rData + InsOff.magic) MAGIC_INSURANCE := by cases hs1; rfl
+  have heq2 : s2 = s1.writeU64 (rData + InsOff.marketId) mid          := by cases hs2; rfl
+  have hM0  : (rData + InsOff.magic).toNat    = rData.toNat      := by have : InsOff.magic.toNat = 0 := rfl; rw [u64_add_toNat_of_lt _ _ (by omega), this]; omega
+  have hM8  : (rData + InsOff.marketId).toNat = rData.toNat + 8  := by have : InsOff.marketId.toNat = 8 := rfl; rw [u64_add_toNat_of_lt _ _ (by omega), this]
+  have hM16 : (rData + InsOff.owner).toNat    = rData.toNat + 16 := by have : InsOff.owner.toNat = 16 := rfl; rw [u64_add_toNat_of_lt _ _ (by omega), this]
+  have hM48 : (rData + InsOff.market).toNat   = rData.toNat + 48 := by have : InsOff.market.toNat = 48 := rfl; rw [u64_add_toNat_of_lt _ _ (by omega), this]
+  have hM80 : (rData + InsOff.shares).toNat   = rData.toNat + 80 := by have : InsOff.shares.toNat = 80 := rfl; rw [u64_add_toNat_of_lt _ _ (by omega), this]
+  have ⟨_, hpc1⟩ := pubkeyCopy_preserves_outside (rData + InsOff.owner) lpKey s2 s3 (by omega) hp1
+  have ⟨_, hpc2⟩ := pubkeyCopy_preserves_outside (rData + InsOff.market) mktKey s3 s4 (by omega) hp2
+  have hsh0 : s4.readU64 (rData + InsOff.shares) = 0 := by
+    apply readU64_of_mem_zero s4 (rData + InsOff.shares) (by omega)
+    intro x hx1 hx2
+    rw [hpc2 x (Or.inr (by omega)), hpc1 x (Or.inr (by omega))]
+    have h21 : s2.mem x = s1.mem x := by rw [heq2]; exact readU8_writeU64_of_disjNat s1 (rData + InsOff.marketId) x mid (by omega) (Or.inr (by omega))
+    have h10 : s1.mem x = s0.mem x := by rw [heq1]; exact mem_writeU32_outside s0 (rData + InsOff.magic) x MAGIC_INSURANCE (by omega) (Or.inr (by omega))
+    rw [h21, h10]
+    exact hzero0 x (by have h0 : (0 : UInt64).toNat = 0 := rfl; omega)
+      (by have h0 : (0 : UInt64).toNat = 0 := rfl; omega)
+  have ⟨_, hs'⟩ := addU64At_ok_spec rData InsOff.shares minted s4 s' h
+  rw [hs', SvmState.readU64_writeU64_same, hsh0]
+  bv_decide
+
+/-- **Refinement #15 (`Portfolio` Initialization Immune to Dirty / Cross-Type Residual Memory)**:
+    Starting from ANY arbitrary dirty `SvmState.mem` (e.g. a reused 952-byte `Market` whose
+    `marketAdmin` pubkey overlapped `PflOff.capital` at bytes `88..95`), the exact init sequence
+    of `Program.handleInitPortfolio` guarantees `capital = 0`, `totalMm = 0`, `totalIm = 0`,
+    `totalReservedMm = 0`, `legCount = 0`, AND every byte of all 8 leg slots `[120, 952)` is `0`! -/
+theorem initPortfolio_zero_inits_dirty_mem
+    (fData dexKey ownerKey : Ptr) (pid : UInt64) (s s' : SvmState)
+    (hfV : regionValid fData PflOff.size)
+    (h : (do
+        zeroWordsLoop fData 0 (PflOff.size >>> 3)
+        storeU32 fData PflOff.magic MAGIC_PORTFOLIO
+        storeU8  fData PflOff.legCount 0
+        storeU64 fData PflOff.portfolioId pid
+        storeU64 fData PflOff.episode 1
+        LeanSVM.pubkeyCopy (fData + PflOff.dex)   dexKey
+        LeanSVM.pubkeyCopy (fData + PflOff.owner) ownerKey) s = .ok () s') :
+    s'.readU64 (fData + PflOff.capital) = 0 ∧
+    s'.readU64 (fData + PflOff.totalMm) = 0 ∧
+    s'.readU64 (fData + PflOff.totalIm) = 0 ∧
+    s'.readU64 (fData + PflOff.totalReservedMm) = 0 ∧
+    (∀ x : UInt64, fData.toNat + 88 ≤ x.toNat → x.toNat < fData.toNat + 952 → s'.mem x = 0) := by
+  have hf952 : fData.toNat + 952 < 2 ^ 64 := hfV
+  obtain ⟨_, s0, hz, h⟩ := bind_ok_elim h
+  have hn119 : (PflOff.size >>> 3).toNat = 119 := by decide
+  have ⟨_, hzero0, _⟩ := zeroWordsLoop_exact fData 0 (PflOff.size >>> 3) s s0
+    (by have h0 : (0 : UInt64).toNat = 0 := rfl; omega) hz
+  obtain ⟨_, s1, hs1, h⟩ := bind_ok_elim h
+  obtain ⟨_, s2, hs2, h⟩ := bind_ok_elim h
+  obtain ⟨_, s3, hs3, h⟩ := bind_ok_elim h
+  obtain ⟨_, s4, hs4, h⟩ := bind_ok_elim h
+  obtain ⟨_, s5, hp1, h⟩ := bind_ok_elim h
+  dsimp only [storeU32, storeU8, storeU64, rawStoreU32, rawStoreU8, rawStoreU64] at hs1 hs2 hs3 hs4
+  have heq1 : s1 = s0.writeU32 (fData + PflOff.magic) MAGIC_PORTFOLIO := by cases hs1; rfl
+  have heq2 : s2 = s1.writeU8  (fData + PflOff.legCount) 0            := by cases hs2; rfl
+  have heq3 : s3 = s2.writeU64 (fData + PflOff.portfolioId) pid       := by cases hs3; rfl
+  have heq4 : s4 = s3.writeU64 (fData + PflOff.episode) 1             := by cases hs4; rfl
+  have hP0  : (fData + PflOff.magic).toNat       = fData.toNat      := by have : PflOff.magic.toNat = 0 := rfl; rw [u64_add_toNat_of_lt _ _ (by omega), this]; omega
+  have hP4  : (fData + PflOff.legCount).toNat    = fData.toNat + 4  := by have : PflOff.legCount.toNat = 4 := rfl; rw [u64_add_toNat_of_lt _ _ (by omega), this]
+  have hP8  : (fData + PflOff.portfolioId).toNat = fData.toNat + 8  := by have : PflOff.portfolioId.toNat = 8 := rfl; rw [u64_add_toNat_of_lt _ _ (by omega), this]
+  have hP16 : (fData + PflOff.episode).toNat     = fData.toNat + 16 := by have : PflOff.episode.toNat = 16 := rfl; rw [u64_add_toNat_of_lt _ _ (by omega), this]
+  have hP24 : (fData + PflOff.dex).toNat         = fData.toNat + 24 := by have : PflOff.dex.toNat = 24 := rfl; rw [u64_add_toNat_of_lt _ _ (by omega), this]
+  have hP56 : (fData + PflOff.owner).toNat       = fData.toNat + 56 := by have : PflOff.owner.toNat = 56 := rfl; rw [u64_add_toNat_of_lt _ _ (by omega), this]
+  have ⟨_, hpc1⟩ := pubkeyCopy_preserves_outside (fData + PflOff.dex) dexKey s4 s5 (by omega) hp1
+  have ⟨_, hpc2⟩ := pubkeyCopy_preserves_outside (fData + PflOff.owner) ownerKey s5 s' (by omega) h
+  have hTailZero : ∀ x : UInt64, fData.toNat + 88 ≤ x.toNat → x.toNat < fData.toNat + 952 → s'.mem x = 0 := by
+    intro x hx1 hx2
+    rw [hpc2 x (Or.inr (by omega)), hpc1 x (Or.inr (by omega))]
+    have h43 : s4.mem x = s3.mem x := by rw [heq4]; exact readU8_writeU64_of_disjNat s3 (fData + PflOff.episode) x 1 (by omega) (Or.inr (by omega))
+    have h32 : s3.mem x = s2.mem x := by rw [heq3]; exact readU8_writeU64_of_disjNat s2 (fData + PflOff.portfolioId) x pid (by omega) (Or.inr (by omega))
+    have h21 : s2.mem x = s1.mem x := by rw [heq2]; exact mem_writeU8_outside s1 (fData + PflOff.legCount) x 0 (fun he => by rw [he] at hx1; omega)
+    have h10 : s1.mem x = s0.mem x := by rw [heq1]; exact mem_writeU32_outside s0 (fData + PflOff.magic) x MAGIC_PORTFOLIO (by omega) (Or.inr (by omega))
+    rw [h43, h32, h21, h10]
+    exact hzero0 x (by have h0 : (0 : UInt64).toNat = 0 := rfl; omega)
+      (by have h0 : (0 : UInt64).toNat = 0 := rfl; omega)
+  have hzOff : ∀ off : UInt64, 88 ≤ off.toNat → off.toNat + 8 ≤ 952 → s'.readU64 (fData + off) = 0 := by
+    intro off h1 h2
+    have hfo := u64_add_toNat_of_lt fData off (by omega)
+    exact readU64_of_mem_zero s' (fData + off) (by omega) (fun x hx1 hx2 => hTailZero x (by omega) (by omega))
+  have hCap : PflOff.capital.toNat = 88 := rfl
+  have hMm  : PflOff.totalMm.toNat = 96 := rfl
+  have hIm  : PflOff.totalIm.toNat = 104 := rfl
+  have hRes : PflOff.totalReservedMm.toNat = 112 := rfl
+  exact ⟨hzOff PflOff.capital (by omega) (by omega),
+         hzOff PflOff.totalMm (by omega) (by omega),
+         hzOff PflOff.totalIm (by omega) (by omega),
+         hzOff PflOff.totalReservedMm (by omega) (by omega),
+         hTailZero⟩
+
+/-- **Refinement #16 (`CloseAccount` Permanent Tombstone & Same-Tx Revival Immunity)**:
+    Executing the exact closure sequence of `Program.handleCloseAccount`
+    (`zeroWordsLoop data 0 nWords` + `storeU32 data 0 MAGIC_CLOSED`) on ANY account (`nWords ≥ 1`):
+    1. Writes `MAGIC_CLOSED` (`"DEAD"`), which is **strictly nonzero** (so `checkFreshAccount` and
+       `DepositInsurance`'s `magic == 0` branch ALWAYS reject even if rent is refunded in the same tx!),
+    2. Is distinct from ALL 4 live magics (`MAGIC_DEX`, `MAGIC_MARKET`, `MAGIC_PORTFOLIO`, `MAGIC_INSURANCE`),
+    3. Zeroes **every single residual byte** in `[data + 4, data + nWords * 8)`. -/
+theorem closeAccount_blocks_same_tx_revival
+    (data nWords : UInt64) (s s' : SvmState)
+    (hpos : 1 ≤ nWords.toNat)
+    (hvalid : data.toNat + nWords.toNat * 8 < 2 ^ 64)
+    (h : (do
+        zeroWordsLoop data 0 nWords
+        storeU32 data 0 MAGIC_CLOSED) s = .ok () s') :
+    s'.readU32 data = MAGIC_CLOSED ∧
+    s'.readU32 data ≠ 0 ∧
+    s'.readU32 data ≠ MAGIC_DEX ∧
+    s'.readU32 data ≠ MAGIC_MARKET ∧
+    s'.readU32 data ≠ MAGIC_PORTFOLIO ∧
+    s'.readU32 data ≠ MAGIC_INSURANCE ∧
+    (∀ x : UInt64, data.toNat + 4 ≤ x.toNat → x.toNat < data.toNat + nWords.toNat * 8 → s'.mem x = 0) := by
+  obtain ⟨_, s0, hz, h⟩ := bind_ok_elim h
+  dsimp only [storeU32, rawStoreU32] at h; cases h
+  have h0nat : (0 : UInt64).toNat = 0 := rfl
+  have ⟨_, hzero0, _⟩ := zeroWordsLoop_exact data 0 nWords s s0 (by omega) hz
+  have hp0 : data + 0 = data := by bv_decide
+  rw [hp0]
+  have hmag : (s0.writeU32 data MAGIC_CLOSED).readU32 data = MAGIC_CLOSED :=
+    readU32_writeU32_same s0 data MAGIC_CLOSED
+  refine ⟨hmag, by rw [hmag]; decide, by rw [hmag]; decide, by rw [hmag]; decide,
+          by rw [hmag]; decide, by rw [hmag]; decide, ?_⟩
+  intro x hx1 hx2
+  rw [mem_writeU32_outside s0 data x MAGIC_CLOSED (by omega) (Or.inr hx1)]
+  exact hzero0 x (by omega) (by omega)
+
 end Percolator.Refinement

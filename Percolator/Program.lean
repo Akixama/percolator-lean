@@ -60,15 +60,35 @@ def getClockSlot : SolanaM UInt64 := do
   SolanaM.require (rc == 0) Err.invalidAccountData
   loadU64 buf 0
 
-def checkOwnedMagic (acc : AccountView) (progId : Ptr) (minLen : UInt64) (magic : UInt32) : SolanaM Unit := do
+/-- Zero `nWords` consecutive 8-byte words starting at `base + off`.
+    Used by every `Init*` handler, `freeLegIfEmpty`, and `handleCloseAccount` so NO account
+    can ever retain dirty or cross-type residual bytes across reuse or same-tx revival attempts. -/
+def zeroWordsLoop (base off nWords : UInt64) : SolanaM Unit := do
+  if h : nWords == 0 then
+    return ()
+  else
+    storeU64 base off 0
+    zeroWordsLoop base (off + 8) (nWords - 1)
+termination_by nWords.toNat
+decreasing_by
+  have hne : nWords.toNat ≠ 0 := by
+    intro hz
+    have h0 : nWords = 0 := UInt64.toNat_inj.mp (by rw [hz]; rfl)
+    exact h (by rw [h0]; rfl)
+  have h1 : (1 : UInt64).toNat = 1 := rfl
+  change (nWords - 1).toNat < nWords.toNat
+  rw [UInt64.toNat_sub_of_le _ _ (UInt64.le_iff_toNat_le.mpr (by omega)), h1]
+  omega
+
+def checkOwnedMagic (acc : AccountView) (progId : Ptr) (exactLen : UInt64) (magic : UInt32) : SolanaM Unit := do
   requireKeyEq (AccountView.ownerPtr acc) progId Err.illegalOwner
-  SolanaM.require ((← AccountView.dataLen acc) >= minLen) Err.accountDataTooSmall
+  SolanaM.require ((← AccountView.dataLen acc) == exactLen) Err.invalidAccountData
   SolanaM.require ((← loadU32 (AccountView.dataPtr acc) 0) == magic) PErr.invalidMagic
 
-def checkFreshAccount (acc : AccountView) (progId : Ptr) (minLen : UInt64) : SolanaM Unit := do
+def checkFreshAccount (acc : AccountView) (progId : Ptr) (exactLen : UInt64) : SolanaM Unit := do
   requireWritable acc
   requireKeyEq (AccountView.ownerPtr acc) progId Err.illegalOwner
-  SolanaM.require ((← AccountView.dataLen acc) >= minLen) Err.accountDataTooSmall
+  SolanaM.require ((← AccountView.dataLen acc) == exactLen) Err.invalidAccountData
   SolanaM.require ((← loadU32 (AccountView.dataPtr acc) 0) == 0) Err.accountAlreadyInitialized
 
 def addU64At (base off delta : UInt64) : SolanaM Unit := do
@@ -224,7 +244,7 @@ def freeLegIfEmpty (pflData slotIdx : UInt64) : SolanaM Unit := do
     let rawB ← loadU64 lp LegOff.rawBasis
     let pnl  ← loadU64 lp LegOff.posPnl
     if side == SIDE_FLAT && rawB == 0 && pnl == 0 then
-      storeU8 lp LegOff.active 0
+      zeroWordsLoop lp 0 (PflOff.legStride >>> 3)
       let cnt ← loadU8 pflData PflOff.legCount
       if cnt > 0 then storeU8 pflData PflOff.legCount (cnt - 1)
 
@@ -408,6 +428,7 @@ def handleInitDex (input : Ptr) : SolanaM Unit := do
   tokenInitializeAccount3 tokProg vaultPda mint (AccountView.keyPtr vaultPda)
 
   let dData := AccountView.dataPtr dex
+  zeroWordsLoop dData 0 (DexOff.size >>> 3)
   storeU32 dData DexOff.magic MAGIC_DEX
   storeU8  dData DexOff.version 2
   storeU8  dData DexOff.vaultBump vaultBump
@@ -478,6 +499,7 @@ def handleCreateMarket (input : Ptr) : SolanaM Unit := do
   storeU64 dData DexOff.nextMarketId (← checkedAdd64 mid 1)
 
   let mData := AccountView.dataPtr mkt
+  zeroWordsLoop mData 0 (MktOff.size >>> 3)
   storeU32 mData MktOff.magic MAGIC_MARKET
   storeU8  mData MktOff.status STATUS_ACTIVE
   storeU64 mData MktOff.marketId mid
@@ -583,6 +605,7 @@ def handleInitPortfolio (input : Ptr) : SolanaM Unit := do
   let pid ← loadU64 dData DexOff.nextPortfolioId
   storeU64 dData DexOff.nextPortfolioId (← checkedAdd64 pid 1)
   let fData := AccountView.dataPtr pfl
+  zeroWordsLoop fData 0 (PflOff.size >>> 3)
   storeU32 fData PflOff.magic MAGIC_PORTFOLIO
   storeU8  fData PflOff.legCount 0
   storeU64 fData PflOff.portfolioId pid
@@ -671,10 +694,11 @@ def handleDepositInsurance (input : Ptr) : SolanaM Unit := do
   else
     requireWritable receipt
     requireKeyEq (AccountView.ownerPtr receipt) progId Err.illegalOwner
-    SolanaM.require ((← AccountView.dataLen receipt) >= InsOff.size) Err.accountDataTooSmall
+    SolanaM.require ((← AccountView.dataLen receipt) == InsOff.size) Err.invalidAccountData
     let rData := AccountView.dataPtr receipt
     let mid ← loadU64 mData MktOff.marketId
     if (← loadU32 rData InsOff.magic) == 0 then
+      zeroWordsLoop rData 0 (InsOff.size >>> 3)
       storeU32 rData InsOff.magic MAGIC_INSURANCE
       storeU64 rData InsOff.marketId mid
       pubkeyCopy (rData + InsOff.owner)  (AccountView.keyPtr lp)
@@ -722,8 +746,9 @@ def handleWithdrawInsurance (input : Ptr) : SolanaM Unit := do
   let burnShares ← loadU64 ix.ptr 1
   SolanaM.require (burnShares > 0) PErr.invalidParams
   let curSh ← loadU64 rData InsOff.shares
-  SolanaM.require (curSh >= burnShares) PErr.insufficientFunds
   let totSh ← loadU64 mData MktOff.totalInsShares
+  SolanaM.require (curSh <= totSh) PErr.nonzeroState
+  SolanaM.require (curSh >= burnShares) PErr.insufficientFunds
   let ins   ← loadU64 mData MktOff.insurance
   let payout ← mulDiv64 burnShares ins totSh
 
@@ -1399,7 +1424,9 @@ def handleTombstoneMarket (input : Ptr) : SolanaM Unit := do
   storeU8 mData MktOff.status STATUS_TOMBSTONED
 
 /-- Unified rent reclaim for empty `Portfolio`, empty `InsReceipt`, or `Tombstoned` `Market`.
-    Zeroes magic before draining lamports to prevent same-tx revival attacks! -/
+    Zeroes ALL account bytes AND writes permanent `MAGIC_CLOSED` ("DEAD", ≠ 0) before draining
+    lamports so a closed account can NEVER be revived (neither as initialized nor as fresh `magic == 0`)
+    even if rent lamports are refunded in the same transaction! -/
 def handleCloseAccount (input : Ptr) : SolanaM Unit := do
   let (acc, authority, dest, _, progId) ← parse3 input
   requireSigner authority; requireWritable acc; requireWritable dest
@@ -1408,25 +1435,30 @@ def handleCloseAccount (input : Ptr) : SolanaM Unit := do
   let dlen ← AccountView.dataLen acc
   let data := AccountView.dataPtr acc
   let magic ← loadU32 data 0
-  if magic == MAGIC_PORTFOLIO then
-    SolanaM.require (dlen >= PflOff.size) Err.accountDataTooSmall
-    requireKeyEq (AccountView.keyPtr authority) (data + PflOff.owner) PErr.ownerMismatch
-    SolanaM.require ((← loadU64 data PflOff.capital) == 0 && (← loadU8 data PflOff.legCount) == 0 &&
-                     (← loadU64 data PflOff.totalMm) == 0 && (← loadU64 data PflOff.totalIm) == 0 &&
-                     (← loadU64 data PflOff.totalReservedMm) == 0) PErr.nonzeroState
-  else if magic == MAGIC_INSURANCE then
-    SolanaM.require (dlen >= InsOff.size) Err.accountDataTooSmall
-    requireKeyEq (AccountView.keyPtr authority) (data + InsOff.owner) PErr.ownerMismatch
-    SolanaM.require ((← loadU64 data InsOff.shares) == 0) PErr.nonzeroState
-  else if magic == MAGIC_MARKET then
-    SolanaM.require (dlen >= MktOff.size) Err.accountDataTooSmall
-    SolanaM.require ((← loadU8 data MktOff.status) == STATUS_TOMBSTONED) PErr.invalidStatus
-    if !(← pubkeyIsZero (data + MktOff.marketAdmin)) then
-      requireKeyEq (AccountView.keyPtr authority) (data + MktOff.marketAdmin) PErr.unauthorized
-  else
-    SolanaM.fail PErr.invalidMagic
+  let closeWords ←
+    if magic == MAGIC_PORTFOLIO then do
+      SolanaM.require (dlen == PflOff.size) Err.invalidAccountData
+      requireKeyEq (AccountView.keyPtr authority) (data + PflOff.owner) PErr.ownerMismatch
+      SolanaM.require ((← loadU64 data PflOff.capital) == 0 && (← loadU8 data PflOff.legCount) == 0 &&
+                       (← loadU64 data PflOff.totalMm) == 0 && (← loadU64 data PflOff.totalIm) == 0 &&
+                       (← loadU64 data PflOff.totalReservedMm) == 0) PErr.nonzeroState
+      pure (PflOff.size >>> 3)
+    else if magic == MAGIC_INSURANCE then do
+      SolanaM.require (dlen == InsOff.size) Err.invalidAccountData
+      requireKeyEq (AccountView.keyPtr authority) (data + InsOff.owner) PErr.ownerMismatch
+      SolanaM.require ((← loadU64 data InsOff.shares) == 0) PErr.nonzeroState
+      pure (InsOff.size >>> 3)
+    else if magic == MAGIC_MARKET then do
+      SolanaM.require (dlen == MktOff.size) Err.invalidAccountData
+      SolanaM.require ((← loadU8 data MktOff.status) == STATUS_TOMBSTONED) PErr.invalidStatus
+      if !(← pubkeyIsZero (data + MktOff.marketAdmin)) then
+        requireKeyEq (AccountView.keyPtr authority) (data + MktOff.marketAdmin) PErr.unauthorized
+      pure (MktOff.size >>> 3)
+    else
+      SolanaM.fail PErr.invalidMagic
 
-  storeU32 data 0 0
+  zeroWordsLoop data 0 closeWords
+  storeU32 data 0 MAGIC_CLOSED
   let accLam  ← AccountView.lamports acc
   let destLam ← AccountView.lamports dest
   AccountView.setLamports dest (← checkedAdd64 destLam accLam)

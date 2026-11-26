@@ -494,6 +494,22 @@ def getClockSlotAndTs : SolanaM (UInt64 × UInt64) := do
 
 /-! ### 2 Minimal Instructions -/
 
+def zeroAdapterWords (base off nWords : UInt64) : SolanaM Unit := do
+  if h : nWords == 0 then return ()
+  else
+    storeU64 base off 0
+    zeroAdapterWords base (off + 8) (nWords - 1)
+termination_by nWords.toNat
+decreasing_by
+  have hne : nWords.toNat ≠ 0 := by
+    intro hz
+    have h0 : nWords = 0 := UInt64.toNat_inj.mp (by rw [hz]; rfl)
+    exact h (by rw [h0]; rfl)
+  have h1 : (1 : UInt64).toNat = 1 := rfl
+  change (nWords - 1).toNat < nWords.toNat
+  rw [UInt64.toNat_sub_of_le _ _ (UInt64.le_iff_toNat_le.mpr (by omega)), h1]
+  omega
+
 /-- Op 0: Initialize `OracleAdapter` binding `(percolatorProg, market, feedAccount[, quoteFeed])`.
     Supports all 4 feed formats (`0=Custom`, `1=PythV2`, `2=Chainlink`, `3=Switchboard`),
     optional Pyth `feed_id` pinning (`ix.len >= 60` / `92`), and optional 2-leg ratio mode (`n >= 6`)! -/
@@ -509,7 +525,7 @@ def handleInitAdapter (input : Ptr) : SolanaM Unit := do
   SolanaM.require (← AccountView.isSigner admin) Err.missingRequiredSignature
   SolanaM.require (← AccountView.isWritable adp) Err.invalidAccountData
   SolanaM.require (← pubkeyEq (AccountView.ownerPtr adp) progId) Err.illegalOwner
-  SolanaM.require ((← AccountView.dataLen adp) >= AdpOff.size) Err.accountDataTooSmall
+  SolanaM.require ((← AccountView.dataLen adp) == AdpOff.size) Err.invalidAccountData
   SolanaM.require ((← loadU32 (AccountView.dataPtr adp) 0) == 0) Err.accountAlreadyInitialized
 
   let pdaBump     ← loadU8  ix.ptr 1
@@ -522,6 +538,7 @@ def handleInitAdapter (input : Ptr) : SolanaM Unit := do
   SolanaM.require (maxFeedAge >= 1 && maxConfBps <= BPS_DEN && fundBpsStep <= BPS_DEN) PErr.invalidParams
 
   let aData := AccountView.dataPtr adp
+  zeroAdapterWords aData 0 (AdpOff.size >>> 3)
   let mut flags : UInt8 := 0
   if ix.len >= 60 then
     pubkeyCopy (aData + AdpOff.feedId) (ix.ptr + 28)
@@ -562,7 +579,7 @@ def handleCrank (input : Ptr) : SolanaM Unit := do
   let percProg    ← AccountView.nextCursor oracAuthPda
 
   SolanaM.require (← pubkeyEq (AccountView.ownerPtr adp) progId) Err.illegalOwner
-  SolanaM.require ((← AccountView.dataLen adp) >= AdpOff.size) Err.accountDataTooSmall
+  SolanaM.require ((← AccountView.dataLen adp) == AdpOff.size) Err.invalidAccountData
   let aData := AccountView.dataPtr adp
   SolanaM.require ((← loadU32 aData AdpOff.magic) == MAGIC_ADAPTER) PErr.invalidMagic
   SolanaM.require (← pubkeyEq (AccountView.keyPtr percProg) (aData + AdpOff.percProg)) OErr.progMismatch
@@ -680,7 +697,7 @@ def handleInitEwma (input : Ptr) : SolanaM Unit := do
   SolanaM.require (← AccountView.isSigner admin) Err.missingRequiredSignature
   SolanaM.require (← AccountView.isWritable adp) Err.invalidAccountData
   SolanaM.require (← pubkeyEq (AccountView.ownerPtr adp) progId) Err.illegalOwner
-  SolanaM.require ((← AccountView.dataLen adp) >= AdpOff.size) Err.accountDataTooSmall
+  SolanaM.require ((← AccountView.dataLen adp) == AdpOff.size) Err.invalidAccountData
   let aData := AccountView.dataPtr adp
   SolanaM.require ((← loadU32 aData AdpOff.magic) == MAGIC_ADAPTER) PErr.invalidMagic
   SolanaM.require (← pubkeyEq (AccountView.keyPtr admin) (aData + AdpOff.admin)) PErr.ownerMismatch
@@ -718,7 +735,7 @@ def handlePushEwmaMark (input : Ptr) : SolanaM Unit := do
   SolanaM.require (← AccountView.isSigner admin) Err.missingRequiredSignature
   SolanaM.require (← AccountView.isWritable adp) Err.invalidAccountData
   SolanaM.require (← pubkeyEq (AccountView.ownerPtr adp) progId) Err.illegalOwner
-  SolanaM.require ((← AccountView.dataLen adp) >= AdpOff.size) Err.accountDataTooSmall
+  SolanaM.require ((← AccountView.dataLen adp) == AdpOff.size) Err.invalidAccountData
   let aData := AccountView.dataPtr adp
   SolanaM.require ((← loadU32 aData AdpOff.magic) == MAGIC_ADAPTER) PErr.invalidMagic
   SolanaM.require (← pubkeyEq (AccountView.keyPtr admin) (aData + AdpOff.admin)) PErr.ownerMismatch

@@ -38,6 +38,7 @@ def MAGIC_DEX        : UInt32 := 0x58454450         -- "PDEX"
 def MAGIC_MARKET     : UInt32 := 0x50544B4D         -- "MKTP"
 def MAGIC_PORTFOLIO  : UInt32 := 0x4F4C4650         -- "PFLO"
 def MAGIC_INSURANCE  : UInt32 := 0x52534E49         -- "INSR"
+def MAGIC_CLOSED     : UInt32 := 0x44454144         -- "DEAD" (permanent tombstone; blocks same-tx revival!)
 
 /-! ### PDA Seed Tag (4-byte little-endian ASCII: "dvlt") -/
 

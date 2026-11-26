@@ -5,14 +5,14 @@
 It achieves **full cross-margin capital efficiency on healthy markets** (hedged spreads net 1:1 with zero warmup drag) while maintaining **machine-checked per-market risk isolation**: permissionlessly created or adversarial markets cannot drain other markets, untouched users, or other markets' insurance pools.
 
 The repository ships a minimal core clearinghouse ([`percolator.so`](Percolator/Program.lean)) plus two tiny, formally verified composable external programs that integrate via CPI without bloating the core:
-- **[`Percolator.Matcher`](Percolator/Matcher.lean)** (`8,552 B`) — permissionless passive-LP AMM / spread matcher enabling single-signer taker opens & closes against resting PDA-owned LP portfolios.
-- **[`Percolator.OracleAdapter`](Percolator/OracleAdapter.lean)** (`18,504 B`) — permissionless on-chain oracle bridge natively parsing **Pyth Pull (`PriceUpdateV2`)**, **Chainlink OCR2 (`Transmissions`)**, **Switchboard On-Demand (`PullFeedAccountData`, 128-bit `PRECISION=18`)**, custom feeds, **2-leg composite ratios** (`base / quote`, e.g. `STOXX/SOL`), and **EWMA smoothing + Hybrid After-Hours mode** (carrying `ewmaPrice` while cash markets are closed, still repricing 24/7 against a live quote feed, plus optional per-slot bounded `PushEwmaMark`), with pinned feed owners/IDs, confidence & staleness checks, smooth multi-slot auto-clamped convergence, and on-chain premium funding.
+- **[`Percolator.Matcher`](Percolator/Matcher.lean)** (`8,680 B`) — permissionless passive-LP AMM / spread matcher enabling single-signer taker opens & closes against resting PDA-owned LP portfolios.
+- **[`Percolator.OracleAdapter`](Percolator/OracleAdapter.lean)** (`18,544 B`) — permissionless on-chain oracle bridge natively parsing **Pyth Pull (`PriceUpdateV2`)**, **Chainlink OCR2 (`Transmissions`)**, **Switchboard On-Demand (`PullFeedAccountData`, 128-bit `PRECISION=18`)**, custom feeds, **2-leg composite ratios** (`base / quote`, e.g. `STOXX/SOL`), and **EWMA smoothing + Hybrid After-Hours mode** (carrying `ewmaPrice` while cash markets are closed, still repricing 24/7 against a live quote feed, plus optional per-slot bounded `PushEwmaMark`), with pinned feed owners/IDs, confidence & staleness checks, smooth multi-slot auto-clamped convergence, and on-chain premium funding.
 
 | Program | ELF `.so` Size | sBPF Insns | Stack | Heap | Formal Lean 4 Proofs (`0 sorry`, `0` custom axioms) |
 |---|---:|---:|---:|---:|---|
-| **[`Percolator.Program`](Percolator/Program.lean)** (Core DEX) | **65,760 B** | 8,069 | 424 B | 0 B | **77 theorems** (`Proofs.lean` + `TraceProofs.lean` + 11 `SvmState.mem` refinement theorems in `Refinement.lean`) |
-| **[`Percolator.Matcher`](Percolator/Matcher.lean)** (LP AMM CPI) | **8,552 B** | 949 | 712 B | 0 B | **4 theorems** (`quoteAsk/Bid` bounds & clamp) |
-| **[`Percolator.OracleAdapter`](Percolator/OracleAdapter.lean)** (Pyth/CL/SB + Ratio + EWMA CPI) | **18,504 B** | 2,187 | 552 B | 0 B | **8 theorems** (`crank_step_and_funding_within_clamp`, `ringBufferPrevIdx_lt`, `scaleToE6Nat_mono_and_id`, `ratio_crank_within_clamp`, `ewmaBlendNat_bounds`, `ewmaBlendNat_fixed_point`, `ewma_ratio_crank_within_clamp`, `ewmaBlendU64_refines_spec`) |
+| **[`Percolator.Program`](Percolator/Program.lean)** (Core DEX) | **66,112 B** | 8,113 | 424 B | 0 B | **84 theorems** (`Proofs.lean` + `TraceProofs.lean` + 15 `SvmState.mem` refinement theorems in `Refinement.lean`) |
+| **[`Percolator.Matcher`](Percolator/Matcher.lean)** (LP AMM CPI) | **8,680 B** | 965 | 712 B | 0 B | **4 theorems** (`quoteAsk/Bid` bounds & clamp) |
+| **[`Percolator.OracleAdapter`](Percolator/OracleAdapter.lean)** (Pyth/CL/SB + Ratio + EWMA CPI) | **18,544 B** | 2,192 | 552 B | 0 B | **8 theorems** (`crank_step_and_funding_within_clamp`, `ringBufferPrevIdx_lt`, `scaleToE6Nat_mono_and_id`, `ratio_crank_within_clamp`, `ewmaBlendNat_bounds`, `ewmaBlendNat_fixed_point`, `ewma_ratio_crank_within_clamp`, `ewmaBlendU64_refines_spec`) |
 
 ---
 
@@ -171,7 +171,7 @@ Assume adversarial validators can censor/reorder for `T - 1` consecutive slots a
 
 ## 7. Verification & Worst-Case Multi-Leg Benchmarks (LiteSVM / Agave 3.1.3)
 
-See [`INVARIANTS.md`](INVARIANTS.md) for all **89 kernel-checked Lean 4 theorems** (`0 sorry`, `0` custom axioms — including 12 direct `SvmState.mem` Program-to-Spec refinement proofs in [`Percolator/Refinement.lean`](Percolator/Refinement.lean)). All **12 end-to-end suites** in [`svm-runner/src/main.rs`](svm-runner/src/main.rs) + [`svm-runner/src/boring_tests.rs`](svm-runner/src/boring_tests.rs) pass 100% with **zero vault mocks**:
+See [`INVARIANTS.md`](INVARIANTS.md) for all **96 kernel-checked Lean 4 theorems** (`0 sorry`, `0` custom axioms — including 16 direct `SvmState.mem` Program-to-Spec refinement proofs in [`Percolator/Refinement.lean`](Percolator/Refinement.lean)). All **12 end-to-end suites** in [`svm-runner/src/main.rs`](svm-runner/src/main.rs) + [`svm-runner/src/boring_tests.rs`](svm-runner/src/boring_tests.rs) pass 100% with **zero vault mocks**:
 
 ### Worst-Case 8-Leg (`MAX_LEGS = 8`) & Double-8-Leg (16-Leg) CU and Wire-MTU Stress Benchmarks (Suite 11)
 
@@ -191,12 +191,12 @@ Every worst-case actor path (users, cranks, and liquidation keepers) executes in
 
 ### Full 12-Suite Verification Summary
 
-1. **Suite 1 — On-Chain `InitDex` PDA Vault Creation (`5,286 CU`)**: Creates real SPL Token `DexVault` PDA on-chain despite 1-lamport pre-funding griefing; rejects real executable `noop.so` as `tokenProg`, fake `sysProg`, and wrong PDA bump.
-2. **Suite 2 — Multi-Market Creation (`1,930 CU`)**: Rejects solvency-envelope violations; creates isolated `BTC`, `ETH`, `SCAM` markets.
+1. **Suite 1 — On-Chain `InitDex` PDA Vault Creation (`5,468 CU`)**: Creates real SPL Token `DexVault` PDA on-chain despite 1-lamport pre-funding griefing; rejects real executable `noop.so` as `tokenProg`, fake `sysProg`, and wrong PDA bump.
+2. **Suite 2 — Multi-Market Creation (`2,246 CU`)**: Rejects solvency-envelope violations; creates isolated `BTC`, `ETH`, `SCAM` markets.
 3. **Suite 3 — Cross-Margin Capital Efficiency (`trade 2,627 CU`, `refresh 1,080 CU`, `oracle 590 CU`)**: Long $500 BTC + Short $500 ETH on $100 shared capital survives a 7.84% parallel drop via atomic `[RefreshLeg(ETH), RefreshLeg(BTC)]` with `$100` intact and zero liquidation; verifies stale-leg withdrawal rejection and atomic withdrawal (`4,043 CU`).
-4. **Suite 4 — Anti-Reverse-Contagion + God-Mode `RUG/USD` 12× Shielding Immunity (`liq 3,015 CU`)**: Rejects bare `Liquidate(SCAM)` while `BTC` leg is stale; atomic `[RefreshLeg(BTC), Liquidate(SCAM)]` leaves Alice with exact `capital == BTC_MM`, `I_BTC`/`I_ETH` untouched; plus **Suite 4B** runs both Long-`RUG` and Short-`RUG` 12× god-mode oracle pump shielding attacks verifying `solLeg.reservedMm == $50`, `I_SOL` untouched, and Bob1/Bob2 paid **100.00% (`+$40`)** with zero haircut.
+4. **Suite 4 — Anti-Reverse-Contagion + God-Mode `RUG/USD` 12× Shielding Immunity (`liq 3,111 CU`)**: Rejects bare `Liquidate(SCAM)` while `BTC` leg is stale; atomic `[RefreshLeg(BTC), Liquidate(SCAM)]` leaves Alice with exact `capital == BTC_MM`, `I_BTC`/`I_ETH` untouched; plus **Suite 4B** runs both Long-`RUG` and Short-`RUG` 12× god-mode oracle pump shielding attacks verifying `solLeg.reservedMm == $50`, `I_SOL` untouched, and Bob1/Bob2 paid **100.00% (`+$40`)** with zero haircut.
 5. **Suite 5 — Runtime Security Regressions**: Rejects same-slot oracle spam, unclamped jumps, **real executable `noop.so` passed as `tokenProgram` across all 5 SPL CPI handlers (`Custom(120)`)**, wrong `mint` (`Custom(112)`), wrong `vaultPda` (`Custom(113)`), aliased trades, and live-OI insurance withdrawals.
-6. **Suite 6 — Post-ADL Recovery, Full Lifecycle, Event Logs & Rent Reclaim (`clearDeadLeg 1,030 CU`, `closeAccount 231 CU`)**: Full ADL → `ClearDeadLeg` → `WindDown` → `ForceClosePair` → `Resolve` → `Tombstone` → `CloseAccount` reclaiming 100% rent across Portfolio, InsReceipt, and Market while verifying structured `sol_log_64_` events.
+6. **Suite 6 — Post-ADL Recovery, Full Lifecycle, Event Logs & Rent Reclaim (`clearDeadLeg 1,126 CU`, `closeAccount 1,074 CU`)**: Full ADL → `ClearDeadLeg` → `WindDown` → `ForceClosePair` → `Resolve` → `Tombstone` → `CloseAccount` reclaiming 100% rent across Portfolio, InsReceipt, and Market while verifying structured `sol_log_64_` events.
 7. **Suite 7 — Core Composability & Donated-Insurance Tombstone**: Bounded `execPrice` spread transfer (rejects out-of-band), `oracleAuth`/`marketAdmin` rotation, `minMm` dust floor rejection, and permissionless insurance donation cleanly sweeping orphan donated insurance to `totalSurplus` on `ResolveMarket` + tombstoning.
 8. **Suite 8 — 1,000-Step Stateful Fuzzer**: 474 valid randomized cross-margin transactions checking exact `C_tot + I_tot + R_tot + S_tot == V == SPL_balance` and all per-market/per-portfolio invariants after every tx — 0 violations.
 9. **Suite 9 — External Multi-Program CPI Composition**:
@@ -205,17 +205,17 @@ Every worst-case actor path (users, cranks, and liquidation keepers) executes in
    - **Suite 9C — Atomic Crank+LP Bundle & `K=4` Censored Liquidation (`6,715 CU, 552 B` / `3,319 CU`)**: Executes `[Crank(SOL), RefreshLeg(SOL, LP), Crank(ETH), RefreshLeg(ETH, LP)]` in one atomic tx, keeping a hedged spread immune to premature-liquidation reordering; verifies `K = 4` consecutive adverse `-1%` oracle slots without interleaved liquidations still liquidates with `shortfall == 0` and `I_SOL` untouched.
 10. **Suite 10 — Core Hardening & Fair Partial Takeover (`4,473 CU`)**: Rejects unbounded `exitWindow`/`maxStaleness`, nonzero `warmupSlots`, and `Trade(mode=1)` spread draining below `totalMm`; verifies partial takeover with gradual deficit fee (`< maxFee`) and zero ADL on innocent counterparties.
 11. **Suite 11 — Worst-Case 8-Leg CU/MTU Exhaustion + Anti-Selective-Liquidation + Post-ADL Recovery + Position Hand-Off**: Full 8-market, double-8-leg stress test verifying every role above, rejecting selective single-leg liquidation on an 8-leg hedged spread, verifying same-side Long→Long & Short→Short hand-off, post-ADL opens, post-ADL double-8-leg takeover, and full 8-market CPI/wind-down sweeps with zero invariant violations.
-12. **Suite 12 — 14 Boring Everyday Exchange Functional Tests ([`svm-runner/src/boring_tests.rs`](svm-runner/src/boring_tests.rs))**: Standalone, realistic exchange flows runnable both in Suite 12 and individually via `cargo test --release`: deposit/withdraw/reclaim roundtrips, Long/Short PnL + fees, scale-in & multi-step partial closes, Long↔Short position flips, bid/ask `execPrice` spreads & clamps, bidirectional funding rates, **3 multi-trader exit-order permutations (winners-first, reverse/fragmented, and L→L/S→S hand-offs asserting bit-for-bit identical micro-USDC SPL payouts)**, partial-then-full liquidations, HLP-style takeover liquidations with gradual deficit fees, multi-market cross-margin offsetting & instant profit reuse without closing, withdrawal margin & freshness guards, passive AMM matcher single-signer fills, Insurance LP fee yield & pro-rata redemption, and full market wind-down/resolve/claim/tombstone exits.
+12. **Suite 12 — 15 Functional & Security Regression Tests ([`svm-runner/src/boring_tests.rs`](svm-runner/src/boring_tests.rs))**: Standalone, realistic exchange flows runnable both in Suite 12 and individually via `cargo test --release`: deposit/withdraw/reclaim roundtrips, Long/Short PnL + fees, scale-in & multi-step partial closes, Long↔Short position flips, bid/ask `execPrice` spreads & clamps, bidirectional funding rates, **3 multi-trader exit-order permutations (winners-first, reverse/fragmented, and L→L/S→S hand-offs asserting bit-for-bit identical micro-USDC SPL payouts)**, partial-then-full liquidations, HLP-style takeover liquidations with gradual deficit fees, multi-market cross-margin offsetting & instant profit reuse without closing, withdrawal margin & freshness guards, passive AMM matcher single-signer fills, Insurance LP fee yield & pro-rata redemption, full market wind-down/resolve/claim/tombstone exits, and **same-tx account revival / dirty-buffer init / oversized-account / share-coherence security regressions**.
 
 ---
 
 ## 8. Build & Reproduce
 
 ```bash
-# Run full Lean 4 kernel proof verification (89 theorems, 0 sorry, 0 custom axioms),
+# Run full Lean 4 kernel proof verification (96 theorems, 0 sorry, 0 custom axioms),
 # compile all 3 sBPF .so binaries, and execute all 12 LiteSVM suites:
 ./scripts/build-and-test.sh
 
-# Run the 14 boring everyday exchange LiteSVM tests individually:
+# Run all 15 boring exchange & security regression LiteSVM tests individually:
 cargo test --manifest-path svm-runner/Cargo.toml --release
 ```

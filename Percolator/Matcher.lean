@@ -96,9 +96,25 @@ def writeMatcherPdaSeeds (sbuf : Ptr) (cfgKeyPtr : Ptr) (bump : UInt8) : SolanaM
   storeU64 signersArr 8 3
   return signersArr
 
+def zeroMatcherWords (base off nWords : UInt64) : SolanaM Unit := do
+  if h : nWords == 0 then return ()
+  else
+    storeU64 base off 0
+    zeroMatcherWords base (off + 8) (nWords - 1)
+termination_by nWords.toNat
+decreasing_by
+  have hne : nWords.toNat ≠ 0 := by
+    intro hz
+    have h0 : nWords = 0 := UInt64.toNat_inj.mp (by rw [hz]; rfl)
+    exact h (by rw [h0]; rfl)
+  have h1 : (1 : UInt64).toNat = 1 := rfl
+  change (nWords - 1).toNat < nWords.toNat
+  rw [UInt64.toNat_sub_of_le _ _ (UInt64.le_iff_toNat_le.mpr (by omega)), h1]
+  omega
+
 def checkCfg (cfg : AccountView) (progId : Ptr) : SolanaM Unit := do
   SolanaM.require (← pubkeyEq (AccountView.ownerPtr cfg) progId) Err.illegalOwner
-  SolanaM.require ((← AccountView.dataLen cfg) >= CfgOff.size) Err.accountDataTooSmall
+  SolanaM.require ((← AccountView.dataLen cfg) == CfgOff.size) Err.invalidAccountData
   SolanaM.require ((← loadU32 (AccountView.dataPtr cfg) CfgOff.magic) == MAGIC_MATCHER) PErr.invalidMagic
 
 /-! ### 4 Minimal Instructions -/
@@ -110,7 +126,7 @@ def handleInitMatcher (input : Ptr) : SolanaM Unit := do
   SolanaM.require (← AccountView.isSigner owner) Err.missingRequiredSignature
   SolanaM.require (← AccountView.isWritable cfg) Err.invalidAccountData
   SolanaM.require (← pubkeyEq (AccountView.ownerPtr cfg) progId) Err.illegalOwner
-  SolanaM.require ((← AccountView.dataLen cfg) >= CfgOff.size) Err.accountDataTooSmall
+  SolanaM.require ((← AccountView.dataLen cfg) == CfgOff.size) Err.invalidAccountData
   SolanaM.require ((← loadU32 (AccountView.dataPtr cfg) 0) == 0) Err.accountAlreadyInitialized
 
   let pdaBump       ← loadU8  ix.ptr 1
@@ -120,6 +136,7 @@ def handleInitMatcher (input : Ptr) : SolanaM Unit := do
   SolanaM.require (halfSpreadBps <= BPS_DEN && maxFillQty > 0) PErr.invalidParams
 
   let cData := AccountView.dataPtr cfg
+  zeroMatcherWords cData 0 (CfgOff.size >>> 3)
   storeU32 cData CfgOff.magic MAGIC_MATCHER
   storeU8  cData CfgOff.pdaBump pdaBump
   storeU8  cData CfgOff.paused 0

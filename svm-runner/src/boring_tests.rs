@@ -1271,7 +1271,231 @@ pub fn test_boring_market_winddown_exit_orders_and_tombstone(elf: &[u8]) {
     assert_eq!(e.svm.get_account(&dest).unwrap().lamports, 30_000_000);
 }
 
-/// Runs all 14 boring everyday exchange LiteSVM tests as Suite 12.
+/// 15. Security regression suite for the 2026-11-26 mainnet exploit & all sibling vectors:
+///     (a) Exact mainnet replay: `InitPortfolio` -> same-tx `[CloseAccount, refund, DepositInsurance]` -> REJECTED!
+///     (b) Same-type revival: `InsReceipt` -> same-tx `[CloseAccount, refund, DepositInsurance]` -> REJECTED!
+///     (c) `CloseAccount` writes `MAGIC_CLOSED ("DEAD")` and zeroes every residual byte `4..size`!
+///     (d) Exact-size enforcement: oversized 952B `InsReceipt` / 952B `Market` -> REJECTED!
+///     (e) Dirty-memory defense-in-depth: pre-filled `magic == 0` accounts with attacker pubkey/shares/capital
+///         bytes get 100% zeroed by `DepositInsurance` & `InitPortfolio` (`shares == 1`, `capital == 0`)!
+///     (f) `WithdrawInsurance` rejects any receipt with `shares > totalInsShares` (`Custom(119)`)!
+pub fn test_security_revival_and_dirty_init_regressions(elf: &[u8]) {
+    let mut e = BoringEnv::new(elf);
+    let btc = e.create_market(100 * POS_SCALE, 10, 1000, 500, 100, 0, 400);
+
+    // Seed 70 USDC into BTC insurance (exact mainnet bounty setup!)
+    let seed_lp = Keypair::new();
+    e.svm.airdrop(&seed_lp.pubkey(), 10_000_000_000).unwrap();
+    let seed_tok = create_tok_acc(&mut e.svm, &e.mint, &seed_lp.pubkey(), 70 * POS_SCALE);
+    let seed_rec = create_prog_acc(&mut e.svm, &e.prog_id, INS_SIZE);
+    send_ok(
+        &mut e.svm,
+        ix_deposit_insurance(
+            e.prog_id, e.dex, btc, seed_rec, seed_lp.pubkey(), seed_tok, e.mint, e.dex_vault, TOKEN_PROGRAM_ID,
+            70 * POS_SCALE,
+        ),
+        &e.payer,
+        &[&e.payer, &seed_lp],
+    );
+    assert_eq!(read_u64(&e.svm, &btc, 224), 70 * POS_SCALE);
+    assert_eq!(read_u64(&e.svm, &btc, 248), 70 * POS_SCALE);
+
+    // Attacker creates a 952-byte Portfolio (writing attacker pubkey bytes at 56..87, overlapping InsOff.shares 80..87!)
+    let attacker = e.create_trader(10 * POS_SCALE, 0);
+    let dest = Keypair::new().pubkey();
+
+    // Helper: SystemProgram::Transfer(from, to, lamports)
+    let sys_transfer = |from: Address, to: Address, lamports: u64| {
+        let mut d = vec![0u8; 12];
+        d[0..4].copy_from_slice(&2u32.to_le_bytes()); // SystemInstruction::Transfer = 2
+        d[4..12].copy_from_slice(&lamports.to_le_bytes());
+        Instruction {
+            program_id: SYSTEM_PROGRAM_ID,
+            accounts: vec![AccountMeta::new(from, true), AccountMeta::new(to, false)],
+            data: d,
+        }
+    };
+
+    // (a) Exact mainnet exploit replay: same-tx [CloseAccount(pfl), refund rent, DepositInsurance(receipt=pfl, 1)]
+    //     MUST BE HARD-REJECTED (both exact-size mismatch AND MAGIC_CLOSED != 0)!
+    send_ixs_err(
+        &mut e.svm,
+        &[
+            ix_close_account(e.prog_id, attacker.pfl, attacker.kp.pubkey(), dest),
+            sys_transfer(e.payer.pubkey(), attacker.pfl, 10_000_000),
+            ix_deposit_insurance(
+                e.prog_id, e.dex, btc, attacker.pfl, attacker.kp.pubkey(), attacker.tok,
+                e.mint, e.dex_vault, TOKEN_PROGRAM_ID, 1,
+            ),
+        ],
+        &e.payer,
+        &[&e.payer, &attacker.kp],
+        "mainnet exploit replay: Portfolio -> CloseAccount + refund -> DepositInsurance",
+    );
+
+    // (b) Same-type revival: close a real 88-byte InsReceipt + refund rent + re-DepositInsurance in SAME tx!
+    let atk_rec = create_prog_acc(&mut e.svm, &e.prog_id, INS_SIZE);
+    send_ok(
+        &mut e.svm,
+        ix_deposit_insurance(
+            e.prog_id, e.dex, btc, atk_rec, attacker.kp.pubkey(), attacker.tok,
+            e.mint, e.dex_vault, TOKEN_PROGRAM_ID, 1_000,
+        ),
+        &e.payer,
+        &[&e.payer, &attacker.kp],
+    );
+    send_ok(
+        &mut e.svm,
+        ix_withdraw_insurance(
+            e.prog_id, e.dex, btc, atk_rec, attacker.kp.pubkey(), attacker.tok,
+            e.mint, e.dex_vault, TOKEN_PROGRAM_ID, 1_000,
+        ),
+        &e.payer,
+        &[&e.payer, &attacker.kp],
+    );
+    send_ixs_err(
+        &mut e.svm,
+        &[
+            ix_close_account(e.prog_id, atk_rec, attacker.kp.pubkey(), dest),
+            sys_transfer(e.payer.pubkey(), atk_rec, 10_000_000),
+            ix_deposit_insurance(
+                e.prog_id, e.dex, btc, atk_rec, attacker.kp.pubkey(), attacker.tok,
+                e.mint, e.dex_vault, TOKEN_PROGRAM_ID, 1,
+            ),
+        ],
+        &e.payer,
+        &[&e.payer, &attacker.kp],
+        "same-tx InsReceipt revival after CloseAccount must fail (MAGIC_CLOSED != 0)",
+    );
+
+    // (c) Verify CloseAccount permanently writes MAGIC_CLOSED ("DEAD") and zeroes ALL bytes `4..size`!
+    send_ixs_ok(
+        &mut e.svm,
+        &[
+            ix_close_account(e.prog_id, attacker.pfl, attacker.kp.pubkey(), dest),
+            sys_transfer(e.payer.pubkey(), attacker.pfl, 10_000_000), // keep alive to inspect closed bytes!
+        ],
+        &e.payer,
+        &[&e.payer, &attacker.kp],
+    );
+    let closed_acc = e.svm.get_account(&attacker.pfl).unwrap();
+    assert_eq!(
+        &closed_acc.data[0..4],
+        &0x44454144u32.to_le_bytes(),
+        "CloseAccount must write permanent MAGIC_CLOSED (0x44454144)"
+    );
+    assert!(
+        closed_acc.data[4..PFL_SIZE].iter().all(|&b| b == 0),
+        "CloseAccount must zero EVERY byte in 4..PFL_SIZE"
+    );
+    // Attempting to InitPortfolio on the closed+refunded account MUST fail!
+    send_err(
+        &mut e.svm,
+        ix_init_portfolio(e.prog_id, e.dex, attacker.pfl, attacker.kp.pubkey()),
+        &e.payer,
+        &[&e.payer, &attacker.kp],
+        "InitPortfolio on closed+refunded account must fail",
+    );
+
+    // (d) Exact-size enforcement: oversized 952-byte Market and oversized 952-byte InsReceipt MUST fail!
+    let big_ins = create_prog_acc(&mut e.svm, &e.prog_id, PFL_SIZE);
+    send_err(
+        &mut e.svm,
+        ix_deposit_insurance(
+            e.prog_id, e.dex, btc, big_ins, attacker.kp.pubkey(), attacker.tok,
+            e.mint, e.dex_vault, TOKEN_PROGRAM_ID, 1,
+        ),
+        &e.payer,
+        &[&e.payer, &attacker.kp],
+        "oversized 952B InsReceipt rejected",
+    );
+    let big_mkt = create_prog_acc(&mut e.svm, &e.prog_id, PFL_SIZE);
+    let ctok = create_tok_acc(&mut e.svm, &e.mint, &e.admin.pubkey(), 0);
+    send_err(
+        &mut e.svm,
+        ix_create_market(
+            e.prog_id, e.dex, big_mkt, e.mint, e.oracle.pubkey(), e.admin.pubkey(), ctok, e.fee_vault,
+            100 * POS_SCALE, 10, 50, 0, 1000, 500, 100, 0, 400, 2500, 1_000_000 * POS_SCALE,
+        ),
+        &e.payer,
+        &[&e.payer, &e.admin],
+        "oversized 952B Market rejected",
+    );
+
+    // (e) Defense-in-depth: pre-dirty `magic == 0` buffers with the exact mainnet exploit value!
+    let dirty_rec = Keypair::new().pubkey();
+    let mut dirty_ins_data = vec![0xFFu8; INS_SIZE];
+    dirty_ins_data[0..4].copy_from_slice(&0u32.to_le_bytes()); // magic == 0
+    dirty_ins_data[80..88].copy_from_slice(&8_536_876_367_605_870_429u64.to_le_bytes());
+    e.svm.set_account(
+        dirty_rec,
+        Account { lamports: 10_000_000, data: dirty_ins_data, owner: e.prog_id, executable: false, rent_epoch: 0 },
+    ).unwrap();
+    send_ok(
+        &mut e.svm,
+        ix_deposit_insurance(
+            e.prog_id, e.dex, btc, dirty_rec, attacker.kp.pubkey(), attacker.tok,
+            e.mint, e.dex_vault, TOKEN_PROGRAM_ID, 1,
+        ),
+        &e.payer,
+        &[&e.payer, &attacker.kp],
+    );
+    assert_eq!(read_u64(&e.svm, &dirty_rec, 80), 1, "Fresh DepositInsurance MUST zero dirty shares -> exact 1 share!");
+    send_err_custom(
+        &mut e.svm,
+        ix_withdraw_insurance(
+            e.prog_id, e.dex, btc, dirty_rec, attacker.kp.pubkey(), attacker.tok,
+            e.mint, e.dex_vault, TOKEN_PROGRAM_ID, 70 * POS_SCALE + 1,
+        ),
+        &e.payer,
+        &[&e.payer, &attacker.kp],
+        108,
+        "attacker with 1 legitimate share cannot withdraw 70 USDC pot",
+    );
+
+    // Same dirty-buffer defense-in-depth on InitPortfolio (bytes 88..95 pre-filled with 999 USDC phantom capital!)
+    let dirty_pfl = Keypair::new().pubkey();
+    let mut dirty_pfl_data = vec![0xAAu8; PFL_SIZE];
+    dirty_pfl_data[0..4].copy_from_slice(&0u32.to_le_bytes()); // magic == 0
+    dirty_pfl_data[88..96].copy_from_slice(&(999 * POS_SCALE).to_le_bytes());
+    e.svm.set_account(
+        dirty_pfl,
+        Account { lamports: 10_000_000, data: dirty_pfl_data, owner: e.prog_id, executable: false, rent_epoch: 0 },
+    ).unwrap();
+    send_ok(
+        &mut e.svm,
+        ix_init_portfolio(e.prog_id, e.dex, dirty_pfl, attacker.kp.pubkey()),
+        &e.payer,
+        &[&e.payer, &attacker.kp],
+    );
+    let init_pfl_acc = e.svm.get_account(&dirty_pfl).unwrap();
+    assert_eq!(read_u64(&e.svm, &dirty_pfl, 88), 0, "InitPortfolio must zero dirty capital");
+    assert_eq!(read_u64(&e.svm, &dirty_pfl, 96), 0, "InitPortfolio must zero dirty totalMm");
+    assert_eq!(read_u64(&e.svm, &dirty_pfl, 104), 0, "InitPortfolio must zero dirty totalIm");
+    assert_eq!(read_u64(&e.svm, &dirty_pfl, 112), 0, "InitPortfolio must zero dirty totalReservedMm");
+    assert!(init_pfl_acc.data[120..PFL_SIZE].iter().all(|&b| b == 0), "InitPortfolio must zero all 8 leg slots");
+
+    // (f) WithdrawInsurance explicitly rejects any receipt with `shares > totalInsShares` (Custom(119))!
+    let mut bogus_acc = e.svm.get_account(&dirty_rec).unwrap();
+    bogus_acc.data[80..88].copy_from_slice(&(70 * POS_SCALE + 2).to_le_bytes());
+    e.svm.set_account(dirty_rec, bogus_acc).unwrap();
+    send_err_custom(
+        &mut e.svm,
+        ix_withdraw_insurance(
+            e.prog_id, e.dex, btc, dirty_rec, attacker.kp.pubkey(), attacker.tok,
+            e.mint, e.dex_vault, TOKEN_PROGRAM_ID, 70 * POS_SCALE + 1,
+        ),
+        &e.payer,
+        &[&e.payer, &attacker.kp],
+        119,
+        "WithdrawInsurance rejects receipt.shares > m.totalInsShares",
+    );
+
+    // Seed LP's 70 USDC insurance pot is 100% untouched!
+    assert_eq!(token_amount(&e.svm, &e.dex_vault), 70 * POS_SCALE + 1);
+}
+
+/// Runs all 15 boring everyday exchange + security regression LiteSVM tests as Suite 12.
 pub fn run_all_boring_tests(elf: &[u8], matcher_elf: &[u8]) {
     test_boring_deposit_withdraw_roundtrip(elf);
     test_boring_simple_long_short_profit_and_loss(elf);
@@ -1287,8 +1511,10 @@ pub fn run_all_boring_tests(elf: &[u8], matcher_elf: &[u8]) {
     test_boring_matcher_amm_single_signer_fills(elf, matcher_elf);
     test_boring_insurance_lp_deposit_fee_yield_withdraw(elf);
     test_boring_market_winddown_exit_orders_and_tombstone(elf);
-    println!("[PASS] Suite 12: 14 Boring Everyday Exchange LiteSVM Tests (Deposits, Scale-In/Out, Flips, Spreads, Funding,");
-    println!("       3 Exit-Order Permutations, Partial+Full Liq, HLP Takeover, Cross-Margin Reuse, AMM Matcher, LP Yield, WindDown)");
+    test_security_revival_and_dirty_init_regressions(elf);
+    println!("[PASS] Suite 12: 15 Boring Exchange & Mainnet Revival-Exploit Regression LiteSVM Tests (Deposits, Scale-In/Out,");
+    println!("       Flips, Spreads, Funding, 3 Exit-Order Permutations, Partial+Full Liq, HLP Takeover, Cross-Margin Reuse,");
+    println!("       AMM Matcher, LP Yield, WindDown, & Same-Tx Revival / Dirty-Init / Exact-Size / Share-Bound Regressions)");
 }
 
 #[cfg(test)]
@@ -1318,4 +1544,5 @@ mod tests {
     #[test] fn boring_12_matcher_amm_single_signer_fills() { let (e, m) = load_elfs(); test_boring_matcher_amm_single_signer_fills(&e, &m); }
     #[test] fn boring_13_insurance_lp_deposit_yield_withdraw() { let (e, _) = load_elfs(); test_boring_insurance_lp_deposit_fee_yield_withdraw(&e); }
     #[test] fn boring_14_market_winddown_exit_and_tombstone() { let (e, _) = load_elfs(); test_boring_market_winddown_exit_orders_and_tombstone(&e); }
+    #[test] fn boring_15_security_revival_and_dirty_init_regressions() { let (e, _) = load_elfs(); test_security_revival_and_dirty_init_regressions(&e); }
 }

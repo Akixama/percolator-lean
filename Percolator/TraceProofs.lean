@@ -838,4 +838,131 @@ theorem censored_crank_no_premature_winddown
   intro ⟨_, hgt⟩
   omega
 
+/-! ### Per-Market Insurance LP Share Conservation (`∑ receipt.shares == m.totalInsShares`) -/
+
+/-- Exact sum of all LP `InsReceipt.shares` on market `mid`. -/
+def sumInsShares (st : DexState) (mid : Nat) (lps : List Nat) : Nat :=
+  (lps.map (st.insShares mid)).sum
+
+/-- Inductive insurance-share coherence across every market in `mids` and every LP in `lps`:
+    the sum of all LP receipt shares on market `mid` equals `m.totalInsShares` EXACTLY! -/
+def sharesCoherent (st : DexState) (mids lps : List Nat) : Prop :=
+  ∀ mid ∈ mids, ∀ m, st.markets mid = some m → sumInsShares st mid lps = m.totalInsShares
+
+private theorem list_sum_le_of_mem {α : Type} (f : α → Nat) (xs : List α) {a : α} (h : a ∈ xs) :
+    f a ≤ (xs.map f).sum := by
+  induction xs with
+  | nil => cases h
+  | cons x tl ih =>
+    simp only [List.mem_cons] at h
+    simp only [List.map_cons, List.sum_cons]
+    rcases h with rfl | htl
+    · omega
+    · have := ih htl; omega
+
+/-- **No-Ghost-Shares Bound (`receipt.shares ≤ m.totalInsShares`)**:
+    Under `sharesCoherent`, NO individual LP receipt can EVER hold more shares than `m.totalInsShares`! -/
+theorem sharesCoherent_implies_receipt_le_total (st : DexState) (mids lps : List Nat)
+    (mid lp : Nat) (m : MarketState)
+    (hsh : sharesCoherent st mids lps) (hmId : mid ∈ mids) (hm : st.markets mid = some m)
+    (hlp : lp ∈ lps) :
+    st.insShares mid lp ≤ m.totalInsShares := by
+  have hsum := hsh mid hmId m hm
+  unfold sumInsShares at hsum
+  have hle := list_sum_le_of_mem (st.insShares mid) lps hlp
+  omega
+
+/-- `stepDepositInsurance` (both regular LP share mint and permanent donation) preserves `sharesCoherent`. -/
+theorem depositInsurance_preserves_sharesCoherent (st st' : DexState) (mids lps : List Nat)
+    (mid lp amount : Nat) (donate : Bool)
+    (hsh : sharesCoherent st mids lps) (hndL : lps.Nodup) (hmemL : lp ∈ lps)
+    (h : stepDepositInsurance st mid lp amount donate = some st') :
+    sharesCoherent st' mids lps := by
+  unfold stepDepositInsurance at h
+  cases hm : st.markets mid with
+  | none => simp [hm] at h
+  | some m =>
+    simp only [hm, Bind.bind, Option.bind] at h
+    split at h
+    · cases donate
+      · simp only [Bool.false_eq_true, ↓reduceIte] at h
+        have hdone : ∀ (minted : Nat),
+            sharesCoherent ({ st with
+              vault          := st.vault + amount
+              totalInsurance := st.totalInsurance + amount
+              markets        := updateFn st.markets mid (some { m with insurance := m.insurance + amount, totalInsShares := m.totalInsShares + minted })
+              insShares      := updateFn st.insShares mid (updateFn (st.insShares mid) lp (st.insShares mid lp + minted)) } : DexState) mids lps := by
+          intro minted mid' hmid' m' hm'
+          dsimp only at hm'
+          unfold sumInsShares; dsimp only
+          by_cases heq : mid' = mid
+          · subst heq
+            simp only [updateFn, ↓reduceIte] at hm' ⊢
+            cases hm'
+            have hprev := hsh mid' hmid' m hm
+            unfold sumInsShares at hprev
+            have hadd := sum_map_eq_add lps (st.insShares mid')
+              (updateFn (st.insShares mid') lp (st.insShares mid' lp + minted))
+              lp minted hndL hmemL (by simp [updateFn]) (fun x hx => by simp [updateFn, hx])
+            dsimp only
+            omega
+          · simp only [updateFn, heq, ↓reduceIte] at hm' ⊢
+            exact hsh mid' hmid' m' hm'
+        by_cases h0 : m.totalInsShares = 0 ∨ m.insurance = 0
+        · simp only [h0, ↓reduceIte] at h
+          split at h
+          · cases h
+          · cases h; exact hdone amount
+        · simp only [h0, ↓reduceIte] at h
+          split at h
+          · cases h
+          · cases h; exact hdone (amount * m.totalInsShares / m.insurance)
+      · simp only [↓reduceIte] at h
+        cases h
+        intro mid' hmid' m' hm'
+        dsimp only at hm'
+        unfold sumInsShares; dsimp only
+        by_cases heq : mid' = mid
+        · subst heq
+          simp only [updateFn, ↓reduceIte] at hm'
+          cases hm'
+          exact hsh mid' hmid' m hm
+        · simp only [updateFn, heq, ↓reduceIte] at hm'
+          exact hsh mid' hmid' m' hm'
+    · cases h
+
+/-- `stepWithdrawInsurance` preserves `sharesCoherent` across all markets and LPs. -/
+theorem withdrawInsurance_preserves_sharesCoherent (st st' : DexState) (mids lps : List Nat)
+    (mid lp burnShares : Nat)
+    (hsh : sharesCoherent st mids lps) (hndL : lps.Nodup) (hmemL : lp ∈ lps)
+    (h : stepWithdrawInsurance st mid lp burnShares = some st') :
+    sharesCoherent st' mids lps := by
+  unfold stepWithdrawInsurance at h
+  cases hm : st.markets mid with
+  | none => simp [hm] at h
+  | some m =>
+    simp only [hm, Bind.bind, Option.bind] at h
+    split at h
+    · next hc =>
+      split at h
+      · cases h
+      · cases h
+        intro mid' hmid' m' hm'
+        dsimp only at hm'
+        unfold sumInsShares; dsimp only
+        by_cases heq : mid' = mid
+        · subst heq
+          simp only [updateFn, ↓reduceIte] at hm' ⊢
+          cases hm'
+          have hprev := hsh mid' hmid' m hm
+          unfold sumInsShares at hprev
+          have hsub := sum_map_eq_sub lps (st.insShares mid')
+            (updateFn (st.insShares mid') lp (st.insShares mid' lp - burnShares))
+            lp burnShares hndL hmemL (by simp [updateFn]) hc.2.2.2.2.2.2.1 (fun x hx => by simp [updateFn, hx])
+          dsimp only
+          omega
+        · simp only [updateFn, heq, ↓reduceIte] at hm' ⊢
+          exact hsh mid' hmid' m' hm'
+    · cases h
+
 end Percolator.TraceProofs
