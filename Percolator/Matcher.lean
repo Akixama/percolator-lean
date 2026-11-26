@@ -87,28 +87,29 @@ theorem quoteBid_within_maxMove (markP halfSpread impact qty maxMove : Nat) (hm 
   have hdiv := Nat.div_le_div_right (c := 10_000) hmul
   split <;> omega
 
-/-- Formal Proof #5 (`PropAMM` Universal Open/Reduce Spread-Direction Soundness):
-    Across ALL allowed modes (`mode = 0` open or `mode = 1` reduce), computing
-    `takerIsBuying = (mode == 0 && takerIsLong) || (mode == 1 && !takerIsLong)` quotes:
-    - Ask (`≥ markP`) whenever taker is buying (`open Long` or `reduce Short`),
-    - Bid (`≤ markP`) whenever taker is selling (`open Short` or `reduce Long`),
-    so `tradeCore` (`applyExecSpread`) ALWAYS directs spread strictly FROM taker TO passive LP! -/
+/-- Formal Proof #5 (`PropAMM` Universal Open/Reduce/Flip Spread-Direction Soundness):
+    Across ALL allowed modes (`mode = 0` open, `mode = 1` reduce, `mode = 4` auto-netted flip),
+    computing `takerIsBuying = (mode != 1 && takerIsLong) || (mode == 1 && !takerIsLong)` quotes:
+    - Ask (`≥ markP`) whenever taker is buying (`open Long`, `reduce Short`, or `netted Buy/Flip`),
+    - Bid (`≤ markP`) whenever taker is selling (`open Short`, `reduce Long`, or `netted Sell/Flip`),
+    so `tradeCore`/`tradeNettedCore` ALWAYS directs spread strictly FROM taker TO passive LP! -/
 theorem matcher_fill_spread_favors_lp
     (mode : UInt8) (takerIsLong : Bool) (markP halfSpread impact qty maxMove : Nat)
-    (hmode : mode = 0 ∨ mode = 1) (hm : markP ≥ 1) :
-    let takerIsBuying := (mode == 0 && takerIsLong) || (mode == 1 && !takerIsLong)
+    (hmode : mode = 0 ∨ mode = 1 ∨ mode = 4) (hm : markP ≥ 1) :
+    let takerIsBuying := (mode != 1 && takerIsLong) || (mode == 1 && !takerIsLong)
     (mode ≠ 2 ∧ mode ≠ 3) ∧
     (if takerIsBuying then quoteAskNat markP halfSpread impact qty maxMove ≥ markP
      else quoteBidNat markP halfSpread impact qty maxMove ≤ markP) := by
   dsimp only
   refine ⟨?_, ?_⟩
-  · rcases hmode with rfl | rfl <;> decide
-  · rcases hmode with rfl | rfl <;> cases takerIsLong <;> simp only [beq_self_eq_true, Bool.true_and,
-      Bool.not_true, Bool.not_false, Bool.or_false, Bool.false_or]
+  · rcases hmode with rfl | rfl | rfl <;> decide
+  · rcases hmode with rfl | rfl | rfl <;> cases takerIsLong
     · exact quoteBid_le_mark markP halfSpread impact qty maxMove hm
     · exact quoteAsk_ge_mark markP halfSpread impact qty maxMove
     · exact quoteAsk_ge_mark markP halfSpread impact qty maxMove
     · exact quoteBid_le_mark markP halfSpread impact qty maxMove hm
+    · exact quoteBid_le_mark markP halfSpread impact qty maxMove hm
+    · exact quoteAsk_ge_mark markP halfSpread impact qty maxMove
 
 /-! ### Runtime Helpers & 3 Minimal CPI-Out Instructions -/
 
@@ -185,7 +186,7 @@ def scanBatchSideMask (ixPtr : Ptr) (i k mask : UInt64) : SolanaM UInt64 := do
     let oPtr := ixPtr + 32 + i * 48
     let mode ← loadU8 oPtr 0
     let side ← loadU8 oPtr 1
-    let isBuying := (mode == 0 && side != 0) || (mode == 1 && side == 0)
+    let isBuying := (mode != 1 && side != 0) || (mode == 1 && side == 0)
     let bit : UInt64 := if isBuying then 2 else 1
     scanBatchSideMask ixPtr (i + 1) k (mask ||| bit)
   else
@@ -207,7 +208,7 @@ def quoteBatchOffersLoop (d ixPtr : Ptr) (effHalfSp i k : UInt64) : SolanaM Unit
     let maxQty      ← loadU64 oPtr 16
     let markP       ← loadU64 oPtr 32
     let maxMove     ← loadU64 oPtr 40
-    SolanaM.require ((mode == 0 || mode == 1) && maxQty > 0 && markP > 0) PErr.invalidParams
+    SolanaM.require ((mode == 0 || mode == 1 || mode == 4) && maxQty > 0 && markP > 0) PErr.invalidParams
 
     let maxFill ← loadU64 d PropOff.maxFillQty
     let fillQty := if maxQty < maxFill then maxQty else maxFill
@@ -216,7 +217,7 @@ def quoteBatchOffersLoop (d ixPtr : Ptr) (effHalfSp i k : UInt64) : SolanaM Unit
     let rawBps  ← checkedAdd64 effHalfSp imp
     let effBps  := if rawBps > maxMove then maxMove else rawBps
     let delta   ← mulDiv64 markP effBps BPS_DEN
-    let isBuying := (mode == 0 && takerIsLong != 0) || (mode == 1 && takerIsLong == 0)
+    let isBuying := (mode != 1 && takerIsLong != 0) || (mode == 1 && takerIsLong == 0)
     let execPrice ← if isBuying then
         checkedAdd64 markP delta
       else

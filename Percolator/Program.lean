@@ -1182,6 +1182,71 @@ def applyExecSpread (mData fLData fSData : Ptr) (qty execPrice : UInt64) : Solan
     SolanaM.fail PErr.invalidParams
   log64 EvtTag.trade ((mid <<< 8) ||| mode.toUInt64) qty execPrice (← loadU64 mData MktOff.markPrice)
 
+/-- Exact effective close-out quantity for `pflData`'s leg on `mid` if it holds `targetSide`:
+    returns `0` if flat/absent/opposite side, else `min oiSide (ceil(rLeg * oiSide / rawSide))`
+    so closing `closeCap` zeroes `rawBasis` completely even under arbitrary post-ADL ratios! -/
+def legCloseCapU64 (mData pflData : Ptr) (mid : UInt64) (targetSide : UInt8) : SolanaM UInt64 := do
+  let slot ← findLegLoop pflData mid 0
+  if slot >= MAX_LEGS then return 0
+  let lp := legPtrAt pflData slot
+  if (← loadU8 lp LegOff.side) != targetSide then return 0
+  let rLeg ← loadU64 lp LegOff.rawBasis
+  if rLeg == 0 then return 0
+  let oiSide  ← loadU64 mData (if targetSide == SIDE_LONG then MktOff.oiLong else MktOff.oiShort)
+  let rawSide ← loadU64 mData (if targetSide == SIDE_LONG then MktOff.rawBasisLong else MktOff.rawBasisShort)
+  if oiSide == 0 || rawSide == 0 then return 0
+  if oiSide == rawSide then return (if rLeg < oiSide then rLeg else oiSide)
+  let q ← mulDiv64Ceil rLeg oiSide rawSide
+  return (if q < oiSide then q else oiSide)
+
+/-- Mode 4 (`Trade` & `TradeWithMatcher`): Atomic Auto-Netted Buy/Sell + Position Flip!
+    `fBuyer` buys `qty` from `fSeller` at `execPrice` regardless of either side's existing position
+    (supports Open, Partial/Full Reduce against ANY counterparty, AND Long↔Short Atomic Flip!):
+      1. `cBoth = min(qty, min(closeB, closeS))` -> `tradeCore(mode=1, fSeller, fBuyer, cBoth)`
+      2. Remaining opposite leg on either side -> `tradeCore(mode=2/3, ...)` (OI-invariant hand-off!)
+      3. Any remaining net quantity -> `tradeCore(mode=0, fBuyer, fSeller, rem2)` (fresh OI!)
+    Every sub-step invokes the exact same verified `tradeCore` with identical spread direction
+    (`applyExecSpread mData fBuyer fSeller`), preserving 5-bucket conservation `C+I+R+S+F=V`,
+    per-market isolation, WindDown safety, and cross-margin IM/MM bounds! -/
+@[noinline] def tradeNettedCore (dData mData fBuyer fSeller argsPtr : Ptr) : SolanaM Unit := do
+  let mktKeyPtr ← loadU64 argsPtr 0
+  let qty       ← loadU64 argsPtr 16
+  let execPrice ← loadU64 argsPtr 24
+  SolanaM.require (qty > 0) PErr.invalidParams
+  let mid ← loadU64 mData MktOff.marketId
+  let closeB ← legCloseCapU64 mData fBuyer  mid SIDE_SHORT
+  let closeS ← legCloseCapU64 mData fSeller mid SIDE_LONG
+  let minCS  := if closeB < closeS then closeB else closeS
+  let cBoth  := if qty < minCS then qty else minCS
+  let subArgs ← stackAlloc 32
+  storeU64 subArgs 0  mktKeyPtr
+  storeU64 subArgs 24 execPrice
+  if cBoth > 0 then
+    storeU64 subArgs 8  1
+    storeU64 subArgs 16 cBoth
+    tradeCore dData mData fSeller fBuyer subArgs
+  let rem1 := qty - cBoth
+  let mut rem2 := rem1
+  if rem1 > 0 then
+    let remS ← legCloseCapU64 mData fSeller mid SIDE_LONG
+    let remB ← legCloseCapU64 mData fBuyer  mid SIDE_SHORT
+    if remS > 0 then
+      let cHo := if rem1 < remS then rem1 else remS
+      storeU64 subArgs 8  2
+      storeU64 subArgs 16 cHo
+      tradeCore dData mData fSeller fBuyer subArgs
+      rem2 := rem1 - cHo
+    else if remB > 0 then
+      let cHo := if rem1 < remB then rem1 else remB
+      storeU64 subArgs 8  3
+      storeU64 subArgs 16 cHo
+      tradeCore dData mData fBuyer fSeller subArgs
+      rem2 := rem1 - cHo
+  if rem2 > 0 then
+    storeU64 subArgs 8  0
+    storeU64 subArgs 16 rem2
+    tradeCore dData mData fBuyer fSeller subArgs
+
 def handleTrade (input : Ptr) : SolanaM Unit := do
   let (dex, mkt, pflL, ownerL, pflS, ownerS, ix, progId) ← parse6 input
   SolanaM.require (ix.len >= 10) Err.invalidInstructionData
@@ -1211,7 +1276,10 @@ def handleTrade (input : Ptr) : SolanaM Unit := do
   storeU64 args 8  mode.toUInt64
   storeU64 args 16 qty
   storeU64 args 24 execPrice
-  tradeCore dData mData fLData fSData args
+  if mode == 4 then
+    tradeNettedCore dData mData fLData fSData args
+  else
+    tradeCore dData mData fLData fSData args
 
 /-- Fair, transparent $O(1)$ liquidation supporting:
     - Partial OR full liquidation (`reqQty = 0` → full leg; `reqQty > 0` → partial `min(reqQty, rawB)`),
@@ -1812,7 +1880,7 @@ def prepMatcherOffersLoop (curMkt ctxBuf : Ptr) (i : UInt64) : SolanaM Ptr := do
       let takerIsLong ← loadU8  ixPtr (ixOff + 1)
       let maxQty      ← loadU64 ixPtr (ixOff + 2)
       let limitPrice  ← loadU64 ixPtr (ixOff + 10)
-      SolanaM.require ((mode == 0 || mode == 1) && maxQty > 0) PErr.invalidParams
+      SolanaM.require ((mode == 0 || mode == 1 || mode == 4) && maxQty > 0) PErr.invalidParams
 
       let rOff := reqBuf + 32 + i * 48
       storeU8  rOff 0  mode
@@ -1854,7 +1922,7 @@ def settleMatcherOffersLoop (dData takerData lpData ctxBuf : Ptr) (i : UInt64) :
       let maxQty      ← loadU64 ixPtr (ixOff + 2)
       let limitPrice  ← loadU64 ixPtr (ixOff + 10)
       let takerIsBuying : UInt8 :=
-        if (mode == 0 && takerIsLong != 0) || (mode == 1 && takerIsLong == 0) then 1 else 0
+        if (mode != 1 && takerIsLong != 0) || (mode == 1 && takerIsLong == 0) then 1 else 0
       let (execPrice, fillQty) ← validateMatcherLeg (mcData + 16 + i * 16) maxQty limitPrice takerIsBuying
       let fLData := if takerIsLong != 0 then takerData else lpData
       let fSData := if takerIsLong != 0 then lpData    else takerData
@@ -1862,7 +1930,10 @@ def settleMatcherOffersLoop (dData takerData lpData ctxBuf : Ptr) (i : UInt64) :
       storeU64 argsBuf 8  mode.toUInt64
       storeU64 argsBuf 16 fillQty
       storeU64 argsBuf 24 execPrice
-      tradeCore dData (AccountView.dataPtr mkt) fLData fSData argsBuf
+      if mode == 4 then
+        tradeNettedCore dData (AccountView.dataPtr mkt) fLData fSData argsBuf
+      else
+        tradeCore dData (AccountView.dataPtr mkt) fLData fSData argsBuf
       settleMatcherOffersLoop dData takerData lpData ctxBuf (i + 1)
     else
       return ()

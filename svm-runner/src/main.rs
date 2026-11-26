@@ -29,6 +29,8 @@ const REW_SIZE: usize = 400;
 const EPOCH_SIZE: usize = 104;
 const BID_SIZE: usize = 120;
 const PROP_AMM_SIZE: usize = 208;
+const HLP_SIZE: usize = 200;
+const HLP_REC_SIZE: usize = 88;
 const MAX_LEGS: usize = 8;
 const LEG_HEADER: usize = 144;
 const LEG_STRIDE: usize = 96;
@@ -603,6 +605,139 @@ fn ix_update_prop_amm(
         accounts: vec![
             AccountMeta::new(ctx, false),
             AccountMeta::new_readonly(owner, true),
+        ],
+        data,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ix_init_hlp_vault(
+    hlp_prog: Address, vault: Address, strategist: Address, dex: Address,
+    hlp_pfl: Address, hlp_auth_pda: Address, hlp_fee_tok: Address, perc_prog: Address,
+    bump: u8, lockup_slots: u64, deposit_cap: u64, min_deposit: u64,
+) -> Instruction {
+    let mut data = vec![0u8; 28];
+    data[0] = 0;
+    data[1] = bump;
+    data[4..12].copy_from_slice(&lockup_slots.to_le_bytes());
+    data[12..20].copy_from_slice(&deposit_cap.to_le_bytes());
+    data[20..28].copy_from_slice(&min_deposit.to_le_bytes());
+    Instruction {
+        program_id: hlp_prog,
+        accounts: vec![
+            AccountMeta::new(vault, false),
+            AccountMeta::new_readonly(strategist, true),
+            AccountMeta::new(dex, false),
+            AccountMeta::new(hlp_pfl, false),
+            AccountMeta::new_readonly(hlp_auth_pda, false),
+            AccountMeta::new_readonly(hlp_fee_tok, false),
+            AccountMeta::new_readonly(perc_prog, false),
+        ],
+        data,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ix_set_hlp_matcher(
+    hlp_prog: Address, vault: Address, strategist: Address,
+    hlp_pfl: Address, hlp_auth_pda: Address, perc_prog: Address,
+    matcher_ctx: Option<Address>, paused: Option<u8>,
+) -> Instruction {
+    let mut data = vec![1u8];
+    if let Some(p) = paused { data.push(p); }
+    let mut accounts = vec![
+        AccountMeta::new(vault, false),
+        AccountMeta::new_readonly(strategist, true),
+        AccountMeta::new(hlp_pfl, false),
+        AccountMeta::new_readonly(hlp_auth_pda, false),
+        AccountMeta::new_readonly(perc_prog, false),
+    ];
+    if let Some(mc) = matcher_ctx {
+        accounts.push(AccountMeta::new_readonly(mc, false));
+    }
+    Instruction { program_id: hlp_prog, accounts, data }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ix_deposit_hlp(
+    hlp_prog: Address, vault: Address, receipt: Address, depositor: Address,
+    depositor_tok: Address, dex: Address, hlp_pfl: Address, mint: Address,
+    dex_vault: Address, tok_prog: Address, perc_prog: Address, amount: u64,
+) -> Instruction {
+    let mut data = vec![0u8; 9];
+    data[0] = 2;
+    data[1..9].copy_from_slice(&amount.to_le_bytes());
+    Instruction {
+        program_id: hlp_prog,
+        accounts: vec![
+            AccountMeta::new(vault, false),
+            AccountMeta::new(receipt, false),
+            AccountMeta::new_readonly(depositor, true),
+            AccountMeta::new(depositor_tok, false),
+            AccountMeta::new(dex, false),
+            AccountMeta::new(hlp_pfl, false),
+            AccountMeta::new_readonly(mint, false),
+            AccountMeta::new(dex_vault, false),
+            AccountMeta::new_readonly(tok_prog, false),
+            AccountMeta::new_readonly(perc_prog, false),
+        ],
+        data,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ix_withdraw_hlp(
+    hlp_prog: Address, vault: Address, receipt: Address, owner: Address,
+    dest_tok: Address, dex: Address, hlp_pfl: Address, hlp_auth_pda: Address,
+    mint: Address, dex_vault: Address, tok_prog: Address, perc_prog: Address, burn_shares: u64,
+) -> Instruction {
+    let mut data = vec![0u8; 9];
+    data[0] = 3;
+    data[1..9].copy_from_slice(&burn_shares.to_le_bytes());
+    Instruction {
+        program_id: hlp_prog,
+        accounts: vec![
+            AccountMeta::new(vault, false),
+            AccountMeta::new(receipt, false),
+            AccountMeta::new(owner, true),
+            AccountMeta::new(dest_tok, false),
+            AccountMeta::new(dex, false),
+            AccountMeta::new(hlp_pfl, false),
+            AccountMeta::new_readonly(hlp_auth_pda, false),
+            AccountMeta::new_readonly(mint, false),
+            AccountMeta::new(dex_vault, false),
+            AccountMeta::new_readonly(tok_prog, false),
+            AccountMeta::new_readonly(perc_prog, false),
+        ],
+        data,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ix_hlp_takeover_liquidate(
+    hlp_prog: Address, vault: Address, strategist: Address, dex: Address,
+    mkt: Address, victim_pfl: Address, hlp_fee_tok: Address, mint: Address,
+    dex_vault: Address, tok_prog: Address, hlp_pfl: Address, hlp_auth_pda: Address,
+    perc_prog: Address, req_qty: u64,
+) -> Instruction {
+    let mut data = vec![0u8; 9];
+    data[0] = 4;
+    data[1..9].copy_from_slice(&req_qty.to_le_bytes());
+    Instruction {
+        program_id: hlp_prog,
+        accounts: vec![
+            AccountMeta::new_readonly(vault, false),
+            AccountMeta::new_readonly(strategist, true),
+            AccountMeta::new(dex, false),
+            AccountMeta::new(mkt, false),
+            AccountMeta::new(victim_pfl, false),
+            AccountMeta::new(hlp_fee_tok, false),
+            AccountMeta::new_readonly(mint, false),
+            AccountMeta::new(dex_vault, false),
+            AccountMeta::new_readonly(tok_prog, false),
+            AccountMeta::new(hlp_pfl, false),
+            AccountMeta::new_readonly(hlp_auth_pda, false),
+            AccountMeta::new_readonly(perc_prog, false),
         ],
         data,
     }
@@ -3832,7 +3967,230 @@ fn main() {
     assert_dex_invariants(&svm, &r_dex, &r_vault, &r_mkts, &[r_trader_pfl, r_mm_pfl, prop_lp_pfl, prop_taker_pfl], "suite14-final");
     println!("[PASS] Suite 14: Unified Single/Multi-Market CPI-Out PropAMM (0 Signer Deleg., 1-CPI k=2 & k=5 Mixed Long/Short Hedged Discount, 12 Attacks Blocked, k=1={}/{} CU, k=2={} CU, k=5 open/close={}/{} CU)", cu_pm_open, cu_pm_close, cu_pm_batch2, cu_pm_batch5, cu_pm_batch5_close);
 
+    // =========================================================================
+    // SUITE 15: ATOMIC SINGLE-TRADE POSITION FLIP (mode=4) & PERMISSIONLESS HLP VAULT!
+    //   15A. Direct `Trade(mode=4)`: Long 2 -> Short 3 atomic flip in 1 ix, cross-LP close
+    //        against a FLAT counterparty (auto mode=3 hand-off!), Short 2 -> Long 3 flip vs flat LP!
+    //   15B. Multi-market `TradeWithMatcher` (`k=3, mode=4`): atomic 3-market basket flip
+    //        (Long/Short/Long -> Short/Long/Short in ONE ix & ONE 0-signer CPI with 50% hedged discount)!
+    //   15C. External Permissionless `hlp_vault.so` (ZERO core changes!):
+    //        - PR #4 shareless donation capture blocked (dead-share lock!)
+    //        - Lockup & stale-NAV front-running blocked (`Custom(501)`, `Custom(122)`)
+    //        - Strategist binds PropAMM (`SetHlpMatcher`), earns spreads via `TradeWithMatcher(mode=4)`
+    //        - Strategist executes Zero-ADL `HlpTakeoverLiquidate` (100% keeper fee auto-compounded into HLP!)
+    //        - Even when strategist pauses deposits (`paused=1`), LPs withdraw 100% principal + spreads + liq fees
+    //          AND auto-close `HlpReceipt` with 100% rent lamport refund!
+    // =========================================================================
+    let hlp_path = std::env::args()
+        .nth(6)
+        .unwrap_or_else(|| "build/hlp_vault.so".to_string());
+    let hlp_elf = std::fs::read(&hlp_path).unwrap_or_else(|e| panic!("Failed to read {}: {}", hlp_path, e));
+    let hlp_prog = Keypair::new().pubkey();
+    svm.add_program(hlp_prog, &hlp_elf).expect("hlp_vault ELF load failed");
+
+    // Isolated fresh DEX for Suite 15 so all invariant checks are self-contained
+    let h_dex = create_prog_acc(&mut svm, &prog_id, DEX_SIZE);
+    let (h_vault, h_vbump) = derive_dex_vault(&prog_id, &h_dex);
+    let h_orc = Keypair::new();
+    let h_strat = Keypair::new();
+    let h_lp1 = Keypair::new();
+    let h_lp2 = Keypair::new();
+    let h_taker = Keypair::new();
+    let h_flat_lp = Keypair::new();
+    let h_victim = Keypair::new();
+    for kp in [&h_orc, &h_strat, &h_lp1, &h_lp2, &h_taker, &h_flat_lp, &h_victim] {
+        svm.airdrop(&kp.pubkey(), 10_000_000_000).unwrap();
+    }
+    send_ok(&mut svm, ix_init_dex(prog_id, h_dex, dex_admin.pubkey(), mint, h_vault, fee_vault, TOKEN_PROGRAM_ID, SYSTEM_PROGRAM_ID, h_vbump, 6, 0, SPL_TOKEN_RENT_MIN), &payer, &[&payer, &dex_admin]);
+
+    let mut h_mkts: Vec<Address> = Vec::new();
+    for _ in 0..3 {
+        let m = create_prog_acc(&mut svm, &prog_id, MKT_SIZE);
+        send_ok(&mut svm, ix_create_market(
+            prog_id, h_dex, m, mint, h_orc.pubkey(), dex_admin.pubkey(), admin_tok, fee_vault,
+            100 * POS_SCALE, 20, 500, 0, 1000, 500, 100, 0, 95, 2500, 1_000_000 * POS_SCALE,
+        ), &payer, &[&payer, &dex_admin]);
+        h_mkts.push(m);
+    }
+
+    let h_taker_tok = create_tok_acc(&mut svm, &mint, &h_taker.pubkey(), 5_000 * POS_SCALE);
+    let h_flat_tok  = create_tok_acc(&mut svm, &mint, &h_flat_lp.pubkey(), 5_000 * POS_SCALE);
+    let h_lp1_tok   = create_tok_acc(&mut svm, &mint, &h_lp1.pubkey(), 5_000 * POS_SCALE);
+    let h_lp2_tok   = create_tok_acc(&mut svm, &mint, &h_lp2.pubkey(), 5_000 * POS_SCALE);
+    let h_vic_tok   = create_tok_acc(&mut svm, &mint, &h_victim.pubkey(), 5_000 * POS_SCALE);
+    let h_atk_tok   = create_tok_acc(&mut svm, &mint, &attacker.pubkey(), 5_000 * POS_SCALE);
+
+    let h_taker_pfl = create_prog_acc(&mut svm, &prog_id, PFL_SIZE);
+    let h_flat_pfl  = create_prog_acc(&mut svm, &prog_id, PFL_SIZE);
+    let h_vic_pfl   = create_prog_acc(&mut svm, &prog_id, PFL_SIZE);
+    for (pfl, kp, tok, dep) in [
+        (h_taker_pfl, &h_taker, h_taker_tok, 1_000 * POS_SCALE),
+        (h_flat_pfl,  &h_flat_lp, h_flat_tok, 1_000 * POS_SCALE),
+        (h_vic_pfl,   &h_victim, h_vic_tok, 105 * POS_SCALE),
+    ] {
+        send_ok(&mut svm, ix_init_portfolio(prog_id, h_dex, pfl, kp.pubkey()), &payer, &[&payer, kp]);
+        send_ok(&mut svm, ix_deposit_collateral(prog_id, h_dex, pfl, kp.pubkey(), tok, mint, h_vault, TOKEN_PROGRAM_ID, dep), &payer, &[&payer, kp]);
+    }
+
+    // 15A. Direct Trade(mode=4): Atomic Long 2 -> Short 3 flip, plus cross-LP close & flip vs FLAT LP!
+    let h_cp1 = Keypair::new();
+    svm.airdrop(&h_cp1.pubkey(), 1_000_000_000).unwrap();
+    let h_cp1_tok = create_tok_acc(&mut svm, &mint, &h_cp1.pubkey(), 2_000 * POS_SCALE);
+    let h_cp1_pfl = create_prog_acc(&mut svm, &prog_id, PFL_SIZE);
+    send_ok(&mut svm, ix_init_portfolio(prog_id, h_dex, h_cp1_pfl, h_cp1.pubkey()), &payer, &[&payer, &h_cp1]);
+    send_ok(&mut svm, ix_deposit_collateral(prog_id, h_dex, h_cp1_pfl, h_cp1.pubkey(), h_cp1_tok, mint, h_vault, TOKEN_PROGRAM_ID, 1_000 * POS_SCALE), &payer, &[&payer, &h_cp1]);
+
+    // Open Long 2.0 on h_taker vs Short 2.0 on h_cp1 via mode=4!
+    send_ok(&mut svm, ix_trade(prog_id, h_dex, h_mkts[0], h_taker_pfl, h_taker.pubkey(), h_cp1_pfl, h_cp1.pubkey(), 4, 2 * POS_SCALE), &payer, &[&payer, &h_taker, &h_cp1]);
+    assert_eq!(read_u8(&svm, &h_taker_pfl, LEG_HEADER + 1), 1, "Taker opened Long via mode=4");
+    assert_eq!(read_u64(&svm, &h_taker_pfl, LEG_HEADER + 48), 2 * POS_SCALE);
+
+    // Atomic Flip: h_cp1 buys 5.0 from h_taker in ONE instruction (closes 2.0 + flips h_taker to Short 3.0, h_cp1 to Long 3.0)!
+    let cu_direct_flip = send_ok(&mut svm, ix_trade(prog_id, h_dex, h_mkts[0], h_cp1_pfl, h_cp1.pubkey(), h_taker_pfl, h_taker.pubkey(), 4, 5 * POS_SCALE), &payer, &[&payer, &h_cp1, &h_taker]);
+    assert_eq!(read_u8(&svm, &h_taker_pfl, LEG_HEADER + 1), 2, "Taker atomically flipped Long 2 -> Short 3!");
+    assert_eq!(read_u64(&svm, &h_taker_pfl, LEG_HEADER + 48), 3 * POS_SCALE);
+    assert_eq!(read_u8(&svm, &h_cp1_pfl, LEG_HEADER + 1), 1, "CP1 atomically flipped Short 2 -> Long 3!");
+    assert_eq!(read_u64(&svm, &h_cp1_pfl, LEG_HEADER + 48), 3 * POS_SCALE);
+
+    // Cross-LP Atomic Flip vs brand-new FLAT LP (`h_flat_pfl` has 0 position!):
+    //   h_taker buys 5.0 from FLAT h_flat_pfl -> auto mode=3 hands off Short 3.0 to h_flat_pfl + mode=0 opens Long 2.0 on h_taker (Short 5.0 on h_flat_pfl)!
+    send_ok(&mut svm, ix_trade(prog_id, h_dex, h_mkts[0], h_taker_pfl, h_taker.pubkey(), h_flat_pfl, h_flat_lp.pubkey(), 4, 5 * POS_SCALE), &payer, &[&payer, &h_taker, &h_flat_lp]);
+    assert_eq!(read_u8(&svm, &h_taker_pfl, LEG_HEADER + 1), 1, "Taker flipped Short 3 -> Long 2 against FLAT LP!");
+    assert_eq!(read_u64(&svm, &h_taker_pfl, LEG_HEADER + 48), 2 * POS_SCALE);
+    assert_eq!(read_u8(&svm, &h_flat_pfl, LEG_HEADER + 1), 2, "Flat LP absorbed Short 3 + opened Short 2 = Short 5!");
+    assert_eq!(read_u64(&svm, &h_flat_pfl, LEG_HEADER + 48), 5 * POS_SCALE);
+    assert_eq!(read_u64(&svm, &h_mkts[0], 256), 5 * POS_SCALE, "OI grew cleanly from 3 -> 5 (hand-off 3 OI-invariant + open 2)!");
+    // Cleanly close h_taker & h_cp1 & h_flat_pfl back to 0 on mkt0
+    send_ok(&mut svm, ix_trade(prog_id, h_dex, h_mkts[0], h_flat_pfl, h_flat_lp.pubkey(), h_taker_pfl, h_taker.pubkey(), 4, 2 * POS_SCALE), &payer, &[&payer, &h_flat_lp, &h_taker]);
+    send_ok(&mut svm, ix_trade(prog_id, h_dex, h_mkts[0], h_flat_pfl, h_flat_lp.pubkey(), h_cp1_pfl, h_cp1.pubkey(), 4, 3 * POS_SCALE), &payer, &[&payer, &h_flat_lp, &h_cp1]);
+    assert_eq!(read_u64(&svm, &h_mkts[0], 256), 0, "Mkt0 returned cleanly to 0 OI!");
+
+    // 15C. External Permissionless HLP Vault (`hlp_vault.so`) + Multi-Market PropAMM Flip (`mode=4`)!
+    let hlp_vault = create_prog_acc(&mut svm, &hlp_prog, HLP_SIZE);
+    let (hlp_pda, hlp_bump) = Address::find_program_address(&[b"hlpv", hlp_vault.as_ref()], &hlp_prog);
+    let hlp_pfl = create_prog_acc(&mut svm, &prog_id, PFL_SIZE);
+    let hlp_fee_tok = create_tok_acc(&mut svm, &mint, &hlp_pda, 0);
+    let hlp_prop_ctx = create_prog_acc(&mut svm, &matcher_prog, PROP_AMM_SIZE);
+    send_ok(&mut svm, ix_init_prop_amm(matcher_prog, hlp_prop_ctx, h_strat.pubkey(), 0, 20, 10, 10 * POS_SCALE), &payer, &[&payer, &h_strat]);
+
+    let cu_hlp_init = send_ok(&mut svm, ix_init_hlp_vault(
+        hlp_prog, hlp_vault, h_strat.pubkey(), h_dex, hlp_pfl, hlp_pda, hlp_fee_tok, prog_id,
+        hlp_bump, 10, 0, POS_SCALE,
+    ), &payer, &[&payer, &h_strat]);
+
+    // Attack 1 (PR #4 Shareless Donation Capture): attacker donates $10 directly to hlp_pfl while totalShares == 0,
+    // then deposits $5 via DepositHlp -> $10 is locked behind 10M dead shares, attacker ONLY gets $5 back!
+    send_ok(&mut svm, ix_deposit_collateral(prog_id, h_dex, hlp_pfl, attacker.pubkey(), h_atk_tok, mint, h_vault, TOKEN_PROGRAM_ID, 10 * POS_SCALE), &payer, &[&payer, &attacker]);
+    let atk_rec = create_prog_acc(&mut svm, &hlp_prog, HLP_REC_SIZE);
+    let atk_tok_pre = token_amount(&svm, &h_atk_tok);
+    send_ok(&mut svm, ix_deposit_hlp(hlp_prog, hlp_vault, atk_rec, attacker.pubkey(), h_atk_tok, h_dex, hlp_pfl, mint, h_vault, TOKEN_PROGRAM_ID, prog_id, 5 * POS_SCALE), &payer, &[&payer, &attacker]);
+    assert_eq!(read_u64(&svm, &hlp_vault, 184), 15 * POS_SCALE, "HLP locked 10M direct donation behind dead shares + 5M attacker shares!");
+    assert_eq!(read_u64(&svm, &atk_rec, 72), 5 * POS_SCALE);
+
+    // Attack 2 (Lockup enforcement): withdraw before +10 slots REJECTED (Custom(501))!
+    send_err_custom(&mut svm, ix_withdraw_hlp(
+        hlp_prog, hlp_vault, atk_rec, attacker.pubkey(), h_atk_tok, h_dex, hlp_pfl, hlp_pda, mint, h_vault, TOKEN_PROGRAM_ID, prog_id, 5 * POS_SCALE,
+    ), &payer, &[&payer, &attacker], 501, "HLP lockup blocks early withdraw");
+    let sl_unlock = get_slot(&svm) + 10;
+    set_slot(&mut svm, sl_unlock);
+    let atk_lam_pre = svm.get_account(&attacker.pubkey()).unwrap().lamports;
+    let atk_rec_lam = svm.get_account(&atk_rec).unwrap().lamports;
+    send_ok(&mut svm, ix_withdraw_hlp(
+        hlp_prog, hlp_vault, atk_rec, attacker.pubkey(), h_atk_tok, h_dex, hlp_pfl, hlp_pda, mint, h_vault, TOKEN_PROGRAM_ID, prog_id, 5 * POS_SCALE,
+    ), &payer, &[&payer, &attacker]);
+    assert_eq!(token_amount(&svm, &h_atk_tok), atk_tok_pre, "PR #4 blocked: attacker recovered ONLY $5 (0 stolen donation!)");
+    assert_eq!(svm.get_account(&attacker.pubkey()).unwrap().lamports, atk_lam_pre + atk_rec_lam, "WithdrawHlp auto-closed empty HlpReceipt & refunded 100% rent!");
+
+    // LP1 ($500) & LP2 ($500) deposit into HLP Vault!
+    let lp1_rec = create_prog_acc(&mut svm, &hlp_prog, HLP_REC_SIZE);
+    let lp2_rec = create_prog_acc(&mut svm, &hlp_prog, HLP_REC_SIZE);
+    let cu_hlp_dep = send_ok(&mut svm, ix_deposit_hlp(hlp_prog, hlp_vault, lp1_rec, h_lp1.pubkey(), h_lp1_tok, h_dex, hlp_pfl, mint, h_vault, TOKEN_PROGRAM_ID, prog_id, 500 * POS_SCALE), &payer, &[&payer, &h_lp1]);
+    send_ok(&mut svm, ix_deposit_hlp(hlp_prog, hlp_vault, lp2_rec, h_lp2.pubkey(), h_lp2_tok, h_dex, hlp_pfl, mint, h_vault, TOKEN_PROGRAM_ID, prog_id, 500 * POS_SCALE), &payer, &[&payer, &h_lp2]);
+    assert_eq!(read_u64(&svm, &hlp_pfl, 88), 1_010 * POS_SCALE, "HLP Portfolio funded with $1,010!");
+
+    // Strategist binds PropAMM (`SetHlpMatcher`, Op 1); unauthorized attacker rejected (Custom(102))!
+    send_err_custom(&mut svm, ix_set_hlp_matcher(hlp_prog, hlp_vault, attacker.pubkey(), hlp_pfl, hlp_pda, prog_id, Some(hlp_prop_ctx), None), &payer, &[&payer, &attacker], 102, "Non-strategist SetHlpMatcher rejected");
+    send_ok(&mut svm, ix_set_hlp_matcher(hlp_prog, hlp_vault, h_strat.pubkey(), hlp_pfl, hlp_pda, prog_id, Some(hlp_prop_ctx), None), &payer, &[&payer, &h_strat]);
+
+    // 15B. Multi-Market (`k=3`) PropAMM Atomic Basket Flip against HLP Vault (`mode=4`)!
+    //   1) Taker opens [Long m0 (2), Short m1 (2), Long m2 (2)] vs HLP Vault in ONE ix!
+    let hlp_cap_pre_mm = read_u64(&svm, &hlp_pfl, 88);
+    send_ok(&mut svm, ix_trade_with_matcher_batch(
+        prog_id, h_dex, h_taker_pfl, h_taker.pubkey(), hlp_pfl, matcher_prog, hlp_prop_ctx,
+        &[(h_mkts[0], 4, true, 2 * POS_SCALE, 101 * POS_SCALE), (h_mkts[1], 4, false, 2 * POS_SCALE, 99 * POS_SCALE), (h_mkts[2], 4, true, 2 * POS_SCALE, 101 * POS_SCALE)], None,
+    ), &payer, &[&payer, &h_taker]);
+    assert_eq!(read_u8(&svm, &h_taker_pfl, 4), 3, "Taker opened 3 legs vs HLP via mode=4!");
+
+    //   2) Attack 3 (Stale-NAV front-running): advance 1 slot -> DepositHlp & WithdrawHlp MUST reject (Custom(122))!
+    let sl_stale = get_slot(&svm) + 1;
+    set_slot(&mut svm, sl_stale);
+    send_err_custom(&mut svm, ix_deposit_hlp(hlp_prog, hlp_vault, lp1_rec, h_lp1.pubkey(), h_lp1_tok, h_dex, hlp_pfl, mint, h_vault, TOKEN_PROGRAM_ID, prog_id, POS_SCALE), &payer, &[&payer, &h_lp1], 122, "HLP blocks DepositHlp with stale open leg");
+
+    //   3) Atomic 3-Market Flip in ONE tx after slot advance (atomic [RefreshLeg(m1,m2) + TradeWithMatcher(k=3, mode=4)]!)
+    //      Taker flips ALL 3 positions simultaneously: [Long 2 -> Short 2, Short 2 -> Long 2, Long 2 -> Short 2] (qty=4 each, hedged 50% discount)!
+    let cu_batch3_flip = send_ixs_ok(&mut svm, &[
+        ix_refresh_leg(prog_id, h_dex, h_mkts[1], h_taker_pfl, false),
+        ix_refresh_leg(prog_id, h_dex, h_mkts[2], h_taker_pfl, false),
+        ix_refresh_leg(prog_id, h_dex, h_mkts[1], hlp_pfl, false),
+        ix_refresh_leg(prog_id, h_dex, h_mkts[2], hlp_pfl, false),
+        ix_trade_with_matcher_batch(
+            prog_id, h_dex, h_taker_pfl, h_taker.pubkey(), hlp_pfl, matcher_prog, hlp_prop_ctx,
+            &[(h_mkts[0], 4, false, 4 * POS_SCALE, 99 * POS_SCALE), (h_mkts[1], 4, true, 4 * POS_SCALE, 101 * POS_SCALE), (h_mkts[2], 4, false, 4 * POS_SCALE, 99 * POS_SCALE)], None,
+        ),
+    ], &payer, &[&payer, &h_taker]);
+    assert_eq!(read_u8(&svm, &h_taker_pfl, 4), 3, "Taker still holds all 3 flipped legs!");
+    // Close all 3 taker legs vs HLP Vault cleanly (mode=4) so HLP realized spreads!
+    send_ok(&mut svm, ix_trade_with_matcher_batch(
+        prog_id, h_dex, h_taker_pfl, h_taker.pubkey(), hlp_pfl, matcher_prog, hlp_prop_ctx,
+        &[(h_mkts[0], 4, true, 2 * POS_SCALE, 101 * POS_SCALE), (h_mkts[1], 4, false, 2 * POS_SCALE, 99 * POS_SCALE), (h_mkts[2], 4, true, 2 * POS_SCALE, 101 * POS_SCALE)], None,
+    ), &payer, &[&payer, &h_taker]);
+    assert_eq!(read_u8(&svm, &hlp_pfl, 4), 0, "HLP flat after taker round-trip!");
+    let hlp_cap_post_mm = read_u64(&svm, &hlp_pfl, 88);
+    assert!(hlp_cap_post_mm > hlp_cap_pre_mm, "HLP Vault earned real PropAMM spreads across open + atomic 3-market flip + close!");
+
+    // 15D. Zero-ADL HLP Liquidation Takeover (`HlpTakeoverLiquidate`, Op 4) with 100% auto-compounded keeper fee!
+    //   Victim opens Long 10.0 on mkt0 vs h_cp1 ($105 capital -> IM=$100, MM=$50); price drops $100 -> $94 -> underwater!
+    send_ok(&mut svm, ix_trade(prog_id, h_dex, h_mkts[0], h_vic_pfl, h_victim.pubkey(), h_cp1_pfl, h_cp1.pubkey(), 0, 10 * POS_SCALE), &payer, &[&payer, &h_victim, &h_cp1]);
+    step_oracle(&mut svm, prog_id, h_mkts[0], &h_orc, 94 * POS_SCALE, &payer);
+    let hlp_cap_pre_liq = read_u64(&svm, &hlp_pfl, 88);
+    let cu_hlp_liq = send_ok(&mut svm, ix_hlp_takeover_liquidate(
+        hlp_prog, hlp_vault, h_strat.pubkey(), h_dex, h_mkts[0], h_vic_pfl, hlp_fee_tok,
+        mint, h_vault, TOKEN_PROGRAM_ID, hlp_pfl, hlp_pda, prog_id, 0,
+    ), &payer, &[&payer, &h_strat]);
+    assert_eq!(read_u64(&svm, &h_mkts[0], 288), ADL_ONE, "HLP takeover caused ZERO ADL on longs!");
+    assert_eq!(read_u64(&svm, &h_mkts[0], 296), ADL_ONE, "HLP takeover caused ZERO ADL on shorts!");
+    assert_eq!(token_amount(&svm, &hlp_fee_tok), 0, "100% of keeper liquidation fee swept from hlpFeeTok into hlpPfl!");
+    let hlp_cap_post_liq = read_u64(&svm, &hlp_pfl, 88);
+    assert!(hlp_cap_post_liq > hlp_cap_pre_liq, "HLP Portfolio capital grew directly from auto-compounded liquidation takeover fee!");
+    // Close HLP's taken-over Long 10.0 cleanly against h_cp1 at mark so LPs can withdraw 100%!
+    send_ok(&mut svm, ix_trade_with_matcher(prog_id, h_dex, h_mkts[0], h_cp1_pfl, h_cp1.pubkey(), hlp_pfl, matcher_prog, hlp_prop_ctx, None, 4, true, 10 * POS_SCALE, 96 * POS_SCALE), &payer, &[&payer, &h_cp1]);
+    assert_eq!(read_u8(&svm, &hlp_pfl, 4), 0, "HLP closed taken-over position cleanly!");
+
+    // 15E. Attack 4 (Strategist cannot pause withdrawals!): strategist pauses deposits (`paused=1`) ->
+    //      DepositHlp blocked (Custom(500)), YET LP1 & LP2 withdraw 100% of principal + ALL compounded yield + rent!
+    send_ok(&mut svm, ix_set_hlp_matcher(hlp_prog, hlp_vault, h_strat.pubkey(), hlp_pfl, hlp_pda, prog_id, None, Some(1)), &payer, &[&payer, &h_strat]);
+    let sl_done = get_slot(&svm) + 10;
+    set_slot(&mut svm, sl_done);
+    send_err_custom(&mut svm, ix_deposit_hlp(hlp_prog, hlp_vault, lp1_rec, h_lp1.pubkey(), h_lp1_tok, h_dex, hlp_pfl, mint, h_vault, TOKEN_PROGRAM_ID, prog_id, POS_SCALE), &payer, &[&payer, &h_lp1], 500, "Paused HLP blocks new deposits");
+
+    let lp1_tok_pre = token_amount(&svm, &h_lp1_tok);
+    let lp2_tok_pre = token_amount(&svm, &h_lp2_tok);
+    let lp1_sh = read_u64(&svm, &lp1_rec, 72);
+    let lp2_sh = read_u64(&svm, &lp2_rec, 72);
+    let cu_hlp_wdr = send_ok(&mut svm, ix_withdraw_hlp(hlp_prog, hlp_vault, lp1_rec, h_lp1.pubkey(), h_lp1_tok, h_dex, hlp_pfl, hlp_pda, mint, h_vault, TOKEN_PROGRAM_ID, prog_id, lp1_sh), &payer, &[&payer, &h_lp1]);
+    send_ok(&mut svm, ix_withdraw_hlp(hlp_prog, hlp_vault, lp2_rec, h_lp2.pubkey(), h_lp2_tok, h_dex, hlp_pfl, hlp_pda, mint, h_vault, TOKEN_PROGRAM_ID, prog_id, lp2_sh), &payer, &[&payer, &h_lp2]);
+    let lp1_out = token_amount(&svm, &h_lp1_tok) - lp1_tok_pre;
+    let lp2_out = token_amount(&svm, &h_lp2_tok) - lp2_tok_pre;
+    assert!(lp1_out > 500 * POS_SCALE, "LP1 withdrew >$500 principal (earned PropAMM spreads + liq fees = {})!", lp1_out);
+    assert!(lp2_out > 500 * POS_SCALE, "LP2 withdrew >$500 principal (earned PropAMM spreads + liq fees = {})!", lp2_out);
+    assert_dex_invariants(&svm, &h_dex, &h_vault, &h_mkts, &[h_taker_pfl, h_flat_pfl, h_vic_pfl, h_cp1_pfl, hlp_pfl], "suite15-final");
+    println!(
+        "[PASS] Suite 15: Atomic Position Flip (mode=4, direct={} CU, k=3 PropAMM flip={} CU) + External HLP Vault ({} B, init={} dep={} liq={} wdr={} CU, LP1/LP2 profit=+{}/+{} uUSDC, 0 ADL, 0 rug!)",
+        cu_direct_flip, cu_batch3_flip, hlp_elf.len(), cu_hlp_init, cu_hlp_dep, cu_hlp_liq, cu_hlp_wdr,
+        lp1_out - 500 * POS_SCALE, lp2_out - 500 * POS_SCALE
+    );
+
     println!("==================================================================================");
-    println!("  ALL 14 PERCOLATOR-LEAN VERIFICATION + BORING EXCHANGE + 8-LEG + REWARD + PROPAMM SUITES PASSED 100%!");
+    println!("  ALL 15 PERCOLATOR-LEAN VERIFICATION + BORING EXCHANGE + 8-LEG + REWARD + PROPAMM + FLIP + HLP SUITES PASSED 100%!");
     println!("==================================================================================");
 }

@@ -32,7 +32,7 @@ def handleEvil (input : Ptr) : SolanaM Unit := do
   let maxQty      ← loadU64 ix.ptr 48
   let limitPrice  ← loadU64 ix.ptr 56
   let markP       ← loadU64 ix.ptr 64
-  let isBuying := (mode == 0 && takerIsLong != 0) || (mode == 1 && takerIsLong == 0)
+  let isBuying := (mode != 1 && takerIsLong != 0) || (mode == 1 && takerIsLong == 0)
   if attackMode == 0 then
     storeU32 d 0  MAGIC_MRET
     storeU32 d 4  0

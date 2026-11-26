@@ -20,6 +20,7 @@ import Percolator.Program
 import Percolator.Matcher
 import Percolator.OracleAdapter
 import Percolator.RewardModule
+import Percolator.HlpVault
 
 namespace Percolator.Refinement
 
@@ -3944,5 +3945,113 @@ theorem rewardSettleCore_conserves_escrow_buckets
   rw [hA', hR', hP', hnewRollNat, hnewPendNat, hR_sA, hP_sA, hAct]
   have h0 : (0 : UInt64).toNat = 0 := rfl
   omega
+
+/-- **Refinement #29 (`legCloseCapU64` Post-ADL Close Cap Core Refines `ThreatModel.postAdl_closeCap_exact`)**:
+    Directly on `SvmState.mem`, `mulDiv64Ceil rLeg oiSide rawSide` capped at `oiSide` computes exact
+    `min oiSide (ceil(rLeg * oiSide / rawSide))` with zero 64-bit overflow! -/
+theorem legCloseCapCore_refines_spec
+    (rLeg oiSide rawSide q : UInt64) (s s' : SvmState)
+    (hsp : 8 ≤ s.stackSp.toNat)
+    (h : (do
+        let raw ← mulDiv64Ceil rLeg oiSide rawSide
+        return (if raw < oiSide then raw else oiSide)) s = .ok q s') :
+    q.toNat = min oiSide.toNat ((rLeg.toNat * oiSide.toNat + rawSide.toNat - 1) / rawSide.toNat) ∧
+    memEqAbove s' s s.stackSp := by
+  obtain ⟨raw, s1, hmd, hret⟩ := bind_ok_elim h
+  dsimp only [Pure.pure, SolanaM.pure] at hret; cases hret
+  have ⟨_, hq, _, _, hmem⟩ := mulDiv64Ceil_stack_and_mem hsp hmd
+  refine ⟨?_, hmem⟩
+  by_cases hlt : raw < oiSide
+  · rw [ite_eq_left_of_eq_true _ _ (eq_true hlt)]
+    have := UInt64.lt_iff_toNat_lt.mp hlt; omega
+  · rw [ite_eq_right_of_eq_false _ _ (eq_false hlt)]
+    have := UInt64.le_iff_toNat_le.mp (UInt64.not_lt.mp hlt); omega
+
+/-- **Refinement #30 (`HlpVault` Share Minting Core Refines `HlpVault.hlpMintSharesNat`)**:
+    Directly on `SvmState.mem`, the exact share-minting branch of `HlpVault.handleDepositHlp`
+    (locking any pre-existing direct donation behind dead shares when `totSh == 0`, and pricing
+    subsequent deposits at optimistic `navDep = capital + Σ posPnl`) computes exact
+    `HlpVault.hlpMintSharesNat`! -/
+theorem hlpMintCore_refines_spec
+    (amount totSh navDep minDep mintSh newTotSh : UInt64) (s s' : SvmState)
+    (hsp : 8 ≤ s.stackSp.toNat)
+    (h : (if totSh == 0 then do
+        SolanaM.require (amount >= minDep) PErr.invalidParams
+        let tot ← checkedAdd64 navDep amount
+        pure (amount, tot)
+      else do
+        SolanaM.require (navDep > 0) PErr.nonzeroState
+        let m ← mulDiv64 amount totSh navDep
+        SolanaM.require (m > 0) PErr.invalidParams
+        let tot ← checkedAdd64 totSh m
+        pure (m, tot)) s = .ok (mintSh, newTotSh) s') :
+    (mintSh.toNat, newTotSh.toNat) = HlpVault.hlpMintSharesNat amount.toNat totSh.toNat navDep.toNat ∧
+    memEqAbove s' s s.stackSp := by
+  unfold HlpVault.hlpMintSharesNat
+  by_cases hz : (totSh == 0) = true
+  · rw [ite_eq_left_of_eq_true _ _ (eq_true hz)] at h
+    have htz : totSh = 0 := beq_iff_eq.mp hz
+    have htzNat : totSh.toNat = 0 := by rw [htz]; rfl
+    rw [ite_eq_left_of_eq_true _ _ (eq_true htzNat)]
+    obtain ⟨_, s1, hreq, h1⟩ := bind_ok_elim h
+    unfold SolanaM.require at hreq
+    by_cases hm : decide (amount ≥ minDep) = true
+    · rw [ite_eq_left_of_eq_true _ _ (eq_true hm)] at hreq
+      dsimp only [SolanaM.pure] at hreq; cases hreq
+      obtain ⟨tot, s2, hadd, h2⟩ := bind_ok_elim h1
+      have ⟨_, _, htotNat, hs2⟩ := checkedAdd64_ok_spec _ _ _ _ _ hadd; subst s2
+      dsimp only [Pure.pure, SolanaM.pure] at h2; cases h2
+      exact ⟨by simp [htotNat], memEqAbove_refl s s.stackSp⟩
+    · rw [ite_eq_right_of_eq_false _ _ (eq_false hm)] at hreq; dsimp only [SolanaM.fail] at hreq; cases hreq
+  · rw [ite_eq_right_of_eq_false _ _ (eq_false hz)] at h
+    have htne : totSh.toNat ≠ 0 := by
+      intro h0
+      have : totSh = 0 := UInt64.toNat_inj.mp (by rw [h0]; rfl)
+      exact hz (beq_iff_eq.mpr this)
+    rw [ite_eq_right_of_eq_false _ _ (eq_false htne)]
+    obtain ⟨_, s1, hreq1, h1⟩ := bind_ok_elim h
+    unfold SolanaM.require at hreq1
+    by_cases hnp : decide (navDep > 0) = true
+    · rw [ite_eq_left_of_eq_true _ _ (eq_true hnp)] at hreq1
+      dsimp only [SolanaM.pure] at hreq1; cases hreq1
+      have hnne : navDep.toNat ≠ 0 := by
+        have := UInt64.lt_iff_toNat_lt.mp (of_decide_eq_true hnp); omega
+      rw [ite_eq_right_of_eq_false _ _ (eq_false hnne)]
+      obtain ⟨m, s2, hmd, h2⟩ := bind_ok_elim h1
+      have ⟨_, hmNat, _, _, hmem⟩ := mulDiv64_stack_and_mem hsp hmd
+      obtain ⟨_, s3, hreq2, h3⟩ := bind_ok_elim h2
+      unfold SolanaM.require at hreq2
+      by_cases hmp : decide (m > 0) = true
+      · rw [ite_eq_left_of_eq_true _ _ (eq_true hmp)] at hreq2
+        dsimp only [SolanaM.pure] at hreq2; cases hreq2
+        obtain ⟨tot, s4, hadd, h4⟩ := bind_ok_elim h3
+        have ⟨_, _, htotNat, hs4⟩ := checkedAdd64_ok_spec _ _ _ _ _ hadd; subst s4
+        dsimp only [Pure.pure, SolanaM.pure] at h4; cases h4
+        exact ⟨by simp [hmNat, htotNat], hmem⟩
+      · rw [ite_eq_right_of_eq_false _ _ (eq_false hmp)] at hreq2; dsimp only [SolanaM.fail] at hreq2; cases hreq2
+    · rw [ite_eq_right_of_eq_false _ _ (eq_false hnp)] at hreq1; dsimp only [SolanaM.fail] at hreq1; cases hreq1
+
+/-- **Refinement #31 (`HlpVault` Share Redemption Core Refines `HlpVault.hlpWithdrawPayoutNat`)**:
+    Directly on `SvmState.mem`, the exact redemption calculation of `HlpVault.handleWithdrawHlp`
+    (`if cap == 0 then 0 else mulDiv64 burnSh cap totSh`) computes exact `HlpVault.hlpWithdrawPayoutNat`! -/
+theorem hlpWithdrawCore_refines_spec
+    (burnSh cap totSh payout : UInt64) (s s' : SvmState)
+    (hsp : 8 ≤ s.stackSp.toNat)
+    (htPos : 0 < totSh.toNat)
+    (h : (if cap == 0 then pure 0 else mulDiv64 burnSh cap totSh) s = .ok payout s') :
+    payout.toNat = HlpVault.hlpWithdrawPayoutNat burnSh.toNat totSh.toNat cap.toNat ∧
+    memEqAbove s' s s.stackSp := by
+  unfold HlpVault.hlpWithdrawPayoutNat
+  have htne : totSh.toNat ≠ 0 := by omega
+  rw [ite_eq_right_of_eq_false _ _ (eq_false htne)]
+  by_cases hcz : (cap == 0) = true
+  · rw [ite_eq_left_of_eq_true _ _ (eq_true hcz)] at h
+    dsimp only [Pure.pure, SolanaM.pure] at h; cases h
+    have hc0 : cap = 0 := beq_iff_eq.mp hcz
+    have hcNat : cap.toNat = 0 := by rw [hc0]; rfl
+    rw [hcNat]; simp [memEqAbove_refl]
+  · rw [ite_eq_right_of_eq_false _ _ (eq_false hcz)] at h
+    have ⟨_, hq, _, _, hmem⟩ := mulDiv64_stack_and_mem hsp h
+    exact ⟨hq, hmem⟩
 
 end Percolator.Refinement

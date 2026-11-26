@@ -878,4 +878,78 @@ theorem threat_adversarial_propamm_bounded_execution
     have hfs := hFundS hlt
     omega
 
+/-- **THEOREM (`threat_atomic_flip_decomposition_exact`)**:
+    **Atomic Position Flip / Auto-Netted Buy-Sell (`mode = 4`) Conservation & Clean Side Transition**:
+    For ANY requested quantity `qty > 0` and ANY prior opposing close-out capacities `(closeB, closeS)`
+    (`fBuyer`'s existing Short and `fSeller`'s existing Long):
+    1. `cBoth + cL2L + cS2S + cOpen = qty` (100% exact quantity conservation across sub-steps!),
+    2. `cL2L = 0 ∨ cS2S = 0` (mutually exclusive OI-invariant hand-offs),
+    3. `cBoth + cL2L ≤ closeS ∧ cBoth + cS2S ≤ closeB` (never over-closes either counterparty),
+    4. `cOpen > 0 → (cBoth + cL2L = closeS ∧ cBoth + cS2S = closeB)` (never opens opposite side
+       until BOTH prior opposing legs are 100% flat — zero side-collision or partial-flip failure!). -/
+theorem threat_atomic_flip_decomposition_exact (qty closeB closeS : Nat) :
+    let cBoth := min qty (min closeB closeS)
+    let rem1  := qty - cBoth
+    let remS  := closeS - cBoth
+    let remB  := closeB - cBoth
+    let cL2L  := if remS > 0 then min rem1 remS else 0
+    let cS2S  := if remS > 0 then 0 else if remB > 0 then min rem1 remB else 0
+    let cOpen := rem1 - cL2L - cS2S
+    cBoth + cL2L + cS2S + cOpen = qty ∧
+    (cL2L = 0 ∨ cS2S = 0) ∧
+    cBoth + cL2L ≤ closeS ∧
+    cBoth + cS2S ≤ closeB ∧
+    (cOpen > 0 → cBoth + cL2L = closeS ∧ cBoth + cS2S = closeB) := by
+  dsimp only
+  split
+  · omega
+  · split <;> omega
+
+/-- **THEOREM (`postAdl_closeCap_exact`)**:
+    Under ANY post-ADL state (`0 < rLeg ≤ rawSide`, `0 < oiSide ≤ rawSide`), the exact close-out
+    cap `q = min oiSide (ceil(rLeg * oiSide / rawSide))` satisfies:
+    1. `1 ≤ q ≤ oiSide`,
+    2. `min (ceil(q * rawSide / oiSide)) rLeg = rLeg` (100% complete zero-dust leg close!),
+    3. `oiSide - q ≤ rawSide - rLeg` (`oi ≤ raw` ADL invariant strictly preserved!). -/
+theorem postAdl_closeCap_exact (rLeg oiSide rawSide : Nat)
+    (hrPos : 0 < rLeg) (hrLe : rLeg ≤ rawSide) (hoiPos : 0 < oiSide) (hoiLe : oiSide ≤ rawSide) :
+    let q := min oiSide ((rLeg * oiSide + rawSide - 1) / rawSide)
+    1 ≤ q ∧ q ≤ oiSide ∧
+    min ((q * rawSide + oiSide - 1) / oiSide) rLeg = rLeg ∧
+    oiSide - q ≤ rawSide - rLeg := by
+  dsimp only
+  have hrawPos : 0 < rawSide := by omega
+  have hmulPos : 1 ≤ rLeg * oiSide := Nat.mul_le_mul hrPos hoiPos
+  have hqCeilPos : 1 ≤ (rLeg * oiSide + rawSide - 1) / rawSide :=
+    (Nat.le_div_iff_mul_le hrawPos).mpr (by omega)
+  have hqPos : 1 ≤ min oiSide ((rLeg * oiSide + rawSide - 1) / rawSide) := by omega
+  have hqLe : min oiSide ((rLeg * oiSide + rawSide - 1) / rawSide) ≤ oiSide := Nat.min_le_left _ _
+  have hqMulGe : rLeg * oiSide ≤ min oiSide ((rLeg * oiSide + rawSide - 1) / rawSide) * rawSide := by
+    by_cases hle : oiSide ≤ (rLeg * oiSide + rawSide - 1) / rawSide
+    · rw [Nat.min_eq_left hle]
+      have := Nat.mul_le_mul_right oiSide hrLe
+      rwa [Nat.mul_comm rawSide oiSide] at this
+    · rw [Nat.min_eq_right (by omega)]
+      have hdiv : ((rLeg * oiSide + rawSide - 1) / rawSide) * rawSide +
+          (rLeg * oiSide + rawSide - 1) % rawSide = rLeg * oiSide + rawSide - 1 := by
+        rw [Nat.mul_comm]; exact Nat.div_add_mod _ _
+      have hmod : (rLeg * oiSide + rawSide - 1) % rawSide < rawSide := Nat.mod_lt _ hrawPos
+      omega
+  have hbackGe : rLeg ≤ (min oiSide ((rLeg * oiSide + rawSide - 1) / rawSide) * rawSide + oiSide - 1) / oiSide := by
+    apply (Nat.le_div_iff_mul_le hoiPos).mpr
+    omega
+  have hminEq : min ((min oiSide ((rLeg * oiSide + rawSide - 1) / rawSide) * rawSide + oiSide - 1) / oiSide) rLeg = rLeg :=
+    Nat.min_eq_right hbackGe
+  have hadlPres : oiSide - min oiSide ((rLeg * oiSide + rawSide - 1) / rawSide) ≤ rawSide - rLeg := by
+    let q := min oiSide ((rLeg * oiSide + rawSide - 1) / rawSide)
+    have h1 : (oiSide - q) * rawSide = oiSide * rawSide - q * rawSide := Nat.sub_mul oiSide q rawSide
+    have h2 : (rawSide - rLeg) * oiSide = rawSide * oiSide - rLeg * oiSide := Nat.sub_mul rawSide rLeg oiSide
+    have h3 : (rawSide - rLeg) * oiSide ≤ (rawSide - rLeg) * rawSide := Nat.mul_le_mul_left _ hoiLe
+    have h4 : (oiSide - q) * rawSide ≤ (rawSide - rLeg) * rawSide := by
+      rw [Nat.mul_comm rawSide oiSide] at h2
+      dsimp only [q] at h1 ⊢
+      omega
+    exact Nat.le_of_mul_le_mul_right h4 hrawPos
+  exact ⟨hqPos, hqLe, hminEq, hadlPres⟩
+
 end Percolator.ThreatModel

@@ -7,4 +7,5 @@ import Percolator.Program
 import Percolator.Matcher
 import Percolator.OracleAdapter
 import Percolator.RewardModule
+import Percolator.HlpVault
 import Percolator.Refinement
