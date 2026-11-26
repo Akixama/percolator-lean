@@ -829,7 +829,8 @@ theorem threat_reward_module_strict_isolation
     1. **Zero Noop/Stale Replay**: for EVERY `preSeq : UInt64`, `(preSeq + 1) ≠ preSeq` (wrapping
        mod `2^64`), so a `noop.so` or stale `matcherCtx` can NEVER pass `retSeq == preSeq + 1`.
     2. **Strict Fill & Limit-Price Bounds**: any accepted quote satisfies `0 < fillQty ≤ maxQty`
-       and honors taker's `limitPrice` (`execPrice ≤ limitPrice` for long, `≥ limitPrice` for short).
+       and honors taker's `limitPrice` (`execPrice ≤ limitPrice` when buying — open Long / reduce
+       Short; `execPrice ≥ limitPrice` when selling — open Short / reduce Long).
     3. **Core `maxMoveBps` Spread Bound**: `applyExecSpread` caps bilateral spread transfer at
        `fillQty * (markP * maxMoveBps / 10000) / POS_SCALE` even when `limitPrice = 0`.
     4. **Zero-Sum Bilateral Capital Transfer**: `cL' + cS' = cL + cS` (adversarial PropAMM cannot
@@ -837,9 +838,9 @@ theorem threat_reward_module_strict_isolation
 theorem threat_adversarial_propamm_bounded_execution
     (preSeq : UInt64)
     (maxQty fillQty markP execPrice limitPrice maxMoveBps cL cS : Nat)
-    (takerIsLong : Bool)
+    (takerIsBuying : Bool)
     (hFill : 0 < fillQty ∧ fillQty ≤ maxQty)
-    (hLim : limitPrice ≠ 0 → (if takerIsLong then execPrice ≤ limitPrice else limitPrice ≤ execPrice))
+    (hLim : limitPrice ≠ 0 → (if takerIsBuying then execPrice ≤ limitPrice else limitPrice ≤ execPrice))
     (hClamp : (if execPrice ≥ markP then execPrice - markP else markP - execPrice) ≤
       (markP * maxMoveBps) / bpsDenNat)
     (hFundL : execPrice ≥ markP → ((fillQty * (execPrice - markP)) / posScaleNat) ≤ cL)
@@ -848,7 +849,7 @@ theorem threat_adversarial_propamm_bounded_execution
     (preSeq + 1 ≠ preSeq) ∧
     -- (2) Fill & limit bounds hold
     (0 < fillQty ∧ fillQty ≤ maxQty) ∧
-    (limitPrice ≠ 0 → (if takerIsLong then execPrice ≤ limitPrice else limitPrice ≤ execPrice)) ∧
+    (limitPrice ≠ 0 → (if takerIsBuying then execPrice ≤ limitPrice else limitPrice ≤ execPrice)) ∧
     -- (3) Spread transfer bounded by maxMoveBps envelope AND strictly zero-sum between cL and cS!
     (let diff := if execPrice ≥ markP then execPrice - markP else markP - execPrice
      let spread := (fillQty * diff) / posScaleNat

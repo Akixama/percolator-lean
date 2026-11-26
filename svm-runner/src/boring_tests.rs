@@ -586,8 +586,8 @@ pub fn test_boring_exec_price_bid_ask_spread(elf: &[u8]) {
     assert_eq!(e.capital(&maker), 101 * POS_SCALE);
     e.check("t5-open-spread");
 
-    // Taker closes 2 BTC crossing spread at $100.50 (paying $1.00 to Maker again; or at $99.50 Maker pays Taker $1.00)
-    e.trade_ext(btc, &taker, &maker, 1, 2 * POS_SCALE, 100_500_000);
+    // Taker closes Long 2 BTC selling at bid $99.50 (-$0.50 spread -> seller Taker pays $1.00 directly to buyer Maker!)
+    e.trade_ext(btc, &taker, &maker, 1, 2 * POS_SCALE, 99_500_000);
     assert_eq!(e.capital(&taker), 98 * POS_SCALE);
     assert_eq!(e.capital(&maker), 102 * POS_SCALE);
     assert_eq!(e.oi_long(btc), 0);
@@ -1005,7 +1005,7 @@ pub fn test_boring_withdraw_margin_checks_and_freshness(elf: &[u8]) {
     e.check("t11-final");
 }
 
-/// 12. Boring external `matcher.so` AMM single-signer fills (two takers + LP withdrawal).
+/// 12. Boring external `matcher.so` CPI-Out PropAMM single-signer fills (two takers + direct EOA LP withdrawal).
 pub fn test_boring_matcher_amm_single_signer_fills(elf: &[u8], matcher_elf: &[u8]) {
     let mut e = BoringEnv::new(elf);
     let matcher_prog = Keypair::new().pubkey();
@@ -1016,37 +1016,20 @@ pub fn test_boring_matcher_amm_single_signer_fills(elf: &[u8], matcher_elf: &[u8
     e.svm.airdrop(&lp_owner.pubkey(), 10_000_000_000).unwrap();
     let lp_tok = create_tok_acc(&mut e.svm, &e.mint, &lp_owner.pubkey(), 2_000 * POS_SCALE);
 
-    let mtch_cfg = create_prog_acc(&mut e.svm, &matcher_prog, 160);
-    let (lp_auth_pda, lp_bump) = Address::find_program_address(&[b"lpau", mtch_cfg.as_ref()], &matcher_prog);
+    let prop_ctx = create_prog_acc(&mut e.svm, &matcher_prog, PROP_AMM_SIZE);
     let lp_pfl = create_prog_acc(&mut e.svm, &e.prog_id, PFL_SIZE);
     e.portfolios.push(lp_pfl);
 
-    // InitMatcher: halfSpread=50bps, impact=10bps/unit, maxFill=10 BTC, pinned strictly to `btc` market!
-    let mut init_d = vec![0u8; 28];
-    init_d[0] = 0;
-    init_d[1] = lp_bump;
-    init_d[4..12].copy_from_slice(&50u64.to_le_bytes());
-    init_d[12..20].copy_from_slice(&10u64.to_le_bytes());
-    init_d[20..28].copy_from_slice(&(10 * POS_SCALE).to_le_bytes());
+    // InitPropAmm (Op 0): halfSpread=50bps, impact=10bps/unit, maxFill=10 BTC
     send_ok(
         &mut e.svm,
-        Instruction {
-            program_id: matcher_prog,
-            accounts: vec![
-                AccountMeta::new(mtch_cfg, false),
-                AccountMeta::new_readonly(lp_owner.pubkey(), true),
-                AccountMeta::new(e.dex, false),
-                AccountMeta::new(lp_pfl, false),
-                AccountMeta::new_readonly(lp_auth_pda, false),
-                AccountMeta::new_readonly(e.prog_id, false),
-                AccountMeta::new_readonly(btc, false),
-            ],
-            data: init_d,
-        },
+        ix_init_prop_amm(matcher_prog, prop_ctx, lp_owner.pubkey(), 0, 50, 10, 10 * POS_SCALE),
         &e.payer,
         &[&e.payer, &lp_owner],
     );
-    // Fund LP portfolio ($1,000) via permissionless DepositCollateral
+    // LP keeps 100% EOA custody over `lp_pfl` and binds `prop_ctx` via `SetPortfolioMatcher`
+    send_ok(&mut e.svm, ix_init_portfolio(e.prog_id, e.dex, lp_pfl, lp_owner.pubkey()), &e.payer, &[&e.payer, &lp_owner]);
+    send_ok(&mut e.svm, ix_set_portfolio_matcher(e.prog_id, lp_pfl, lp_owner.pubkey(), Some(prop_ctx)), &e.payer, &[&e.payer, &lp_owner]);
     send_ok(
         &mut e.svm,
         ix_deposit_collateral(e.prog_id, e.dex, lp_pfl, lp_owner.pubkey(), lp_tok, e.mint, e.dex_vault, TOKEN_PROGRAM_ID, 1_000 * POS_SCALE),
@@ -1058,31 +1041,15 @@ pub fn test_boring_matcher_amm_single_signer_fills(elf: &[u8], matcher_elf: &[u8
     let carol = e.create_trader(1_000 * POS_SCALE, 200 * POS_SCALE);
 
     let (dex_addr, prog_id) = (e.dex, e.prog_id);
-    let mk_fill = |t: &Trader, mode: u8, taker_is_long: u8, qty: u64, limit_p: u64| {
-        let mut d = vec![0u8; 19];
-        d[0] = 2;
-        d[1] = mode;
-        d[2] = taker_is_long;
-        d[3..11].copy_from_slice(&qty.to_le_bytes());
-        d[11..19].copy_from_slice(&limit_p.to_le_bytes());
-        Instruction {
-            program_id: matcher_prog,
-            accounts: vec![
-                AccountMeta::new_readonly(mtch_cfg, false),
-                AccountMeta::new(dex_addr, false),
-                AccountMeta::new(btc, false),
-                AccountMeta::new(lp_pfl, false),
-                AccountMeta::new_readonly(lp_auth_pda, false),
-                AccountMeta::new(t.pfl, false),
-                AccountMeta::new_readonly(t.kp.pubkey(), true),
-                AccountMeta::new_readonly(prog_id, false),
-            ],
-            data: d,
-        }
+    let mk_fill = |t: &Trader, mode: u8, taker_is_long: bool, qty: u64, limit_p: u64| {
+        ix_trade_with_matcher(
+            prog_id, dex_addr, btc, t.pfl, t.kp.pubkey(), lp_pfl,
+            matcher_prog, prop_ctx, None, mode, taker_is_long, qty, limit_p,
+        )
     };
 
-    // Single-signer Alice opens Long 1 BTC vs passive LP (60 bps spread = $0.60!)
-    send_ok(&mut e.svm, mk_fill(&alice, 0, 1, 1 * POS_SCALE, 101 * POS_SCALE), &e.payer, &[&e.payer, &alice.kp]);
+    // Single-signer Alice opens Long 1 BTC vs passive LP at Ask $100.60 (60 bps spread = $0.60!)
+    send_ok(&mut e.svm, mk_fill(&alice, 0, true, 1 * POS_SCALE, 101 * POS_SCALE), &e.payer, &[&e.payer, &alice.kp]);
     assert_eq!(read_u64(&e.svm, &lp_pfl, 88), 1_000_600_000);
     assert_eq!(e.capital(&alice), 199_400_000);
     e.check("t12-alice-open");
@@ -1090,36 +1057,20 @@ pub fn test_boring_matcher_amm_single_signer_fills(elf: &[u8], matcher_elf: &[u8
     // Price moves $100 -> $102 (+$2 Alice, -$2 LP)
     e.update_oracle(btc, 102 * POS_SCALE, 0, 0);
 
-    // Single-signer Alice closes Long 1 BTC vs passive LP (60 bps of $102 = $0.612)
-    send_ok(&mut e.svm, mk_fill(&alice, 1, 1, 1 * POS_SCALE, 103 * POS_SCALE), &e.payer, &[&e.payer, &alice.kp]);
-    // Single-signer Carol opens Short 1 BTC vs passive LP (60 bps of $102 = $0.612) and closes it
-    send_ok(&mut e.svm, mk_fill(&carol, 0, 0, 1 * POS_SCALE, 101 * POS_SCALE), &e.payer, &[&e.payer, &carol.kp]);
-    send_ok(&mut e.svm, mk_fill(&carol, 1, 0, 1 * POS_SCALE, 101 * POS_SCALE), &e.payer, &[&e.payer, &carol.kp]);
+    // Single-signer Alice closes Long 1 BTC selling at Bid $101.388 (60 bps of $102 = $0.612 -> LP earns spread!)
+    send_ok(&mut e.svm, mk_fill(&alice, 1, true, 1 * POS_SCALE, 101 * POS_SCALE), &e.payer, &[&e.payer, &alice.kp]);
+    assert_eq!(read_u64(&e.svm, &lp_pfl, 88), 999_212_000);
+    // Single-signer Carol opens Short 1 BTC at Bid $101.388 and closes Short 1 BTC buying at Ask $102.612 (LP earns spread BOTH ways!)
+    send_ok(&mut e.svm, mk_fill(&carol, 0, false, 1 * POS_SCALE, 101 * POS_SCALE), &e.payer, &[&e.payer, &carol.kp]);
+    send_ok(&mut e.svm, mk_fill(&carol, 1, false, 1 * POS_SCALE, 103 * POS_SCALE), &e.payer, &[&e.payer, &carol.kp]);
     assert_eq!(e.oi_long(btc), 0);
+    assert_eq!(read_u64(&e.svm, &lp_pfl, 88), 1_000_436_000);
 
-    // LP withdraws $500 via Matcher::WithdrawLp (op=3)
-    let mut wdr_d = vec![0u8; 9];
-    wdr_d[0] = 3;
-    wdr_d[1..9].copy_from_slice(&(500 * POS_SCALE).to_le_bytes());
+    // LP withdraws $500 DIRECTLY via EOA `WithdrawCollateral` (ZERO PDA custody!)
     let lp_tok_pre = token_amount(&e.svm, &lp_tok);
     send_ok(
         &mut e.svm,
-        Instruction {
-            program_id: matcher_prog,
-            accounts: vec![
-                AccountMeta::new_readonly(mtch_cfg, false),
-                AccountMeta::new_readonly(lp_owner.pubkey(), true),
-                AccountMeta::new(e.dex, false),
-                AccountMeta::new(lp_pfl, false),
-                AccountMeta::new_readonly(lp_auth_pda, false),
-                AccountMeta::new(lp_tok, false),
-                AccountMeta::new_readonly(e.mint, false),
-                AccountMeta::new(e.dex_vault, false),
-                AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),
-                AccountMeta::new_readonly(e.prog_id, false),
-            ],
-            data: wdr_d,
-        },
+        ix_withdraw_collateral(e.prog_id, e.dex, lp_pfl, lp_owner.pubkey(), lp_tok, e.mint, e.dex_vault, TOKEN_PROGRAM_ID, 500 * POS_SCALE),
         &e.payer,
         &[&e.payer, &lp_owner],
     );
@@ -1595,68 +1546,35 @@ pub fn test_audited_security_regressions(elf: &[u8], matcher_elf: &[u8]) {
     e.trade(btc, &bob, &alice, 1, 10 * POS_SCALE);
     e.trade(eth, &bob, &alice, 1, 2 * POS_SCALE);
 
-    // (b) Matcher::Fill mode=2 LP spread-drain & rogue-market fill MUST FAIL!
+    // (b) CPI-Out `TradeWithMatcher` rejects mode=2/3 hand-offs (`Custom(103)`), unauthorized
+    //     `UpdatePropAmm` (`Custom(111)`), and directs spread strictly FROM taker TO LP on BOTH open & close!
     let lp_owner = Keypair::new();
     e.svm.airdrop(&lp_owner.pubkey(), 10_000_000_000).unwrap();
     let lp_tok = create_tok_acc(&mut e.svm, &e.mint, &lp_owner.pubkey(), 2_000 * POS_SCALE);
-    let mtch_cfg = create_prog_acc(&mut e.svm, &matcher_prog, 160);
-    let (lp_auth_pda, lp_bump) = Address::find_program_address(&[b"lpau", mtch_cfg.as_ref()], &matcher_prog);
+    let prop_ctx = create_prog_acc(&mut e.svm, &matcher_prog, PROP_AMM_SIZE);
     let lp_pfl = create_prog_acc(&mut e.svm, &e.prog_id, PFL_SIZE);
     e.portfolios.push(lp_pfl);
-    let mut init_m = vec![0u8; 28];
-    init_m[0] = 0; init_m[1] = lp_bump;
-    init_m[4..12].copy_from_slice(&100u64.to_le_bytes()); // 100 bps halfSpread
-    init_m[12..20].copy_from_slice(&0u64.to_le_bytes());
-    init_m[20..28].copy_from_slice(&(10 * POS_SCALE).to_le_bytes());
-    send_ok(
-        &mut e.svm,
-        Instruction {
-            program_id: matcher_prog,
-            accounts: vec![
-                AccountMeta::new(mtch_cfg, false),
-                AccountMeta::new_readonly(lp_owner.pubkey(), true),
-                AccountMeta::new(e.dex, false),
-                AccountMeta::new(lp_pfl, false),
-                AccountMeta::new_readonly(lp_auth_pda, false),
-                AccountMeta::new_readonly(e.prog_id, false),
-                AccountMeta::new_readonly(btc, false), // pinned strictly to BTC!
-            ],
-            data: init_m,
-        },
-        &e.payer,
-        &[&e.payer, &lp_owner],
-    );
+    send_ok(&mut e.svm, ix_init_prop_amm(matcher_prog, prop_ctx, lp_owner.pubkey(), 0, 100, 0, 10 * POS_SCALE), &e.payer, &[&e.payer, &lp_owner]);
+    send_ok(&mut e.svm, ix_init_portfolio(e.prog_id, e.dex, lp_pfl, lp_owner.pubkey()), &e.payer, &[&e.payer, &lp_owner]);
+    send_ok(&mut e.svm, ix_set_portfolio_matcher(e.prog_id, lp_pfl, lp_owner.pubkey(), Some(prop_ctx)), &e.payer, &[&e.payer, &lp_owner]);
     send_ok(
         &mut e.svm,
         ix_deposit_collateral(e.prog_id, e.dex, lp_pfl, lp_owner.pubkey(), lp_tok, e.mint, e.dex_vault, TOKEN_PROGRAM_ID, 500 * POS_SCALE),
         &e.payer,
         &[&e.payer, &lp_owner],
     );
-    // Open a real Long on Bob via Matcher(mode=0), then attempt mode=2 hand-off spread-drain!
+    let (dex_addr, prog_id) = (e.dex, e.prog_id);
     let mk_mfill = |mkt_addr: Address, mode: u8, qty: u64| {
-        let mut d = vec![0u8; 19];
-        d[0] = 2; d[1] = mode; d[2] = 1; // takerIsLong = 1
-        d[3..11].copy_from_slice(&qty.to_le_bytes());
-        Instruction {
-            program_id: matcher_prog,
-            accounts: vec![
-                AccountMeta::new_readonly(mtch_cfg, false),
-                AccountMeta::new(e.dex, false),
-                AccountMeta::new(mkt_addr, false),
-                AccountMeta::new(lp_pfl, false),
-                AccountMeta::new_readonly(lp_auth_pda, false),
-                AccountMeta::new(bob.pfl, false),
-                AccountMeta::new_readonly(bob.kp.pubkey(), true),
-                AccountMeta::new_readonly(e.prog_id, false),
-            ],
-            data: d,
-        }
+        ix_trade_with_matcher(prog_id, dex_addr, mkt_addr, bob.pfl, bob.kp.pubkey(), lp_pfl, matcher_prog, prop_ctx, None, mode, true, qty, 0)
     };
     send_ok(&mut e.svm, mk_mfill(btc, 0, POS_SCALE), &e.payer, &[&e.payer, &bob.kp]);
-    send_err_custom(&mut e.svm, mk_mfill(btc, 2, POS_SCALE), &e.payer, &[&e.payer, &bob.kp], 206, "Matcher::Fill must reject mode=2 hand-off");
-    send_err_custom(&mut e.svm, mk_mfill(btc, 3, POS_SCALE), &e.payer, &[&e.payer, &bob.kp], 206, "Matcher::Fill must reject mode=3 hand-off");
-    send_err_custom(&mut e.svm, mk_mfill(eth, 0, POS_SCALE), &e.payer, &[&e.payer, &bob.kp], 205, "Matcher::Fill must reject unpinned market");
+    let lp_cap_after_open = read_u64(&e.svm, &lp_pfl, 88);
+    assert!(lp_cap_after_open > 500 * POS_SCALE, "LP earned spread on open!");
+    send_err_custom(&mut e.svm, mk_mfill(btc, 2, POS_SCALE), &e.payer, &[&e.payer, &bob.kp], 103, "TradeWithMatcher must reject mode=2 hand-off");
+    send_err_custom(&mut e.svm, mk_mfill(btc, 3, POS_SCALE), &e.payer, &[&e.payer, &bob.kp], 103, "TradeWithMatcher must reject mode=3 hand-off");
+    send_err_custom(&mut e.svm, ix_update_prop_amm(matcher_prog, prop_ctx, bob.kp.pubkey(), 1, 100, 0, POS_SCALE), &e.payer, &[&e.payer, &bob.kp], 111, "Non-owner UpdatePropAmm must fail");
     send_ok(&mut e.svm, mk_mfill(btc, 1, POS_SCALE), &e.payer, &[&e.payer, &bob.kp]);
+    assert!(read_u64(&e.svm, &lp_pfl, 88) > lp_cap_after_open, "LP earned spread on reduce close too!");
 
     // (c) InitDex with active `quoteMint` freeze authority MUST FAIL (legacy #487)!
     let frozen_mint = Keypair::new().pubkey();

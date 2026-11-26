@@ -139,6 +139,17 @@ namespace SwitchboardOff
   def scaleToE6   : UInt64 := 1_000_000_000_000 -- 10^(18 - 6) = 10^12
 end SwitchboardOff
 
+/-- Compile-time layout bounds proof: every field across `AdpOff`, `FeedOff`, `PythOff`,
+    `ChainlinkOff`, and `SwitchboardOff` fits strictly inside its checked account size! -/
+theorem oracle_layout_sizes_valid :
+    AdpOff.lastEwmaSlot + 8 ≤ AdpOff.size ∧ AdpOff.size % 8 == 0 ∧
+    FeedOff.publishSlot + 8 ≤ FeedOff.size ∧ FeedOff.size % 8 == 0 ∧
+    PythOff.postedSlot + 8 ≤ PythOff.minSize ∧
+    ChainlinkOff.liveCursor + 4 ≤ ChainlinkOff.headerTotal ∧
+    ChainlinkOff.entryAnswerHi + 8 ≤ ChainlinkOff.entrySize ∧
+    SwitchboardOff.resSlot + 8 ≤ SwitchboardOff.minSize := by
+  decide
+
 /-! ### Pure Specifications & Formal Proofs -/
 
 def clampedStepNat (oldP targetP maxMoveBps : Nat) : Nat × Nat :=

@@ -15,7 +15,7 @@
        (ZERO withdraw instruction — required for `wSOL`, since SPL Token forbids `Burn` on NativeMint).
   3. `StartEpoch` (Op 1, permissionless): Once `m.rewardAccrued + rolloverQuote >= minBatchQuote`,
      pulls `m.rewardAccrued` via PDA-signed `percolator::ClaimReward` into `quoteVault`, locks
-     the epoch pot `Q_e`, computes virtual reserve `B_virt = floor(Q_e * reserveRateE6 / 10^6)`,
+     the epoch pot `Q_e`, computes virtual reserve `B_virt = ceil(Q_e * reserveRateE6 / 10^6) >= 1`,
      and opens a fixed `epochSlots` window (`>= MIN_EPOCH_SLOTS = 32 >> K = 4` leader window).
   4. `SubmitBid` (Op 2, permissionless, UNLIMITED bids like an AMM, O(1)):
      During `[startSlot, endSlot)`, anyone commits irrevocable `targetMint` into `targetEscrow`
@@ -604,7 +604,7 @@ def handleStartEpoch (input : Ptr) : SolanaM Unit := do
   SolanaM.require (totalPot >= minBatch) RErr.belowMinBatch
 
   let resRate ← loadU64 cData RewOff.reserveRateE6
-  let virtBids ← mulDiv64 totalPot resRate POS_SCALE
+  let virtBids ← mulDiv64Ceil totalPot resRate POS_SCALE
   let epSlots ← loadU64 cData RewOff.epochSlots
   let curSlot ← getSlot
   let endSlot ← checkedAdd64 curSlot epSlots
@@ -798,12 +798,14 @@ def handleSettleEpoch (input : Ptr) : SolanaM Unit := do
   storeU64 cData RewOff.reserveRateE6 nextRate
   log64 EVT_SETTLE_EPOCH epId quotePaid totBids nextRate
 
-/-- Op 4 (`ClaimQuote`): O(1) claim of exact uniform-price quote payout from ANY settled epoch!
-    Accounts (8):
+/-- Op 4 (`ClaimQuote`): O(1) claim of exact uniform-price quote payout from ANY settled epoch,
+    automatically closing `bidReceipt` (`zeroRewardWords` + `MAGIC_CLOSED`) and refunding 100%
+    of its rent lamports back to `bidder` (zero rent leak, zero same-tx revival!).
+    Accounts (9):
       0. `cfg` (W)
       1. `epochAcc` (W) — any settled `EpochState` belonging to `cfg`
-      2. `bidReceipt` (W) — bidder's `BidReceipt` for `epochAcc`
-      3. `bidder` (S) — MUST match `bidReceipt.bidder`
+      2. `bidReceipt` (W) — bidder's `BidReceipt` for `epochAcc` (closed & rent refunded!)
+      3. `bidder` (W, S) — MUST match `bidReceipt.bidder` (receives reclaimed rent lamports)
       4. `rewAuthPda`
       5. `quoteVault` (W)
       6. `bidderQuoteTok` (W)
@@ -826,6 +828,8 @@ def handleClaimQuote (input : Ptr) : SolanaM Unit := do
   SolanaM.require (← AccountView.isWritable cfg) Err.invalidAccountData
   SolanaM.require (← AccountView.isWritable epochAcc) Err.invalidAccountData
   SolanaM.require (← AccountView.isWritable bidReceipt) Err.invalidAccountData
+  SolanaM.require (← AccountView.isWritable bidder) Err.invalidAccountData
+  SolanaM.require (!(← pubkeyEq (AccountView.keyPtr bidReceipt) (AccountView.keyPtr bidder))) PErr.aliasedAccounts
   checkRewardCfg cfg progId
   checkEpochAcc epochAcc cfg progId
 
@@ -860,8 +864,14 @@ def handleClaimQuote (input : Ptr) : SolanaM Unit := do
     let denom ← checkedAdd64 totBids virtBids
     payout ← mulDiv64 qPot bidAmt denom
 
-  -- Checks-Effects-Interactions: mark claimed & debit pendingClaims BEFORE CPI!
-  storeU8 rData BidOff.claimed 1
+  -- Checks-Effects-Interactions: permanently close `bidReceipt` (`zeroRewardWords` + `MAGIC_CLOSED`),
+  -- refund 100% of rent lamports to `bidder`, and debit `pendingClaims` BEFORE SPL CPI!
+  zeroRewardWords rData 0 (BidOff.size >>> 3)
+  storeU32 rData BidOff.magic MAGIC_CLOSED
+  let recLam ← AccountView.lamports bidReceipt
+  let bidLam ← AccountView.lamports bidder
+  AccountView.setLamports bidder (← checkedAdd64 bidLam recLam)
+  AccountView.setLamports bidReceipt 0
   if payout > 0 then
     let newClaimed ← checkedAdd64 (← loadU64 eData EpochOff.claimedQuote) payout
     let quotePaid  ← loadU64 eData EpochOff.quotePaid

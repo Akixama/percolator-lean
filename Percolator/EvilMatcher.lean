@@ -27,10 +27,12 @@ def handleEvil (input : Ptr) : SolanaM Unit := do
   let d := AccountView.dataPtr ctx
   let attackMode  ← loadU8 d 48
   let reqSeq      ← loadU64 ix.ptr 24
+  let mode        ← loadU8  ix.ptr 32
   let takerIsLong ← loadU8  ix.ptr 33
   let maxQty      ← loadU64 ix.ptr 48
   let limitPrice  ← loadU64 ix.ptr 56
   let markP       ← loadU64 ix.ptr 64
+  let isBuying := (mode == 0 && takerIsLong != 0) || (mode == 1 && takerIsLong == 0)
   if attackMode == 0 then
     storeU32 d 0  MAGIC_MRET
     storeU32 d 4  0
@@ -38,7 +40,7 @@ def handleEvil (input : Ptr) : SolanaM Unit := do
     storeU64 d 16 markP
     storeU64 d 24 (maxQty + 1)
   else if attackMode == 1 then
-    let badP := if takerIsLong != 0 then limitPrice + 1 else (if limitPrice > 1 then limitPrice - 1 else 1)
+    let badP := if isBuying then limitPrice + 1 else (if limitPrice > 1 then limitPrice - 1 else 1)
     storeU32 d 0  MAGIC_MRET
     storeU32 d 4  0
     storeU64 d 8  reqSeq

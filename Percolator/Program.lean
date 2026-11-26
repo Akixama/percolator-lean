@@ -1061,7 +1061,11 @@ def applyExecSpread (mData fLData fSData : Ptr) (qty execPrice : UInt64) : Solan
 
     let _ ← settleAndRefreshLeg dData mData fLData slotL curSlot false
     let _ ← settleAndRefreshLeg dData mData fSData slotS curSlot false
-    applyExecSpread mData fLData fSData qty execPrice
+    -- Mode 1 reduce: `fL` is SELLING to close its Long and `fS` is BUYING to close its Short!
+    -- Swapping `(fSData, fLData)` enforces universal market pricing across ALL modes:
+    --   * Ask (`execPrice > markP`): buyer `fS` pays spread to seller `fL`
+    --   * Bid (`execPrice < markP`): seller `fL` pays spread to buyer `fS`
+    applyExecSpread mData fSData fLData qty execPrice
 
     let oiL ← loadU64 mData MktOff.oiLong
     let oiS ← loadU64 mData MktOff.oiShort
@@ -1104,14 +1108,15 @@ def applyExecSpread (mData fLData fSData : Ptr) (qty execPrice : UInt64) : Solan
     syncLegMargins mData fSData slotS curSlot
     -- Paying an `execPrice` spread during reduce requires fresh margins across ALL active legs
     -- on the spread payer AND can NEVER drop payer below `newTotalMm`!
+    -- (`execPrice > markP` => buyer `fS` paid spread; `execPrice < markP` => seller `fL` paid spread.)
     let markP ← loadU64 mData MktOff.markPrice
     if execPrice != 0 && execPrice != markP then
       if execPrice > markP then
-        checkAllLegsFreshLoop fLData curSlot 0
-        SolanaM.require ((← loadU64 fLData PflOff.capital) >= (← loadU64 fLData PflOff.totalMm)) PErr.insufficientMargin
-      else
         checkAllLegsFreshLoop fSData curSlot 0
         SolanaM.require ((← loadU64 fSData PflOff.capital) >= (← loadU64 fSData PflOff.totalMm)) PErr.insufficientMargin
+      else
+        checkAllLegsFreshLoop fLData curSlot 0
+        SolanaM.require ((← loadU64 fLData PflOff.capital) >= (← loadU64 fLData PflOff.totalMm)) PErr.insufficientMargin
     freeLegIfEmpty fLData slotL
     freeLegIfEmpty fSData slotS
   else if mode == 2 || mode == 3 then
@@ -1729,14 +1734,16 @@ def validateMatcherHeader (mcData reqSeq : UInt64) : SolanaM Unit := do
 /-- Pure, verifiable per-leg adversarial PropAMM quote check (Refinement #25b).
     Validates `(execPrice, fillQty)` at `legRetPtr[0..16]`:
     - `0 < execPrice <= MAX_PRICE` and `0 < fillQty <= maxQty` (blocks over-fill & zero-fill!)
-    - Enforces taker's `limitPrice` inside core `percolator` (blocks abusive quoting!). -/
-def validateMatcherLeg (legRetPtr maxQty limitPrice : UInt64) (takerIsLong : UInt8) :
+    - Enforces taker's `limitPrice` inside core `percolator` using true economic buy/sell direction:
+      * `takerIsBuying != 0` (open Long OR reduce Short): `execPrice <= limitPrice`
+      * `takerIsBuying == 0` (open Short OR reduce Long): `execPrice >= limitPrice`. -/
+def validateMatcherLeg (legRetPtr maxQty limitPrice : UInt64) (takerIsBuying : UInt8) :
     SolanaM (UInt64 × UInt64) := do
   let execPrice ← loadU64 legRetPtr 0
   let fillQty   ← loadU64 legRetPtr 8
   SolanaM.require (execPrice > 0 && execPrice <= MAX_PRICE && fillQty > 0 && fillQty <= maxQty) PErr.invalidMatcher
   if limitPrice != 0 then
-    if takerIsLong != 0 then
+    if takerIsBuying != 0 then
       SolanaM.require (execPrice <= limitPrice) PErr.execPriceClamp
     else
       SolanaM.require (execPrice >= limitPrice) PErr.execPriceClamp
@@ -1846,7 +1853,9 @@ def settleMatcherOffersLoop (dData takerData lpData ctxBuf : Ptr) (i : UInt64) :
       let takerIsLong ← loadU8  ixPtr (ixOff + 1)
       let maxQty      ← loadU64 ixPtr (ixOff + 2)
       let limitPrice  ← loadU64 ixPtr (ixOff + 10)
-      let (execPrice, fillQty) ← validateMatcherLeg (mcData + 16 + i * 16) maxQty limitPrice takerIsLong
+      let takerIsBuying : UInt8 :=
+        if (mode == 0 && takerIsLong != 0) || (mode == 1 && takerIsLong == 0) then 1 else 0
+      let (execPrice, fillQty) ← validateMatcherLeg (mcData + 16 + i * 16) maxQty limitPrice takerIsBuying
       let fLData := if takerIsLong != 0 then takerData else lpData
       let fSData := if takerIsLong != 0 then lpData    else takerData
       storeU64 argsBuf 0  (AccountView.keyPtr mkt)
@@ -1927,7 +1936,7 @@ def handleTradeWithMatcher (input : Ptr) : SolanaM Unit := do
   let mktArr  ← stackAlloc 64
   let reqBuf  ← stackAlloc 416
   let ctxBuf  ← stackAlloc 48
-  storeU8  reqBuf 0  5
+  storeU8  reqBuf 0  2
   storeU8  reqBuf 1  k8
   storeU64 reqBuf 8  (← loadU64 lpData PflOff.capital)
   storeU64 reqBuf 16 curSlot

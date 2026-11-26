@@ -1,13 +1,17 @@
 /-
   Percolator.Matcher
-  Minimal, formally verified external passive-LP AMM / Spread Matcher program that
-  composes with `percolator-lean` via CPI (`sol_invoke_signed_c`).
+  Minimal, formally verified 0-Signer Multi-Market CPI-Out PropAMM reference program for
+  `percolator-lean::TradeWithMatcher`.
 
-  Zero changes to core `percolator-lean`:
-  - Owns an LP `Portfolio` via PDA `["lpau", config.key, bump]`.
-  - Any trader executes single-signer `Fill` (open or close!) against resting LP liquidity
-    at a deterministic, mark-bounded quote (`halfSpreadBps + qty * impactBps`).
-  - LP owner updates parameters (`UpdateMatcher`) or withdraws collateral (`WithdrawLp`).
+  Zero custody, zero PDA signer delegation, zero transaction introspection:
+  - LP retains 100% EOA ownership over their `percolator` `Portfolio` and binds `PropCtx`
+    via `SetPortfolioMatcher`.
+  - `TradeWithMatcher` passes ALL `k ∈ [1..8]` offers in ONE single 0-signer CPI (`Op 2`),
+    so the PropAMM sees the full basket atomically: if a multi-market batch contains BOTH
+    buying and selling legs (`mask == 3`), it grants a 50% hedged-basket half-spread discount!
+  - Standard market pricing on BOTH open (`mode = 0`) and reduce (`mode = 1`):
+    buyers (`open Long` / `reduce Short`) always receive Ask (`≥ markP`),
+    sellers (`open Short` / `reduce Long`) always receive Bid (`≤ markP`).
 -/
 import LeanSVM
 import Percolator.Layout
@@ -17,35 +21,11 @@ namespace Percolator.Matcher
 open LeanSVM
 open LeanSVM.Input
 open LeanSVM.Math
-open LeanSVM.CPI
 open Percolator
 
-def MAGIC_MATCHER : UInt32 := 0x4843544D -- "MTCH"
-def TAG_LP_AUTH   : UInt32 := 0x7561706C -- "lpau"
-
 namespace MErr
-  def paused       : UInt64 := 200
-  def qtyTooLarge  : UInt64 := 201
-  def slippage     : UInt64 := 202
-  def progMismatch : UInt64 := 203
-  def pflMismatch  : UInt64 := 204
-  def mktMismatch  : UInt64 := 205
-  def invalidMode  : UInt64 := 206
+  def paused : UInt64 := 200
 end MErr
-
-namespace CfgOff
-  def size          : UInt64 := 160
-  def magic         : UInt64 := 0   -- u32 ("MTCH")
-  def pdaBump       : UInt64 := 4   -- u8
-  def paused        : UInt64 := 5   -- u8
-  def owner         : UInt64 := 8   -- Pubkey (32)
-  def percProg      : UInt64 := 40  -- Pubkey (32)
-  def lpPortfolio   : UInt64 := 72  -- Pubkey (32)
-  def halfSpreadBps : UInt64 := 104 -- u64
-  def impactBps     : UInt64 := 112 -- u64 (per 1.0 E6 unit)
-  def maxFillQty    : UInt64 := 120 -- u64
-  def market        : UInt64 := 128 -- Pubkey (32) pinned Market!
-end CfgOff
 
 /-! Zero-copy Multi-Market CPI-Out PropAMM Context (`208` bytes):
     Bytes `0..144` hold the standard `percolator` `MatcherReturn` header (`16 B`: `[magic="MRET", status, seq]`)
@@ -65,7 +45,6 @@ namespace PropOff
 end PropOff
 
 theorem matcher_layout_sizes_valid :
-    CfgOff.market + 32 ≤ CfgOff.size ∧ CfgOff.size % 8 == 0 ∧
     PropOff.quotesBase + MAX_LEGS * 16 ≤ PropOff.owner ∧
     PropOff.paused + 1 ≤ PropOff.size ∧ PropOff.size % 8 == 0 := by
   decide
@@ -108,36 +87,30 @@ theorem quoteBid_within_maxMove (markP halfSpread impact qty maxMove : Nat) (hm 
   have hdiv := Nat.div_le_div_right (c := 10_000) hmul
   split <;> omega
 
-/-- Formal Proof #5 (`Matcher::Fill` Mode & Spread-Direction Soundness):
-    For any allowed fill mode (`mode = 0` open or `mode = 1` reduce — strictly excluding
-    hand-off modes `2/3` which swap `applyExecSpread`'s payer/payee!), the quoted `execPrice`
-    (`ask ≥ markP` when taker is Long / `fL = taker`, `bid ≤ markP` when taker is Short / `fS = taker`)
-    ALWAYS directs spread strictly FROM taker TO passive LP (never draining the LP!). -/
+/-- Formal Proof #5 (`PropAMM` Universal Open/Reduce Spread-Direction Soundness):
+    Across ALL allowed modes (`mode = 0` open or `mode = 1` reduce), computing
+    `takerIsBuying = (mode == 0 && takerIsLong) || (mode == 1 && !takerIsLong)` quotes:
+    - Ask (`≥ markP`) whenever taker is buying (`open Long` or `reduce Short`),
+    - Bid (`≤ markP`) whenever taker is selling (`open Short` or `reduce Long`),
+    so `tradeCore` (`applyExecSpread`) ALWAYS directs spread strictly FROM taker TO passive LP! -/
 theorem matcher_fill_spread_favors_lp
     (mode : UInt8) (takerIsLong : Bool) (markP halfSpread impact qty maxMove : Nat)
     (hmode : mode = 0 ∨ mode = 1) (hm : markP ≥ 1) :
+    let takerIsBuying := (mode == 0 && takerIsLong) || (mode == 1 && !takerIsLong)
     (mode ≠ 2 ∧ mode ≠ 3) ∧
-    (if takerIsLong then quoteAskNat markP halfSpread impact qty maxMove ≥ markP
+    (if takerIsBuying then quoteAskNat markP halfSpread impact qty maxMove ≥ markP
      else quoteBidNat markP halfSpread impact qty maxMove ≤ markP) := by
+  dsimp only
   refine ⟨?_, ?_⟩
   · rcases hmode with rfl | rfl <;> decide
-  · cases takerIsLong
+  · rcases hmode with rfl | rfl <;> cases takerIsLong <;> simp only [beq_self_eq_true, Bool.true_and,
+      Bool.not_true, Bool.not_false, Bool.or_false, Bool.false_or]
     · exact quoteBid_le_mark markP halfSpread impact qty maxMove hm
     · exact quoteAsk_ge_mark markP halfSpread impact qty maxMove
+    · exact quoteAsk_ge_mark markP halfSpread impact qty maxMove
+    · exact quoteBid_le_mark markP halfSpread impact qty maxMove hm
 
-/-! ### CPI Signer Helper -/
-
-def writeMatcherPdaSeeds (sbuf : Ptr) (cfgKeyPtr : Ptr) (bump : UInt8) : SolanaM Ptr := do
-  let seedsArr   := sbuf + 8
-  let signersArr := sbuf + 56
-  storeU32 sbuf 0 TAG_LP_AUTH
-  storeU8  sbuf 4 bump
-  storeU64 seedsArr 0  sbuf;       storeU64 seedsArr 8  4
-  storeU64 seedsArr 16 cfgKeyPtr;  storeU64 seedsArr 24 32
-  storeU64 seedsArr 32 (sbuf + 4); storeU64 seedsArr 40 1
-  storeU64 signersArr 0 seedsArr
-  storeU64 signersArr 8 3
-  return signersArr
+/-! ### Runtime Helpers & 3 Minimal CPI-Out Instructions -/
 
 def zeroMatcherWords (base off nWords : UInt64) : SolanaM Unit := do
   if h : nWords == 0 then return ()
@@ -155,215 +128,9 @@ decreasing_by
   rw [UInt64.toNat_sub_of_le _ _ (UInt64.le_iff_toNat_le.mpr (by omega)), h1]
   omega
 
-def checkCfg (cfg : AccountView) (progId : Ptr) : SolanaM Unit := do
-  SolanaM.require (← pubkeyEq (AccountView.ownerPtr cfg) progId) Err.illegalOwner
-  SolanaM.require ((← AccountView.dataLen cfg) == CfgOff.size) Err.invalidAccountData
-  SolanaM.require ((← loadU32 (AccountView.dataPtr cfg) CfgOff.magic) == MAGIC_MATCHER) PErr.invalidMagic
-
-/-! ### 4 Minimal Instructions -/
-
-/-- Op 0: Initialize `MatcherConfig` pinned to `(percProg, lpPortfolio, market)` and CPI
-    `percolator::InitPortfolio` for the PDA-owned LP portfolio. -/
-def handleInitMatcher (input : Ptr) : SolanaM Unit := do
-  let (cfg, owner, dex, lpPfl, lpAuthPda, percProg, mkt, ix, progId) ← parse7 input
-  SolanaM.require (ix.len >= 28) Err.invalidInstructionData
-  SolanaM.require (← AccountView.isSigner owner) Err.missingRequiredSignature
-  SolanaM.require (← AccountView.isWritable cfg) Err.invalidAccountData
-  SolanaM.require (← pubkeyEq (AccountView.ownerPtr cfg) progId) Err.illegalOwner
-  SolanaM.require ((← AccountView.dataLen cfg) == CfgOff.size) Err.invalidAccountData
-  SolanaM.require ((← loadU32 (AccountView.dataPtr cfg) 0) == 0) Err.accountAlreadyInitialized
-  -- Validate pinned `mkt` is a genuine `percolator` Market!
-  SolanaM.require (← pubkeyEq (AccountView.ownerPtr mkt) (AccountView.keyPtr percProg)) Err.illegalOwner
-  SolanaM.require ((← AccountView.dataLen mkt) == MktOff.size) Err.invalidAccountData
-  SolanaM.require ((← loadU32 (AccountView.dataPtr mkt) MktOff.magic) == MAGIC_MARKET) PErr.invalidMagic
-
-  let pdaBump       ← loadU8  ix.ptr 1
-  let halfSpreadBps ← loadU64 ix.ptr 4
-  let impactBps     ← loadU64 ix.ptr 12
-  let maxFillQty    ← loadU64 ix.ptr 20
-  SolanaM.require (halfSpreadBps <= BPS_DEN && maxFillQty > 0) PErr.invalidParams
-
-  let cData := AccountView.dataPtr cfg
-  zeroMatcherWords cData 0 (CfgOff.size >>> 3)
-  storeU32 cData CfgOff.magic MAGIC_MATCHER
-  storeU8  cData CfgOff.pdaBump pdaBump
-  storeU8  cData CfgOff.paused 0
-  pubkeyCopy (cData + CfgOff.owner)       (AccountView.keyPtr owner)
-  pubkeyCopy (cData + CfgOff.percProg)    (AccountView.keyPtr percProg)
-  pubkeyCopy (cData + CfgOff.lpPortfolio) (AccountView.keyPtr lpPfl)
-  storeU64 cData CfgOff.halfSpreadBps halfSpreadBps
-  storeU64 cData CfgOff.impactBps     impactBps
-  storeU64 cData CfgOff.maxFillQty    maxFillQty
-  pubkeyCopy (cData + CfgOff.market)      (AccountView.keyPtr mkt)
-
-  -- CPI `percolator::InitPortfolio(dex[W], lpPfl[W], lpAuthPda[S])` signed by LP PDA!
-  let buf ← stackAlloc 336
-  let metas := buf + 40
-  let infos := buf + 88
-  let data  := buf + 256
-  let sbuf  := buf + 264
-  storeU8 data 0 IxOp.initPortfolio
-  writeMeta metas        dex       1 0
-  writeMeta (metas + 16) lpPfl     1 0
-  writeMeta (metas + 32) lpAuthPda 0 1
-  writeAccountInfo infos         dex
-  writeAccountInfo (infos + 56)  lpPfl
-  writeAccountInfo (infos + 112) lpAuthPda
-  writeInstruction buf (AccountView.keyPtr percProg) metas 3 data 1
-  let signersArr ← writeMatcherPdaSeeds sbuf (AccountView.keyPtr cfg) pdaBump
-  let rc ← sysInvokeSignedC buf infos 3 signersArr 1
-  SolanaM.require (rc == 0) rc
-
-/-- Op 1: LP owner updates quote parameters or pauses quoting. -/
-def handleUpdateMatcher (input : Ptr) : SolanaM Unit := do
-  let (cfg, owner, ix, progId) ← parse2 input
-  SolanaM.require (ix.len >= 28) Err.invalidInstructionData
-  SolanaM.require (← AccountView.isSigner owner) Err.missingRequiredSignature
-  SolanaM.require (← AccountView.isWritable cfg) Err.invalidAccountData
-  checkCfg cfg progId
-  let cData := AccountView.dataPtr cfg
-  SolanaM.require (← pubkeyEq (AccountView.keyPtr owner) (cData + CfgOff.owner)) PErr.ownerMismatch
-  let paused        ← loadU8  ix.ptr 1
-  let halfSpreadBps ← loadU64 ix.ptr 4
-  let impactBps     ← loadU64 ix.ptr 12
-  let maxFillQty    ← loadU64 ix.ptr 20
-  SolanaM.require (halfSpreadBps <= BPS_DEN && maxFillQty > 0) PErr.invalidParams
-  storeU8  cData CfgOff.paused        paused
-  storeU64 cData CfgOff.halfSpreadBps halfSpreadBps
-  storeU64 cData CfgOff.impactBps     impactBps
-  storeU64 cData CfgOff.maxFillQty    maxFillQty
-
-/-- Op 2: Permissionless single-signer taker `Fill` (open OR close) against passive LP portfolio! -/
-def handleFill (input : Ptr) : SolanaM Unit := do
-  let (cfg, dex, mkt, lpPfl, lpAuthPda, takerPfl, takerOwner, percProg, ix, progId) ← parse8 input
-  SolanaM.require (ix.len >= 19) Err.invalidInstructionData
-  SolanaM.require (← AccountView.isSigner takerOwner) Err.missingRequiredSignature
-  checkCfg cfg progId
-  let cData := AccountView.dataPtr cfg
-  SolanaM.require ((← loadU8 cData CfgOff.paused) == 0) MErr.paused
-  SolanaM.require (← pubkeyEq (AccountView.keyPtr percProg) (cData + CfgOff.percProg))    MErr.progMismatch
-  SolanaM.require (← pubkeyEq (AccountView.keyPtr lpPfl)    (cData + CfgOff.lpPortfolio)) MErr.pflMismatch
-  SolanaM.require (← pubkeyEq (AccountView.keyPtr mkt)      (cData + CfgOff.market))      MErr.mktMismatch
-
-  -- Validate `mkt` belongs to `percolatorProg` with exact size before reading `markPrice` & `maxMoveBps`
-  SolanaM.require (← pubkeyEq (AccountView.ownerPtr mkt) (AccountView.keyPtr percProg)) Err.illegalOwner
-  SolanaM.require ((← AccountView.dataLen mkt) == MktOff.size) Err.invalidAccountData
-  let mData := AccountView.dataPtr mkt
-  SolanaM.require ((← loadU32 mData MktOff.magic) == MAGIC_MARKET) PErr.invalidMagic
-
-  let mode        ← loadU8  ix.ptr 1
-  -- Restrict strictly to bilateral open (`0`) or reduce (`1`)! Hand-off modes (`2/3`) swap
-  -- `applyExecSpread`'s payer/payee and would drain the passive LP!
-  SolanaM.require (mode == 0 || mode == 1) MErr.invalidMode
-  let takerIsLong ← loadU8  ix.ptr 2
-  let qty         ← loadU64 ix.ptr 3
-  let limitPrice  ← loadU64 ix.ptr 11
-  SolanaM.require (qty > 0 && qty <= (← loadU64 cData CfgOff.maxFillQty)) MErr.qtyTooLarge
-
-  let markP   ← loadU64 mData MktOff.markPrice
-  let maxMove ← loadU64 mData MktOff.maxMoveBps
-  let halfSp  ← loadU64 cData CfgOff.halfSpreadBps
-  let impBps  ← loadU64 cData CfgOff.impactBps
-  let imp     ← mulDiv64 qty impBps POS_SCALE
-  let rawBps  ← checkedAdd64 halfSp imp
-  let effBps  := if rawBps > maxMove then maxMove else rawBps
-  let delta   ← mulDiv64 markP effBps BPS_DEN
-
-  let execPrice ← if takerIsLong != 0 then do
-      let ask ← checkedAdd64 markP delta
-      if limitPrice != 0 then SolanaM.require (ask <= limitPrice) MErr.slippage
-      pure ask
-    else do
-      let bid := if markP > delta then markP - delta else 1
-      if limitPrice != 0 then SolanaM.require (bid >= limitPrice) MErr.slippage
-      pure bid
-
-  let pflL   := if takerIsLong != 0 then takerPfl   else lpPfl
-  let ownerL := if takerIsLong != 0 then takerOwner else lpAuthPda
-  let pflS   := if takerIsLong != 0 then lpPfl      else takerPfl
-  let ownerS := if takerIsLong != 0 then lpAuthPda  else takerOwner
-
-  -- CPI `percolator::Trade(dex[W], mkt[W], pflL[W], ownerL[S], pflS[W], ownerS[S])`
-  let buf ← stackAlloc 568
-  let metas := buf + 40
-  let infos := buf + 136
-  let data  := buf + 472
-  let sbuf  := buf + 496
-  storeU8  data 0  IxOp.trade
-  storeU8  data 1  mode
-  storeU64 data 2  qty
-  storeU64 data 10 execPrice
-  writeMeta metas        dex    1 0
-  writeMeta (metas + 16) mkt    1 0
-  writeMeta (metas + 32) pflL   1 0
-  writeMeta (metas + 48) ownerL 0 1
-  writeMeta (metas + 64) pflS   1 0
-  writeMeta (metas + 80) ownerS 0 1
-  writeAccountInfo infos         dex
-  writeAccountInfo (infos + 56)  mkt
-  writeAccountInfo (infos + 112) pflL
-  writeAccountInfo (infos + 168) ownerL
-  writeAccountInfo (infos + 224) pflS
-  writeAccountInfo (infos + 280) ownerS
-  writeInstruction buf (AccountView.keyPtr percProg) metas 6 data 18
-  let bump ← loadU8 cData CfgOff.pdaBump
-  let signersArr ← writeMatcherPdaSeeds sbuf (AccountView.keyPtr cfg) bump
-  let rc ← sysInvokeSignedC buf infos 6 signersArr 1
-  SolanaM.require (rc == 0) rc
-
-/-- Op 3: LP owner withdraws collateral from PDA-owned LP portfolio via `percolator::WithdrawCollateral`. -/
-def handleWithdrawLp (input : Ptr) : SolanaM Unit := do
-  let (n, cfg, ix, progId) ← parseIxOnly input
-  SolanaM.require (n >= 10) Err.notEnoughAccountKeys
-  SolanaM.require (ix.len >= 9) Err.invalidInstructionData
-  let owner     ← AccountView.nextCursor cfg
-  let dex       ← AccountView.nextCursor owner
-  let lpPfl     ← AccountView.nextCursor dex
-  let lpAuthPda ← AccountView.nextCursor lpPfl
-  let destTok   ← AccountView.nextCursor lpAuthPda
-  let mint      ← AccountView.nextCursor destTok
-  let vaultPda  ← AccountView.nextCursor mint
-  let tokProg   ← AccountView.nextCursor vaultPda
-  let percProg  ← AccountView.nextCursor tokProg
-
-  SolanaM.require (← AccountView.isSigner owner) Err.missingRequiredSignature
-  checkCfg cfg progId
-  let cData := AccountView.dataPtr cfg
-  SolanaM.require (← pubkeyEq (AccountView.keyPtr owner)    (cData + CfgOff.owner))       PErr.ownerMismatch
-  SolanaM.require (← pubkeyEq (AccountView.keyPtr percProg) (cData + CfgOff.percProg))    MErr.progMismatch
-  SolanaM.require (← pubkeyEq (AccountView.keyPtr lpPfl)    (cData + CfgOff.lpPortfolio)) MErr.pflMismatch
-
-  let amount ← loadU64 ix.ptr 1
-  let buf ← stackAlloc 632
-  let metas := buf + 40
-  let infos := buf + 152
-  let data  := buf + 544
-  let sbuf  := buf + 560
-  storeU8  data 0 IxOp.withdrawCollateral
-  storeU64 data 1 amount
-  writeMeta metas        dex       1 0
-  writeMeta (metas + 16) lpPfl     1 0
-  writeMeta (metas + 32) lpAuthPda 0 1
-  writeMeta (metas + 48) destTok   1 0
-  writeMeta (metas + 64) mint      0 0
-  writeMeta (metas + 80) vaultPda  1 0
-  writeMeta (metas + 96) tokProg   0 0
-  writeAccountInfo infos         dex
-  writeAccountInfo (infos + 56)  lpPfl
-  writeAccountInfo (infos + 112) lpAuthPda
-  writeAccountInfo (infos + 168) destTok
-  writeAccountInfo (infos + 224) mint
-  writeAccountInfo (infos + 280) vaultPda
-  writeAccountInfo (infos + 336) tokProg
-  writeInstruction buf (AccountView.keyPtr percProg) metas 7 data 9
-  let bump ← loadU8 cData CfgOff.pdaBump
-  let signersArr ← writeMatcherPdaSeeds sbuf (AccountView.keyPtr cfg) bump
-  let rc ← sysInvokeSignedC buf infos 7 signersArr 1
-  SolanaM.require (rc == 0) rc
-
-/-- Op 4 (`InitPropAmm`): Initialize a 96-byte CPI-Out PropAMM context account (`owner == progId`, `magic == 0`).
+/-- Op 0 (`InitPropAmm`): Initialize a 208-byte CPI-Out PropAMM context (`owner == progId`, `magic == 0`).
     Accounts: `0. ctx (W)`, `1. owner (S)`.
-    Ix data (28B): `[4, paused:u8, pad:u16, halfSpreadBps:u64, impactBps:u64, maxFillQty:u64]`. -/
+    Ix data (28B): `[0, paused:u8, pad:u16, halfSpreadBps:u64, impactBps:u64, maxFillQty:u64]`. -/
 def handleInitPropAmm (input : Ptr) : SolanaM Unit := do
   let (ctx, owner, ix, progId) ← parse2 input
   SolanaM.require (ix.len >= 28) Err.invalidInstructionData
@@ -387,13 +154,39 @@ def handleInitPropAmm (input : Ptr) : SolanaM Unit := do
   storeU64 d PropOff.maxFillQty    maxFillQty
   storeU8  d PropOff.paused        paused
 
-/-- Scan all `k` offers in the CPI-Out request to return a 2-bit side mask:
-    bit 0 = hasShort, bit 1 = hasLong. When `(mask == 3)` (both long & short in ONE batch!),
-    the PropAMM sees a correlated hedged basket without tx introspection and grants a 50% spread discount! -/
+/-- Op 1 (`UpdatePropAmm`): Owner updates PropAMM quoting parameters or pauses quoting.
+    Accounts: `0. ctx (W)`, `1. owner (S)`.
+    Ix data (28B): `[1, paused:u8, pad:u16, halfSpreadBps:u64, impactBps:u64, maxFillQty:u64]`. -/
+def handleUpdatePropAmm (input : Ptr) : SolanaM Unit := do
+  let (ctx, owner, ix, progId) ← parse2 input
+  SolanaM.require (ix.len >= 28) Err.invalidInstructionData
+  SolanaM.require (← AccountView.isSigner owner) Err.missingRequiredSignature
+  SolanaM.require (← AccountView.isWritable ctx) Err.invalidAccountData
+  SolanaM.require (← pubkeyEq (AccountView.ownerPtr ctx) progId) Err.illegalOwner
+  SolanaM.require ((← AccountView.dataLen ctx) == PropOff.size) Err.invalidAccountData
+  let d := AccountView.dataPtr ctx
+  SolanaM.require ((← loadU32 d PropOff.magic) == MAGIC_MRET) PErr.invalidMagic
+  SolanaM.require (← pubkeyEq (AccountView.keyPtr owner) (d + PropOff.owner)) PErr.ownerMismatch
+  let paused        ← loadU8  ix.ptr 1
+  let halfSpreadBps ← loadU64 ix.ptr 4
+  let impactBps     ← loadU64 ix.ptr 12
+  let maxFillQty    ← loadU64 ix.ptr 20
+  SolanaM.require (halfSpreadBps <= BPS_DEN && maxFillQty > 0) PErr.invalidParams
+  storeU8  d PropOff.paused        paused
+  storeU64 d PropOff.halfSpreadBps halfSpreadBps
+  storeU64 d PropOff.impactBps     impactBps
+  storeU64 d PropOff.maxFillQty    maxFillQty
+
+/-- Scan all `k` offers in the CPI-Out request to return a 2-bit economic buy/sell mask:
+    bit 0 = hasSell, bit 1 = hasBuy. When `(mask == 3)` (both buys & sells in ONE batch!),
+    the PropAMM sees a hedged basket without tx introspection and grants a 50% spread discount! -/
 def scanBatchSideMask (ixPtr : Ptr) (i k mask : UInt64) : SolanaM UInt64 := do
   if _h : i < k then
-    let side ← loadU8 ixPtr (32 + i * 48 + 1)
-    let bit : UInt64 := if side != 0 then 2 else 1
+    let oPtr := ixPtr + 32 + i * 48
+    let mode ← loadU8 oPtr 0
+    let side ← loadU8 oPtr 1
+    let isBuying := (mode == 0 && side != 0) || (mode == 1 && side == 0)
+    let bit : UInt64 := if isBuying then 2 else 1
     scanBatchSideMask ixPtr (i + 1) k (mask ||| bit)
   else
     return mask
@@ -423,7 +216,8 @@ def quoteBatchOffersLoop (d ixPtr : Ptr) (effHalfSp i k : UInt64) : SolanaM Unit
     let rawBps  ← checkedAdd64 effHalfSp imp
     let effBps  := if rawBps > maxMove then maxMove else rawBps
     let delta   ← mulDiv64 markP effBps BPS_DEN
-    let execPrice ← if takerIsLong != 0 then
+    let isBuying := (mode == 0 && takerIsLong != 0) || (mode == 1 && takerIsLong == 0)
+    let execPrice ← if isBuying then
         checkedAdd64 markP delta
       else
         pure (if markP > delta then markP - delta else 1)
@@ -442,10 +236,10 @@ decreasing_by
     rw [UInt64.toNat_add, h1, Nat.mod_eq_of_lt (by have := k.toNat_lt; omega)]
   omega
 
-/-- Op 5 (`PropAmmQuote`): Multi-Market (`k ∈ [1..8]`) CPI-Out PropAMM quoting entrypoint invoked
+/-- Op 2 (`PropAmmQuote`): Multi-Market (`k ∈ [1..8]`) CPI-Out PropAMM quoting entrypoint invoked
     by `percolator::TradeWithMatcher` with ZERO signers (`[ctx (W)]`).
     Sees ALL `k` offers in ONE CPI without tx introspection: if the batch includes offsetting
-    long + short legs (`mask == 3`), halves `halfSpreadBps` across the entire basket! -/
+    buy + sell legs (`mask == 3`), halves `halfSpreadBps` across the entire basket! -/
 def handlePropAmmQuote (input : Ptr) : SolanaM Unit := do
   let (n, ctx, ix, progId) ← parseIxOnly input
   SolanaM.require (n >= 1 && ix.len >= 80) Err.invalidInstructionData
@@ -473,12 +267,9 @@ def dispatch (input : Ptr) : SolanaM Unit := do
   let (_, _, ix, _) ← parseIxOnly input
   SolanaM.require (ix.len >= 1) Err.invalidInstructionData
   let op ← loadU8 ix.ptr 0
-  if op == 0 then handleInitMatcher input
-  else if op == 1 then handleUpdateMatcher input
-  else if op == 2 then handleFill input
-  else if op == 3 then handleWithdrawLp input
-  else if op == 4 then handleInitPropAmm input
-  else if op == 5 then handlePropAmmQuote input
+  if op == 0 then handleInitPropAmm input
+  else if op == 1 then handleUpdatePropAmm input
+  else if op == 2 then handlePropAmmQuote input
   else SolanaM.fail PErr.invalidInstruction
 
 def entrypoint (input : Ptr) (s : SvmState) : UInt64 × SvmState :=

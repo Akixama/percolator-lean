@@ -573,7 +573,27 @@ fn ix_init_prop_amm(
     paused: u8, half_spread_bps: u64, impact_bps: u64, max_fill_qty: u64,
 ) -> Instruction {
     let mut data = vec![0u8; 28];
-    data[0] = 4;
+    data[0] = 0;
+    data[1] = paused;
+    data[4..12].copy_from_slice(&half_spread_bps.to_le_bytes());
+    data[12..20].copy_from_slice(&impact_bps.to_le_bytes());
+    data[20..28].copy_from_slice(&max_fill_qty.to_le_bytes());
+    Instruction {
+        program_id: matcher_prog,
+        accounts: vec![
+            AccountMeta::new(ctx, false),
+            AccountMeta::new_readonly(owner, true),
+        ],
+        data,
+    }
+}
+
+fn ix_update_prop_amm(
+    matcher_prog: Address, ctx: Address, owner: Address,
+    paused: u8, half_spread_bps: u64, impact_bps: u64, max_fill_qty: u64,
+) -> Instruction {
+    let mut data = vec![0u8; 28];
+    data[0] = 1;
     data[1] = paused;
     data[4..12].copy_from_slice(&half_spread_bps.to_le_bytes());
     data[12..20].copy_from_slice(&impact_bps.to_le_bytes());
@@ -705,7 +725,7 @@ fn ix_claim_quote(
             AccountMeta::new(cfg, false),
             AccountMeta::new(epoch_acc, false),
             AccountMeta::new(bid_receipt, false),
-            AccountMeta::new_readonly(bidder, true),
+            AccountMeta::new(bidder, true),
             AccountMeta::new_readonly(rew_auth_pda, false),
             AccountMeta::new(quote_vault, false),
             AccountMeta::new(bidder_quote_tok, false),
@@ -2366,104 +2386,69 @@ fn main() {
         cu_pyth, cu_cl, cu_sb, cu_ratio, cu_ewma_live, cu_ewma_ah, cu_push_ewma
     );
 
-    // 9B: Passive LP AMM Matcher CPI composition (Single-Signer Taker Open & Close!)
-    let mtch_cfg = create_prog_acc(&mut svm, &matcher_prog, 160);
-    let (lp_auth_pda, lp_bump) = Address::find_program_address(&[b"lpau", mtch_cfg.as_ref()], &matcher_prog);
-    let lp_pfl = create_prog_acc(&mut svm, &prog_id, PFL_SIZE);
-    let mut init_m_data = vec![0u8; 28];
-    init_m_data[0] = 0;
-    init_m_data[1] = lp_bump;
-    init_m_data[4..12].copy_from_slice(&50u64.to_le_bytes());       // halfSpread = 50 bps (0.50%)
-    init_m_data[12..20].copy_from_slice(&20u64.to_le_bytes());      // impact = 20 bps / unit
-    init_m_data[20..28].copy_from_slice(&(10 * POS_SCALE).to_le_bytes()); // maxFillQty = 10
+    // 9B: Pure 0-Signer CPI-Out PropAMM Composition (Single-Signer Taker Open & Close, 100% EOA LP Custody!)
+    let mtch_ctx = create_prog_acc(&mut svm, &matcher_prog, PROP_AMM_SIZE);
     send_ok(
         &mut svm,
-        Instruction {
-            program_id: matcher_prog,
-            accounts: vec![
-                AccountMeta::new(mtch_cfg, false),
-                AccountMeta::new_readonly(lp.pubkey(), true),
-                AccountMeta::new(dex, false),
-                AccountMeta::new(lp_pfl, false),
-                AccountMeta::new_readonly(lp_auth_pda, false),
-                AccountMeta::new_readonly(prog_id, false),
-                AccountMeta::new_readonly(comp_mkt2, false),
-            ],
-            data: init_m_data,
-        },
+        ix_init_prop_amm(matcher_prog, mtch_ctx, lp.pubkey(), 0, 50, 20, 10 * POS_SCALE),
         &payer,
         &[&payer, &lp],
     );
-    // Fund LP portfolio ($500) directly via core DepositCollateral? Note: DepositCollateral requires owner signature,
-    // OR even cleaner: fund LP by depositing to a temporary owner or wait — let's check: lp_pfl.owner == lp_auth_pda!
-    // So let's let LP fund via a direct zero-spread transfer or wait: in Suite 9B let's test LP deposit through
-    // a tiny helper OR let LP trade against Alice? Wait: DepositCollateral requires `owner` signer (which is `lp_auth_pda`)!
-    // Catching this in a real LiteSVM test is GOLD: `DepositCollateral` should allow ANY depositor (`depositor[S]`, NOT only `pfl.owner`!) to top up `pfl.capital`!
-    // Let's verify that in Program.lean right now!
+    let lp_pfl = create_prog_acc(&mut svm, &prog_id, PFL_SIZE);
+    send_ok(&mut svm, ix_init_portfolio(prog_id, dex, lp_pfl, lp.pubkey()), &payer, &[&payer, &lp]);
+    send_ok(&mut svm, ix_set_portfolio_matcher(prog_id, lp_pfl, lp.pubkey(), Some(mtch_ctx)), &payer, &[&payer, &lp]);
+    send_ok(&mut svm, ix_deposit_collateral(prog_id, dex, lp_pfl, lp.pubkey(), lp_tok, mint, dex_vault, TOKEN_PROGRAM_ID, 500 * POS_SCALE), &payer, &[&payer, &lp]);
+
     let taker_kp = Keypair::new();
     svm.airdrop(&taker_kp.pubkey(), 10_000_000_000).unwrap();
     let taker_tok = create_tok_acc(&mut svm, &mint, &taker_kp.pubkey(), 1_000 * POS_SCALE);
     let taker_pfl = create_prog_acc(&mut svm, &prog_id, PFL_SIZE);
     send_ok(&mut svm, ix_init_portfolio(prog_id, dex, taker_pfl, taker_kp.pubkey()), &payer, &[&payer, &taker_kp]);
     send_ok(&mut svm, ix_deposit_collateral(prog_id, dex, taker_pfl, taker_kp.pubkey(), taker_tok, mint, dex_vault, TOKEN_PROGRAM_ID, 200 * POS_SCALE), &payer, &[&payer, &taker_kp]);
-    // Permissionless deposit into PDA-owned LP portfolio (`lp` signs as depositor for `lp_pfl`!)
-    send_ok(&mut svm, ix_deposit_collateral(prog_id, dex, lp_pfl, lp.pubkey(), lp_tok, mint, dex_vault, TOKEN_PROGRAM_ID, 500 * POS_SCALE), &payer, &[&payer, &lp]);
 
-    let ix_fill = |mode: u8, taker_is_long: u8, qty: u64, limit_p: u64| {
-        let mut d = vec![0u8; 19];
-        d[0] = 2;
-        d[1] = mode;
-        d[2] = taker_is_long;
-        d[3..11].copy_from_slice(&qty.to_le_bytes());
-        d[11..19].copy_from_slice(&limit_p.to_le_bytes());
-        Instruction {
-            program_id: matcher_prog,
-            accounts: vec![
-                AccountMeta::new_readonly(mtch_cfg, false),
-                AccountMeta::new(dex, false),
-                AccountMeta::new(comp_mkt2, false),
-                AccountMeta::new(lp_pfl, false),
-                AccountMeta::new_readonly(lp_auth_pda, false),
-                AccountMeta::new(taker_pfl, false),
-                AccountMeta::new_readonly(taker_kp.pubkey(), true),
-                AccountMeta::new_readonly(prog_id, false),
-            ],
-            data: d,
-        }
-    };
-    // Slippage check: ask = $115 * (1 + 90bps) = $116.035 -> limit $115.50 REJECTED!
-    send_err(&mut svm, ix_fill(0, 1, 2 * POS_SCALE, 115_500_000), &payer, &[&payer, &taker_kp], "Matcher rejects fill exceeding slippage limit");
-    // Single-signer Taker OPEN Long 2.0 against passive LP (ZERO LP signature!)
-    let cu_fill_open = send_ok(&mut svm, ix_fill(0, 1, 2 * POS_SCALE, 117 * POS_SCALE), &payer, &[&payer, &taker_kp]);
+    // Slippage check: ask = $115 * (1 + 90bps) = $116.035 -> limit $115.50 REJECTED (Custom(130))!
+    send_err_custom(
+        &mut svm,
+        ix_trade_with_matcher(prog_id, dex, comp_mkt2, taker_pfl, taker_kp.pubkey(), lp_pfl, matcher_prog, mtch_ctx, None, 0, true, 2 * POS_SCALE, 115_500_000),
+        &payer, &[&payer, &taker_kp], 130, "Core rejects CPI-Out quote exceeding taker limitPrice",
+    );
+    // Single-signer Taker OPEN Long 2.0 against passive LP at Ask $116.035 (ZERO LP signature!)
+    let cu_fill_open = send_ok(
+        &mut svm,
+        ix_trade_with_matcher(prog_id, dex, comp_mkt2, taker_pfl, taker_kp.pubkey(), lp_pfl, matcher_prog, mtch_ctx, None, 0, true, 2 * POS_SCALE, 117 * POS_SCALE),
+        &payer, &[&payer, &taker_kp],
+    );
     let lp_cap_after_open = read_u64(&svm, &lp_pfl, 88);
-    assert_eq!(lp_cap_after_open, 502_070_000, "LP must earn exact $2.07 spread on 2.0 fill at 90bps!");
-    // Single-signer Taker CLOSE Long 2.0 against passive LP (ZERO LP signature!)
-    let cu_fill_close = send_ok(&mut svm, ix_fill(1, 1, 2 * POS_SCALE, 117 * POS_SCALE), &payer, &[&payer, &taker_kp]);
-    assert_eq!(read_u64(&svm, &comp_mkt2, 256), 0, "OI must return to 0 after single-signer close!");
+    assert_eq!(lp_cap_after_open, 502_070_000, "LP must earn exact $2.07 spread on 2.0 open at 90bps!");
 
-    // LP owner withdraws $100 via Matcher::WithdrawLp (PDA signs percolator::WithdrawCollateral!)
-    let mut wdr_lp_data = vec![0u8; 9];
-    wdr_lp_data[0] = 3;
-    wdr_lp_data[1..9].copy_from_slice(&(100 * POS_SCALE).to_le_bytes());
+    // Pause check via Op 1 (`UpdatePropAmm`): paused PropAMM rejects quoting (Custom(200)), then unpause!
+    send_ok(&mut svm, ix_update_prop_amm(matcher_prog, mtch_ctx, lp.pubkey(), 1, 50, 20, 10 * POS_SCALE), &payer, &[&payer, &lp]);
+    send_err_custom(
+        &mut svm,
+        ix_trade_with_matcher(prog_id, dex, comp_mkt2, taker_pfl, taker_kp.pubkey(), lp_pfl, matcher_prog, mtch_ctx, None, 1, true, 2 * POS_SCALE, 113 * POS_SCALE),
+        &payer, &[&payer, &taker_kp], 200, "Paused PropAMM rejects quoting",
+    );
+    send_ok(&mut svm, ix_update_prop_amm(matcher_prog, mtch_ctx, lp.pubkey(), 0, 50, 20, 10 * POS_SCALE), &payer, &[&payer, &lp]);
+
+    // Single-signer Taker CLOSE Long 2.0 against passive LP at standard Bid $113.965 (seller limit >= $113)!
+    send_err_custom(
+        &mut svm,
+        ix_trade_with_matcher(prog_id, dex, comp_mkt2, taker_pfl, taker_kp.pubkey(), lp_pfl, matcher_prog, mtch_ctx, None, 1, true, 2 * POS_SCALE, 114_500_000),
+        &payer, &[&payer, &taker_kp], 130, "Reduce seller limitPrice rejects bid below floor",
+    );
+    let cu_fill_close = send_ok(
+        &mut svm,
+        ix_trade_with_matcher(prog_id, dex, comp_mkt2, taker_pfl, taker_kp.pubkey(), lp_pfl, matcher_prog, mtch_ctx, None, 1, true, 2 * POS_SCALE, 113 * POS_SCALE),
+        &payer, &[&payer, &taker_kp],
+    );
+    assert_eq!(read_u64(&svm, &comp_mkt2, 256), 0, "OI must return to 0 after single-signer close!");
+    assert_eq!(read_u64(&svm, &lp_pfl, 88), 504_140_000, "LP must earn ANOTHER exact $2.07 spread on 2.0 close at Bid $113.965!");
+
+    // LP owner withdraws $100 DIRECTLY from their EOA-owned portfolio (ZERO PDA custody!)
     let lp_tok_before = token_amount(&svm, &lp_tok);
     let cu_wdr_lp = send_ok(
         &mut svm,
-        Instruction {
-            program_id: matcher_prog,
-            accounts: vec![
-                AccountMeta::new_readonly(mtch_cfg, false),
-                AccountMeta::new_readonly(lp.pubkey(), true),
-                AccountMeta::new(dex, false),
-                AccountMeta::new(lp_pfl, false),
-                AccountMeta::new_readonly(lp_auth_pda, false),
-                AccountMeta::new(lp_tok, false),
-                AccountMeta::new_readonly(mint, false),
-                AccountMeta::new(dex_vault, false),
-                AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),
-                AccountMeta::new_readonly(prog_id, false),
-            ],
-            data: wdr_lp_data,
-        },
+        ix_withdraw_collateral(prog_id, dex, lp_pfl, lp.pubkey(), lp_tok, mint, dex_vault, TOKEN_PROGRAM_ID, 100 * POS_SCALE),
         &payer,
         &[&payer, &lp],
     );
@@ -2656,7 +2641,7 @@ fn main() {
 
     // 10b. Verify Trade(mode=1) execPrice spread CANNOT drain payer below remaining totalMm!
     step_oracle(&mut svm, prog_id, fair_mkt, &fair_orc, 94_450_000, &payer);
-    send_err(&mut svm, ix_trade_ext(prog_id, dex, fair_mkt, vic_pfl, victim.pubkey(), cp_pfl, cparty.pubkey(), 1, 10_000, 95_000_000),
+    send_err(&mut svm, ix_trade_ext(prog_id, dex, fair_mkt, vic_pfl, victim.pubkey(), cp_pfl, cparty.pubkey(), 1, 10_000, 93_900_000),
         &payer, &[&payer, &victim, &cparty], "Trade(mode=1) execPrice draining below totalMm rejected");
 
     // 10c. Fair Partial Liquidation + Permissionless Takeover (**ZERO ADL ON INNOCENT COUNTERPARTY!**)
@@ -3457,14 +3442,21 @@ fn main() {
             let ep2 = create_prog_acc(&mut svm, &rew_prog, EPOCH_SIZE);
             send_ok(&mut svm, ix_start_epoch(rew_prog, r_cfgs[1], ep2, r_dex, r_mkts[1], r_pdas[1], mint, r_vault, r_q_vaults[1], TOKEN_PROGRAM_ID, prog_id), &payer, &[&payer]);
             assert_eq!(read_u64(&svm, &ep2, 48), expected_roll, "Epoch 2 carries 100% of rolled-over quote!");
-            assert_eq!(read_u64(&svm, &ep2, 56), expected_roll / 4, "Epoch 2 virtBids reflects halved reserveRateE6 (0.25)!");
+            let exp_virt2 = ((expected_roll as u128 * (init_reserve_rate_e6 / 2) as u128 + 999_999) / 1_000_000) as u64;
+            assert_eq!(read_u64(&svm, &ep2, 56), exp_virt2, "Epoch 2 virtBids reflects ceil(rollover * 0.25)!");
         } else {
-            // Healthy epoch: bidder_a (10) & bidder_b (30) claim at EXACT uniform xy=k price!
+            // Healthy epoch: bidder_a (10) & bidder_b (30) claim at EXACT uniform xy=k price AND reclaim BidReceipt rent!
             let qa_pre = token_amount(&svm, &r_bidder_a_q);
             let qb_pre = token_amount(&svm, &r_bidder_b_q);
+            let lam_a_pre = svm.get_account(&r_bidder_a.pubkey()).unwrap().lamports;
+            let lam_rec_a = svm.get_account(&rec_a[i].unwrap()).unwrap().lamports;
+            let lam_b_pre = svm.get_account(&r_bidder_b.pubkey()).unwrap().lamports;
+            let lam_rec_b = svm.get_account(&rec_b[i].unwrap()).unwrap().lamports;
             let cu_ca = send_ok(&mut svm, ix_claim_quote(rew_prog, r_cfgs[i], r_ep1[i], rec_a[i].unwrap(), r_bidder_a.pubkey(), r_pdas[i], r_q_vaults[i], r_bidder_a_q, mint, TOKEN_PROGRAM_ID), &payer, &[&payer, &r_bidder_a]);
             let cu_cb = send_ok(&mut svm, ix_claim_quote(rew_prog, r_cfgs[i], r_ep1[i], rec_b[i].unwrap(), r_bidder_b.pubkey(), r_pdas[i], r_q_vaults[i], r_bidder_b_q, mint, TOKEN_PROGRAM_ID), &payer, &[&payer, &r_bidder_b]);
             max_claim_cu = max_claim_cu.max(cu_ca).max(cu_cb);
+            assert_eq!(svm.get_account(&r_bidder_a.pubkey()).unwrap().lamports, lam_a_pre + lam_rec_a, "Mkt {} ClaimQuote refunded 100% of BidReceipt rent to bidder_a!", i);
+            assert_eq!(svm.get_account(&r_bidder_b.pubkey()).unwrap().lamports, lam_b_pre + lam_rec_b, "Mkt {} ClaimQuote refunded 100% of BidReceipt rent to bidder_b!", i);
             let got_a = token_amount(&svm, &r_bidder_a_q) - qa_pre;
             let got_b = token_amount(&svm, &r_bidder_b_q) - qb_pre;
             let exp_a = ((q_pot as u128 * (10 * POS_SCALE) as u128) / (tot_b as u128 + b_virt as u128)) as u64;
@@ -3475,13 +3467,13 @@ fn main() {
             assert!(got_b.abs_diff(3 * got_a) <= 3, "Uniform clearing price violated: got_a={}, got_b={}", got_a, got_b);
 
             if i == 0 {
-                // Double-claim rejected!
-                send_err_custom(
+                // Double-claim rejected (closed BidReceipt cannot be re-claimed)!
+                send_err(
                     &mut svm,
                     ix_claim_quote(rew_prog, r_cfgs[0], r_ep1[0], rec_a[0].unwrap(), r_bidder_a.pubkey(), r_pdas[0], r_q_vaults[0], r_bidder_a_q, mint, TOKEN_PROGRAM_ID),
-                    &payer, &[&payer, &r_bidder_a], 412, "Double ClaimQuote rejected",
+                    &payer, &[&payer, &r_bidder_a], "Double ClaimQuote on auto-closed receipt rejected",
                 );
-                // All 5 1-atom spam receipts receive 0 USDC!
+                // All 5 1-atom spam receipts receive 0 USDC AND auto-close cleanly!
                 let sp_pre = token_amount(&svm, &r_spammer_q);
                 for sr in &spam_recs_m0 {
                     send_ok(&mut svm, ix_claim_quote(rew_prog, r_cfgs[0], r_ep1[0], *sr, r_spammer.pubkey(), r_pdas[0], r_q_vaults[0], r_spammer_q, mint, TOKEN_PROGRAM_ID), &payer, &[&payer, &r_spammer]);
@@ -3502,6 +3494,61 @@ fn main() {
             assert_eq!(read_u64(&svm, &r_mkts[j], 224), expected_ins[j], "Settle/Claim({}) modified Market {} insurance!", i, j);
         }
     }
+    // 13.8 Small-pot `virtBids` ceil regression (`totalPot * resRate < 1_000_000` -> `virtBids == 1 > 0`!):
+    //      Pre-fix floor rounded `virtBids = 0` so a 1-atom bidder drained 100% of `totalPot`!
+    //      With `mulDiv64Ceil`, `virtBids == 1`, so 1-atom bidder gets at most `floor(100 * 1 / 2) = 50`!
+    {
+        let sp_creator = Keypair::new();
+        svm.airdrop(&sp_creator.pubkey(), 1_000_000_000).unwrap();
+        let sp_mkt = create_prog_acc(&mut svm, &prog_id, MKT_SIZE);
+        let sp_cfg = create_prog_acc(&mut svm, &rew_prog, REW_SIZE);
+        let (sp_pda, sp_bump) = Address::find_program_address(&[b"rewm", sp_cfg.as_ref()], &rew_prog);
+        let sp_q_vault = create_tok_acc(&mut svm, &mint, &sp_pda, 0);
+        let sp_t_mint = Keypair::new().pubkey();
+        svm.set_account(sp_t_mint, Account { lamports: 10_000_000, data: make_spl_mint(6, 1_000_000, &payer.pubkey()), owner: TOKEN_PROGRAM_ID, executable: false, rent_epoch: 0 }).unwrap();
+        let sp_t_escrow = create_tok_acc(&mut svm, &sp_t_mint, &sp_pda, 0);
+        let sp_bidder_t = create_tok_acc(&mut svm, &sp_t_mint, &r_spammer.pubkey(), 100);
+        let sp_creator_tok = create_tok_acc(&mut svm, &mint, &sp_creator.pubkey(), 0);
+        send_ok(&mut svm, ix_create_market_with_reward(
+            prog_id, r_dex, sp_mkt, mint, r_orc.pubkey(), sp_creator.pubkey(), sp_creator_tok, fee_vault,
+            100 * POS_SCALE, 10, 500, 0, 1000, 500, 100, 10, 95, 2500, 1_000_000 * POS_SCALE, 0, 10_000, sp_pda,
+        ), &payer, &[&payer, &sp_creator]);
+        // minBatchQuote = 100, initReserveRateE6 = 1 -> product = 100 < 1_000_000!
+        send_ok(&mut svm, ix_init_reward(
+            rew_prog, sp_cfg, sp_creator.pubkey(), prog_id, r_dex, sp_mkt, sp_pda,
+            mint, sp_q_vault, TOKEN_PROGRAM_ID, sp_t_mint, sp_t_escrow, TOKEN_PROGRAM_ID, None,
+            sp_bump, 0, 32, 100, 1,
+        ), &payer, &[&payer, &sp_creator]);
+        // Accrue exact 200 micro-USDC trade fee (`qty = 1_000` @ $100 -> notional = 100_000 -> 10 bps fee = 100 each -> fee2 = 200)
+        let sp_l = Keypair::new(); let sp_s = Keypair::new();
+        svm.airdrop(&sp_l.pubkey(), 1_000_000_000).unwrap(); svm.airdrop(&sp_s.pubkey(), 1_000_000_000).unwrap();
+        let sp_lt = create_tok_acc(&mut svm, &mint, &sp_l.pubkey(), 10 * POS_SCALE);
+        let sp_st = create_tok_acc(&mut svm, &mint, &sp_s.pubkey(), 10 * POS_SCALE);
+        let sp_lp = create_prog_acc(&mut svm, &prog_id, PFL_SIZE);
+        let sp_sp = create_prog_acc(&mut svm, &prog_id, PFL_SIZE);
+        send_ok(&mut svm, ix_init_portfolio(prog_id, r_dex, sp_lp, sp_l.pubkey()), &payer, &[&payer, &sp_l]);
+        send_ok(&mut svm, ix_init_portfolio(prog_id, r_dex, sp_sp, sp_s.pubkey()), &payer, &[&payer, &sp_s]);
+        send_ok(&mut svm, ix_deposit_collateral(prog_id, r_dex, sp_lp, sp_l.pubkey(), sp_lt, mint, r_vault, TOKEN_PROGRAM_ID, POS_SCALE), &payer, &[&payer, &sp_l]);
+        send_ok(&mut svm, ix_deposit_collateral(prog_id, r_dex, sp_sp, sp_s.pubkey(), sp_st, mint, r_vault, TOKEN_PROGRAM_ID, POS_SCALE), &payer, &[&payer, &sp_s]);
+        send_ok(&mut svm, ix_trade(prog_id, r_dex, sp_mkt, sp_lp, sp_l.pubkey(), sp_sp, sp_s.pubkey(), 0, 1_000), &payer, &[&payer, &sp_l, &sp_s]);
+        let accrued = read_u64(&svm, &sp_mkt, 360);
+        assert_eq!(accrued, 200, "Small-pot accrued exactly 200 micro-USDC (< 1_000_000)");
+        let sp_ep = create_prog_acc(&mut svm, &rew_prog, EPOCH_SIZE);
+        send_ok(&mut svm, ix_start_epoch(rew_prog, sp_cfg, sp_ep, r_dex, sp_mkt, sp_pda, mint, r_vault, sp_q_vault, TOKEN_PROGRAM_ID, prog_id), &payer, &[&payer]);
+        assert_eq!(read_u64(&svm, &sp_ep, 56), 1, "virtBids MUST ceil to 1 (never 0!) when totalPot * resRate < 1e6!");
+        let sp_rec = create_prog_acc(&mut svm, &rew_prog, BID_SIZE);
+        send_ok(&mut svm, ix_submit_bid(rew_prog, sp_cfg, sp_ep, sp_rec, r_spammer.pubkey(), sp_bidder_t, sp_t_escrow, sp_t_mint, TOKEN_PROGRAM_ID, 1), &payer, &[&payer, &r_spammer]);
+        let sp_end = get_slot(&svm) + 32;
+        set_slot(&mut svm, sp_end);
+        send_ok(&mut svm, ix_settle_epoch(rew_prog, sp_cfg, sp_ep, sp_pda, sp_t_escrow, sp_t_mint, TOKEN_PROGRAM_ID, None), &payer, &[&payer]);
+        assert_eq!(read_u64(&svm, &sp_ep, 72), 100, "1-atom bidder got floor(200*1/2)=100 (NOT 100% drain of 200)!");
+        assert_eq!(read_u64(&svm, &sp_cfg, 368), 100, "Remaining 50% rolled over safely!");
+        // Clean up temporary small-pot portfolios so r_dex invariants stay exact for Suite 13 & 14!
+        send_ok(&mut svm, ix_trade(prog_id, r_dex, sp_mkt, sp_lp, sp_l.pubkey(), sp_sp, sp_s.pubkey(), 1, 1_000), &payer, &[&payer, &sp_l, &sp_s]);
+        send_ok(&mut svm, ix_withdraw_collateral(prog_id, r_dex, sp_lp, sp_l.pubkey(), sp_lt, mint, r_vault, TOKEN_PROGRAM_ID, POS_SCALE - 100), &payer, &[&payer, &sp_l]);
+        send_ok(&mut svm, ix_withdraw_collateral(prog_id, r_dex, sp_sp, sp_s.pubkey(), sp_st, mint, r_vault, TOKEN_PROGRAM_ID, POS_SCALE - 100), &payer, &[&payer, &sp_s]);
+    }
+
     assert_eq!(read_u64(&svm, &r_trader_pfl, 88), trader_cap_pre, "User capital untouched!");
     assert_eq!(read_u64(&svm, &r_mm_pfl, 88), mm_cap_pre, "MM capital untouched!");
     assert_dex_invariants(&svm, &r_dex, &r_vault, &r_mkts, &[r_trader_pfl, r_mm_pfl], "suite13-final");
@@ -3612,14 +3659,18 @@ fn main() {
     assert_eq!(read_u64(&svm, &prop_taker_pfl, 88), taker_cap_0 - 3_500_000 - 5_000_000, "Taker paid exact $3.50 spread + $5 fee");
     assert_dex_invariants(&svm, &r_dex, &r_vault, &r_mkts, &[r_trader_pfl, r_mm_pfl, prop_lp_pfl, prop_taker_pfl], "suite14-k1-open");
 
-    // 14.4 Single-market (k=1) CPI-Out Reduce Close (taker is fL closing existing Long at spread-adjusted $100.70!)
+    // 14.4 Single-market (k=1) CPI-Out Reduce Close (taker sells existing Long at standard Bid = $99.30!)
+    let lp_cap_pre_c1 = read_u64(&svm, &prop_lp_pfl, 88);
+    let taker_cap_pre_c1 = read_u64(&svm, &prop_taker_pfl, 88);
     let cu_pm_close = send_ok(
         &mut svm,
-        ix_trade_with_matcher(prog_id, r_dex, r_mkts[0], prop_taker_pfl, prop_taker_kp.pubkey(), prop_lp_pfl, matcher_prog, prop_ctx, None, 1, true, 5 * POS_SCALE, 101 * POS_SCALE),
+        ix_trade_with_matcher(prog_id, r_dex, r_mkts[0], prop_taker_pfl, prop_taker_kp.pubkey(), prop_lp_pfl, matcher_prog, prop_ctx, None, 1, true, 5 * POS_SCALE, 99 * POS_SCALE),
         &payer, &[&payer, &prop_taker_kp],
     );
     assert_eq!(read_u64(&svm, &prop_ctx, 8), 2, "PropAMM seq advanced 1 -> 2");
-    assert_eq!(read_u64(&svm, &prop_ctx, 16), 100_700_000, "Standalone k=1 reduce quote exact ($100.70)");
+    assert_eq!(read_u64(&svm, &prop_ctx, 16), 99_300_000, "Standalone k=1 reduce Bid exact ($99.30 = 20+50 bps below mark)");
+    assert_eq!(read_u64(&svm, &prop_lp_pfl, 88), lp_cap_pre_c1 + 3_500_000, "LP earned ANOTHER exact $3.50 spread on reduce close!");
+    assert_eq!(read_u64(&svm, &prop_taker_pfl, 88), taker_cap_pre_c1 - 3_500_000, "Taker paid exact $3.50 spread on reduce close!");
     assert_eq!(read_u8(&svm, &prop_taker_pfl, 4), 0, "Taker closed completely via CPI-Out PropAMM!");
     assert_eq!(read_u8(&svm, &prop_lp_pfl, 4), 0, "LP closed completely via CPI-Out PropAMM!");
 
@@ -3654,15 +3705,19 @@ fn main() {
     assert_eq!(read_u8(&svm, &prop_lp_pfl, 4), 2, "LP opened BOTH offsetting legs in ONE TradeWithMatcher ix!");
     assert_dex_invariants(&svm, &r_dex, &r_vault, &r_mkts, &[r_trader_pfl, r_mm_pfl, prop_lp_pfl, prop_taker_pfl], "suite14-k2-batch-open");
 
-    // Close BOTH legs atomically in ONE k=2 reduce batch!
+    // Close BOTH legs atomically in ONE k=2 reduce batch (sell Long at Bid $99.50 + buy Short at Ask $100.50)!
+    let lp_cap_pre_k2c = read_u64(&svm, &prop_lp_pfl, 88);
     send_ok(
         &mut svm,
         ix_trade_with_matcher_batch(
             prog_id, r_dex, prop_taker_pfl, prop_taker_kp.pubkey(), prop_lp_pfl, matcher_prog, prop_ctx,
-            &[(r_mkts[0], 1, true, 4 * POS_SCALE, 101 * POS_SCALE), (r_mkts[1], 1, false, 4 * POS_SCALE, 99 * POS_SCALE)], None,
+            &[(r_mkts[0], 1, true, 4 * POS_SCALE, 99 * POS_SCALE), (r_mkts[1], 1, false, 4 * POS_SCALE, 101 * POS_SCALE)], None,
         ),
         &payer, &[&payer, &prop_taker_kp],
     );
+    assert_eq!(read_u64(&svm, &prop_ctx, 16), 99_500_000, "Mkt0 reduce got hedged 50bps bid ($99.50)!");
+    assert_eq!(read_u64(&svm, &prop_ctx, 32), 100_500_000, "Mkt1 reduce got hedged 50bps ask ($100.50)!");
+    assert_eq!(read_u64(&svm, &prop_lp_pfl, 88), lp_cap_pre_k2c + 4 * POS_SCALE, "LP earned exact $4.00 spread on k=2 reduce batch!");
     assert_eq!(read_u8(&svm, &prop_taker_pfl, 4), 0, "Taker closed BOTH legs in ONE k=2 reduce ix!");
     assert_eq!(read_u8(&svm, &prop_lp_pfl, 4), 0, "LP closed BOTH legs in ONE k=2 reduce ix!");
     assert_dex_invariants(&svm, &r_dex, &r_vault, &r_mkts, &[r_trader_pfl, r_mm_pfl, prop_lp_pfl, prop_taker_pfl], "suite14-k2-batch-close");
@@ -3692,13 +3747,14 @@ fn main() {
     assert_eq!(read_u8(&svm, &prop_lp_pfl, 4), 5, "LP opened ALL 5 offsetting legs in ONE ix!");
     assert_dex_invariants(&svm, &r_dex, &r_vault, &r_mkts, &[r_trader_pfl, r_mm_pfl, prop_lp_pfl, prop_taker_pfl], "suite14-k5-batch-open");
 
-    // Close ALL 5 legs atomically in ONE k=5 reduce ix!
+    // Close ALL 5 legs atomically in ONE k=5 reduce ix (selling Longs at Bid $99.70, buying Shorts at Ask $100.30)!
+    let lp_cap_pre_k5c = read_u64(&svm, &prop_lp_pfl, 88);
     let offers_5_close = [
-        (r_mkts[0], 1u8, true,  2 * POS_SCALE, 101 * POS_SCALE),
-        (r_mkts[1], 1u8, false, 2 * POS_SCALE,  99 * POS_SCALE),
-        (r_mkts[2], 1u8, true,  2 * POS_SCALE, 101 * POS_SCALE),
-        (r_mkts[3], 1u8, false, 2 * POS_SCALE,  99 * POS_SCALE),
-        (r_mkts[4], 1u8, true,  2 * POS_SCALE, 101 * POS_SCALE),
+        (r_mkts[0], 1u8, true,  2 * POS_SCALE,  99 * POS_SCALE),
+        (r_mkts[1], 1u8, false, 2 * POS_SCALE, 101 * POS_SCALE),
+        (r_mkts[2], 1u8, true,  2 * POS_SCALE,  99 * POS_SCALE),
+        (r_mkts[3], 1u8, false, 2 * POS_SCALE, 101 * POS_SCALE),
+        (r_mkts[4], 1u8, true,  2 * POS_SCALE,  99 * POS_SCALE),
     ];
     let cu_pm_batch5_close = send_ok(
         &mut svm,
@@ -3708,6 +3764,11 @@ fn main() {
         ),
         &payer, &[&payer, &prop_taker_kp],
     );
+    for j in 0..5 {
+        let exp_p = if j % 2 == 0 { 99_700_000 } else { 100_300_000 };
+        assert_eq!(read_u64(&svm, &prop_ctx, 16 + j * 16), exp_p, "5-market close leg {} hedged price mismatch!", j);
+    }
+    assert_eq!(read_u64(&svm, &prop_lp_pfl, 88), lp_cap_pre_k5c + 3 * POS_SCALE, "LP earned exact $3.00 spread on k=5 reduce batch!");
     assert_eq!(read_u8(&svm, &prop_taker_pfl, 4), 0, "Taker closed ALL 5 legs in ONE k=5 reduce ix!");
     assert_eq!(read_u8(&svm, &prop_lp_pfl, 4), 0, "LP closed ALL 5 legs in ONE k=5 reduce ix!");
     assert_dex_invariants(&svm, &r_dex, &r_vault, &r_mkts, &[r_trader_pfl, r_mm_pfl, prop_lp_pfl, prop_taker_pfl], "suite14-k5-batch-close");
