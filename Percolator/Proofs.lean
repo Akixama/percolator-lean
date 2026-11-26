@@ -116,14 +116,15 @@ theorem deriveAdl_le_one (oi rawBasis : Nat) : deriveAdl oi rawBasis ≤ adlOneN
     · next hraw hlt =>
       have hrawPos : 0 < rawBasis := Nat.pos_of_ne_zero hraw
       have hoiLe : oi ≤ rawBasis := Nat.le_of_lt (Nat.lt_of_not_ge hlt)
-      have hdiv : (adlOneNat * oi) / rawBasis ≤ adlOneNat := by
-        calc (adlOneNat * oi) / rawBasis
-            ≤ (adlOneNat * rawBasis) / rawBasis := Nat.div_le_div_right (Nat.mul_le_mul_left _ hoiLe)
-          _ = adlOneNat := Nat.mul_div_cancel adlOneNat hrawPos
-      exact Nat.max_le.mpr ⟨by decide, hdiv⟩
+      calc (adlOneNat * oi) / rawBasis
+          ≤ (adlOneNat * rawBasis) / rawBasis := Nat.div_le_div_right (Nat.mul_le_mul_left _ hoiLe)
+        _ = adlOneNat := Nat.mul_div_cancel adlOneNat hrawPos
 
+/-- Unconditional Derived Side ADL Exposure Bound (Gap #4A Fix):
+    Removing the artificial `max 1` floor-clamp eliminates the unverified `rawBasis ≤ ADL_ONE * oi`
+    precondition — `effectiveQty rawBasis (deriveAdl oi rawBasis) ≤ oi` now holds for EVERY `oi ≤ rawBasis`! -/
 theorem deriveAdl_exposure_le_oi (oi rawBasis : Nat)
-    (hraw : 0 < rawBasis) (hle : oi ≤ rawBasis) (hnondeg : rawBasis ≤ adlOneNat * oi) :
+    (hraw : 0 < rawBasis) (hle : oi ≤ rawBasis) :
     effectiveQty rawBasis (deriveAdl oi rawBasis) ≤ oi := by
   unfold effectiveQty deriveAdl
   have hrawNe : rawBasis ≠ 0 := Nat.ne_of_gt hraw
@@ -136,9 +137,6 @@ theorem deriveAdl_exposure_le_oi (oi rawBasis : Nat)
     rw [Nat.mul_div_cancel oi hpos]
     exact Nat.le_refl _
   · next _ =>
-    have hqPos : 1 ≤ (adlOneNat * oi) / rawBasis :=
-      (Nat.le_div_iff_mul_le hraw).mpr (by simpa using hnondeg)
-    rw [Nat.max_eq_right hqPos]
     have hmul : rawBasis * ((adlOneNat * oi) / rawBasis) ≤ adlOneNat * oi := by
       rw [Nat.mul_comm]; exact Nat.div_mul_le_self (adlOneNat * oi) rawBasis
     have hdiv := Nat.div_le_div_right (c := adlOneNat) hmul

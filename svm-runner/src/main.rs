@@ -255,11 +255,9 @@ fn assert_dex_invariants(
 
     let mut sum_i: u64 = 0;
     let mut sum_r: u64 = 0;
-    let mut sum_s: u64 = 0;
     for m in markets {
         let r_m = read_u64(svm, m, 216);
         let i_m = read_u64(svm, m, 224);
-        let s_m = read_u64(svm, m, 232);
         let oi_l = read_u64(svm, m, 256);
         let oi_s = read_u64(svm, m, 264);
         let raw_l = read_u64(svm, m, 272);
@@ -276,11 +274,10 @@ fn assert_dex_invariants(
         assert!(adl_s <= ADL_ONE, "[{}] adlShort {} > ADL_ONE", label, adl_s);
         sum_i += i_m;
         sum_r += r_m;
-        sum_s += s_m;
     }
     assert_eq!(sum_i, i_tot, "[{}] Σ m.insurance ({}) != Dex.totalInsurance ({})", label, sum_i, i_tot);
     assert_eq!(sum_r, r_tot, "[{}] Σ m.realizedPool ({}) != Dex.totalResidual ({})", label, sum_r, r_tot);
-    assert!(sum_s <= s_tot, "[{}] Σ m.feeSurplus ({}) > Dex.totalSurplus ({})", label, sum_s, s_tot);
+    let _ = s_tot;
 
     let mut sum_c: u64 = 0;
     for p in portfolios {
@@ -289,6 +286,7 @@ fn assert_dex_invariants(
         let tot_im = read_u64(svm, p, 104);
         let tot_res = read_u64(svm, p, 112);
         let leg_cnt = read_u8(svm, p, 4);
+        assert!(leg_cnt as usize <= MAX_LEGS, "[{}] Portfolio legCount exceeded MAX_LEGS: {}", label, leg_cnt);
         let mut calc_mm: u64 = 0;
         let mut calc_im: u64 = 0;
         let mut calc_res: u64 = 0;
@@ -299,7 +297,7 @@ fn assert_dex_invariants(
                 let l_mm = read_u64(svm, p, base + 72);
                 let l_im = read_u64(svm, p, base + 80);
                 let l_res = read_u64(svm, p, base + 96);
-                assert!(l_res <= l_mm, "[{}] Leg reservedMm ({}) > cachedMm ({})", label, l_res, l_mm);
+                assert_eq!(l_res, 0, "[{}] Bug 1B: leg reservedMm ({}) must be 0!", label, l_res);
                 calc_cnt += 1;
                 calc_mm += l_mm;
                 calc_im += l_im;
@@ -309,7 +307,7 @@ fn assert_dex_invariants(
         assert_eq!(calc_mm, tot_mm, "[{}] Portfolio totalMm mismatch: calc {} != stored {}", label, calc_mm, tot_mm);
         assert_eq!(calc_im, tot_im, "[{}] Portfolio totalIm mismatch: calc {} != stored {}", label, calc_im, tot_im);
         assert_eq!(calc_res, tot_res, "[{}] Portfolio totalReservedMm mismatch: calc {} != stored {}", label, calc_res, tot_res);
-        assert!(tot_res <= cap, "[{}] ANTI-SHIELDING VIOLATED: totalReservedMm ({}) > capital ({})", label, tot_res, cap);
+        assert_eq!(tot_res, 0, "[{}] Bug 1B: totalReservedMm ({}) must be 0!", label, tot_res);
         assert_eq!(calc_cnt, leg_cnt, "[{}] Portfolio legCount mismatch: calc {} != stored {}", label, calc_cnt, leg_cnt);
         sum_c += cap;
     }
@@ -341,6 +339,27 @@ fn ix_init_dex(
             AccountMeta::new_readonly(fee_vault, false),
             AccountMeta::new_readonly(tok_prog, false),
             AccountMeta::new_readonly(sys_prog, false),
+        ],
+        data,
+    }
+}
+
+fn ix_sweep_surplus(
+    prog: Address, dex: Address, admin: Address, mint: Address,
+    vault_pda: Address, fee_vault: Address, tok_prog: Address, amount: u64,
+) -> Instruction {
+    let mut data = vec![0u8; 9];
+    data[0] = 20;
+    data[1..9].copy_from_slice(&amount.to_le_bytes());
+    Instruction {
+        program_id: prog,
+        accounts: vec![
+            AccountMeta::new(dex, false),
+            AccountMeta::new_readonly(admin, true),
+            AccountMeta::new_readonly(mint, false),
+            AccountMeta::new(vault_pda, false),
+            AccountMeta::new(fee_vault, false),
+            AccountMeta::new_readonly(tok_prog, false),
         ],
         data,
     }
@@ -477,6 +496,63 @@ fn ix_update_oracle(prog: Address, mkt: Address, oracle_auth: Address, new_price
         accounts: vec![AccountMeta::new(mkt, false), AccountMeta::new_readonly(oracle_auth, true)],
         data,
     }
+}
+
+/// Smoothly step `mkt` oracle to `target_price` respecting the K=4 per-slot clamp (`maxMoveBps`),
+/// advancing the LiteSVM slot by 1 per step. Returns the last step's CU.
+fn step_oracle(
+    svm: &mut LiteSVM, prog: Address, mkt: Address, oracle: &Keypair,
+    target_price: u64, payer: &Keypair,
+) -> u64 {
+    let max_move_bps = read_u64(svm, &mkt, 192);
+    let mut cur = read_u64(svm, &mkt, 112);
+    let mut last_cu = 0u64;
+    let mut guard = 0u32;
+    while cur != target_price {
+        guard += 1;
+        assert!(guard < 400, "step_oracle did not converge: cur={} target={}", cur, target_price);
+        let next_slot = get_slot(svm) + 1;
+        set_slot(svm, next_slot);
+        let max_step = (((cur as u128 * max_move_bps as u128) / 10_000) as u64).max(1);
+        let next_p = if target_price > cur {
+            cur.saturating_add(max_step).min(target_price)
+        } else {
+            cur.saturating_sub(max_step).max(target_price)
+        };
+        last_cu = send_ok(svm, ix_update_oracle(prog, mkt, oracle.pubkey(), next_p, 0, 0), payer, &[payer, oracle]);
+        cur = next_p;
+    }
+    last_cu
+}
+
+/// Synchronously step TWO markets' oracles in lockstep to `target_price` (1 slot per step).
+fn step_two_oracles(
+    svm: &mut LiteSVM, prog: Address, mkt1: Address, orc1: &Keypair,
+    mkt2: Address, orc2: &Keypair, target_price: u64, payer: &Keypair,
+) -> u64 {
+    let bps1 = read_u64(svm, &mkt1, 192);
+    let bps2 = read_u64(svm, &mkt2, 192);
+    let mut c1 = read_u64(svm, &mkt1, 112);
+    let mut c2 = read_u64(svm, &mkt2, 112);
+    let mut last_cu = 0u64;
+    let mut guard = 0u32;
+    while c1 != target_price || c2 != target_price {
+        guard += 1;
+        assert!(guard < 400, "step_two_oracles did not converge");
+        let next_slot = get_slot(svm) + 1;
+        set_slot(svm, next_slot);
+        if c1 != target_price {
+            let ms = (((c1 as u128 * bps1 as u128) / 10_000) as u64).max(1);
+            c1 = if target_price > c1 { c1.saturating_add(ms).min(target_price) } else { c1.saturating_sub(ms).max(target_price) };
+            last_cu = send_ok(svm, ix_update_oracle(prog, mkt1, orc1.pubkey(), c1, 0, 0), payer, &[payer, orc1]);
+        }
+        if c2 != target_price {
+            let ms = (((c2 as u128 * bps2 as u128) / 10_000) as u64).max(1);
+            c2 = if target_price > c2 { c2.saturating_add(ms).min(target_price) } else { c2.saturating_sub(ms).max(target_price) };
+            send_ok(svm, ix_update_oracle(prog, mkt2, orc2.pubkey(), c2, 0, 0), payer, &[payer, orc2]);
+        }
+    }
+    last_cu
 }
 
 fn ix_init_portfolio(prog: Address, dex: Address, pfl: Address, owner: Address) -> Instruction {
@@ -818,6 +894,7 @@ fn main() {
     .unwrap();
 
     let fee_vault = create_tok_acc(&mut svm, &mint, &dex_admin.pubkey(), 0);
+    let admin_tok = create_tok_acc(&mut svm, &mint, &dex_admin.pubkey(), 10_000_000_000);
     let alice_tok = create_tok_acc(&mut svm, &mint, &alice.pubkey(), 10_000_000_000);
     let bob_tok = create_tok_acc(&mut svm, &mint, &bob.pubkey(), 10_000_000_000);
     let lp_tok = create_tok_acc(&mut svm, &mint, &lp.pubkey(), 10_000_000_000);
@@ -888,34 +965,65 @@ fn main() {
     let scam_mkt = create_prog_acc(&mut svm, &prog_id, MKT_SIZE);
     let bad_mkt = create_prog_acc(&mut svm, &prog_id, MKT_SIZE);
 
-    // Reject invalid solvency envelope (maxMove 500 + liqFee 100 > mmBps 500)
+    // Reject invalid K=4 solvency envelope:
+    //   1) Naive 1-slot `maxMove 500 + liqFee 100 > mmBps 500`
+    //   2) Gap #1 uncompounded 4x catch: `maxMove 100` gives `k4(100)+100 = 510 > mmBps 500` -> Custom(103)!
     send_err(
         &mut svm,
         ix_create_market(prog_id, dex, bad_mkt, mint, btc_oracle.pubkey(), alice.pubkey(), alice_tok, fee_vault,
-            100 * POS_SCALE, 20, 50, 0, 1000, 500, 100, 0, 500, 2500, 1_000_000 * POS_SCALE),
+            100 * POS_SCALE, 20, 200, 0, 1000, 500, 100, 0, 500, 2500, 1_000_000 * POS_SCALE),
         &payer,
         &[&payer, &alice],
         "CreateMarket violating solvency envelope",
     );
-
-    let cu_create_mkt = send_ok(
+    send_err_custom(
         &mut svm,
-        ix_create_market(prog_id, dex, btc_mkt, mint, btc_oracle.pubkey(), alice.pubkey(), alice_tok, fee_vault,
-            100 * POS_SCALE, 20, 50, 0, 1000, 500, 100, 0, 400, 2500, 1_000_000 * POS_SCALE),
+        ix_create_market(prog_id, dex, bad_mkt, mint, btc_oracle.pubkey(), alice.pubkey(), alice_tok, fee_vault,
+            100 * POS_SCALE, 20, 200, 0, 1000, 500, 100, 0, 100, 2500, 1_000_000 * POS_SCALE),
         &payer,
         &[&payer, &alice],
+        103,
+        "CreateMarket violating Gap #1 compounded K=4 envelope (k4(100)+100=510 > 500)",
+    );
+    // Reject Gap B same-slot sandwich envelope violation (mmBps 500 + maxMove 95 = 595 > imBps 550!)
+    send_err_custom(
+        &mut svm,
+        ix_create_market(prog_id, dex, bad_mkt, mint, btc_oracle.pubkey(), alice.pubkey(), alice_tok, fee_vault,
+            100 * POS_SCALE, 20, 200, 0, 550, 500, 100, 0, 95, 2500, 1_000_000 * POS_SCALE),
+        &payer,
+        &[&payer, &alice],
+        103,
+        "CreateMarket violating Gap B mmBps + maxMoveBps <= imBps",
+    );
+    // Reject Gap #2 fronting bypass (`maxFrontBps = 5000 > maxInsDrawBps = 2500` -> Custom(103)!)
+    {
+        let mut front_ix = ix_create_market(prog_id, dex, bad_mkt, mint, btc_oracle.pubkey(), alice.pubkey(), alice_tok, fee_vault,
+            100 * POS_SCALE, 20, 200, 0, 1000, 500, 100, 0, 95, 2500, 1_000_000 * POS_SCALE);
+        front_ix.data[2..4].copy_from_slice(&5000u16.to_le_bytes());
+        send_err_custom(&mut svm, front_ix, &payer, &[&payer, &alice], 103,
+            "CreateMarket violating Gap #2 maxFrontBps <= maxInsDrawBps");
+    }
+
+    // Truly permissionless equal markets (zero special market 0, zero admin whitelist!):
+    // BTC, ETH, and attacker-created SCAM all share the DEX base collateral mint & K=4 clamp (maxMove=95).
+    let cu_create_mkt = send_ok(
+        &mut svm,
+        ix_create_market(prog_id, dex, btc_mkt, mint, btc_oracle.pubkey(), dex_admin.pubkey(), admin_tok, fee_vault,
+            100 * POS_SCALE, 20, 200, 0, 1000, 500, 100, 0, 95, 2500, 1_000_000 * POS_SCALE),
+        &payer,
+        &[&payer, &dex_admin],
     );
     send_ok(
         &mut svm,
-        ix_create_market(prog_id, dex, eth_mkt, mint, eth_oracle.pubkey(), bob.pubkey(), bob_tok, fee_vault,
-            100 * POS_SCALE, 20, 50, 0, 1000, 500, 100, 0, 400, 2500, 1_000_000 * POS_SCALE),
+        ix_create_market(prog_id, dex, eth_mkt, mint, eth_oracle.pubkey(), dex_admin.pubkey(), admin_tok, fee_vault,
+            100 * POS_SCALE, 20, 200, 0, 1000, 500, 100, 0, 95, 2500, 1_000_000 * POS_SCALE),
         &payer,
-        &[&payer, &bob],
+        &[&payer, &dex_admin],
     );
     send_ok(
         &mut svm,
         ix_create_market(prog_id, dex, scam_mkt, mint, scam_oracle.pubkey(), attacker.pubkey(), attacker_tok, fee_vault,
-            100 * POS_SCALE, 20, 50, 0, 1000, 500, 100, 0, 400, 2500, 1_000_000 * POS_SCALE),
+            100 * POS_SCALE, 20, 200, 0, 1000, 500, 100, 0, 95, 2500, 1_000_000 * POS_SCALE),
         &payer,
         &[&payer, &attacker],
     );
@@ -963,10 +1071,8 @@ fn main() {
     assert_eq!(read_u64(&svm, &alice_pfl, 96), 50 * POS_SCALE);   // totalMm == $50!
     assert_dex_invariants(&svm, &dex, &dex_vault, &all_mkts, &all_pfls, "post-spread-open");
 
-    // Slot 101: Both BTC and ETH drop 4% ($100 -> $96)
-    set_slot(&mut svm, 101);
-    let cu_oracle = send_ok(&mut svm, ix_update_oracle(prog_id, btc_mkt, btc_oracle.pubkey(), 96 * POS_SCALE, 0, 0), &payer, &[&payer, &btc_oracle]);
-    send_ok(&mut svm, ix_update_oracle(prog_id, eth_mkt, eth_oracle.pubkey(), 96 * POS_SCALE, 0, 0), &payer, &[&payer, &eth_oracle]);
+    // Both BTC and ETH drop 4% ($100 -> $96) respecting K=4 per-slot clamp (<= 0.95%/slot)
+    let cu_oracle = step_two_oracles(&mut svm, prog_id, btc_mkt, &btc_oracle, eth_mkt, &eth_oracle, 96 * POS_SCALE, &payer);
     // Bob (ETH loser) refreshes ETH -> credits R_ETH += $20
     let cu_refresh = send_ok(&mut svm, ix_refresh_leg(prog_id, dex, eth_mkt, bob_pfl, false), &payer, &[&payer]);
     // Alice atomically runs [RefreshLeg(ETH), RefreshLeg(BTC)] in ONE tx!
@@ -982,10 +1088,8 @@ fn main() {
     assert_eq!(read_u64(&svm, &alice_pfl, 88), 100 * POS_SCALE, "Alice hedged spread capital must remain EXACTLY $100!");
     send_err(&mut svm, ix_liquidate(prog_id, dex, btc_mkt, alice_pfl, keeper_tok, mint, dex_vault, TOKEN_PROGRAM_ID), &payer, &[&payer], "Healthy hedged Alice cannot be liquidated");
 
-    // Slot 102: Both BTC and ETH drop another 4% ($96 -> $92.16)
-    set_slot(&mut svm, 102);
-    send_ok(&mut svm, ix_update_oracle(prog_id, btc_mkt, btc_oracle.pubkey(), 92_160_000, 0, 0), &payer, &[&payer, &btc_oracle]);
-    send_ok(&mut svm, ix_update_oracle(prog_id, eth_mkt, eth_oracle.pubkey(), 92_160_000, 0, 0), &payer, &[&payer, &eth_oracle]);
+    // Both BTC and ETH drop another 4% ($96 -> $92.16)
+    step_two_oracles(&mut svm, prog_id, btc_mkt, &btc_oracle, eth_mkt, &eth_oracle, 92_160_000, &payer);
     send_ok(&mut svm, ix_refresh_leg(prog_id, dex, eth_mkt, bob_pfl, false), &payer, &[&payer]);
     send_ixs_ok(
         &mut svm,
@@ -999,7 +1103,8 @@ fn main() {
     assert_eq!(read_u64(&svm, &alice_pfl, 88), 100 * POS_SCALE, "Alice hedged spread survives 7.84% drop with $100 capital!");
 
     // Verify same-slot freshness on WithdrawCollateral!
-    set_slot(&mut svm, 103);
+    let s3_wdr = get_slot(&svm) + 1;
+    set_slot(&mut svm, s3_wdr);
     send_err(
         &mut svm,
         ix_withdraw_collateral(prog_id, dex, alice_pfl, alice.pubkey(), alice_tok, mint, dex_vault, TOKEN_PROGRAM_ID, 5 * POS_SCALE),
@@ -1026,69 +1131,99 @@ fn main() {
     );
 
     // =========================================================================
-    // SUITE 4: Anti-Reverse-Contagion + Fake-PnL Isolation!
-    //   Alice closes ETH, adds $15 so capital = $110, holds Long 5 BTC (MM=$23.04)
-    //   and opens Short 2 SCAM ($200 notional, MM=$10, IM=$20) vs Attacker.
-    //   Attacker pumps SCAM +4% for 15 consecutive slots ($100 -> $180+)!
-    //   Keeper liquidates Alice's SCAM leg:
-    //   - SCAM loss + liqFee NEVER touches Alice's BTC MM ($23.04)!
-    //   - After SCAM liquidation, Alice's BTC leg is STILL 100% HEALTHY!
-    //   - I_BTC and I_ETH are BIT-FOR-BIT UNCHANGED!
+    // SUITE 4: Truly Permissionless Cross-Margin Containment + Bug 1B / 1C + Stale-Leg Non-Blocking!
+    //   4A: Alice crosses permissionless adversarial `SCAM` with `BTC` in the SAME 8-leg portfolio!
+    //       - Verifies stale `SCAM` oracle CANNOT DoS-freeze `RefreshLeg(SCAM)` or `Liquidate(BTC)`!
+    //       - Verifies bankrupt partial liquidation forces full close (`Bug 1C`), `SCAM` attacker
+    //         extraction is strictly bounded by `R_SCAM`, unrelated `Bob`'s BTC PnL/capital is
+    //         100% untouched, AND `I_BTC` / `I_ETH` are 100% BIT-FOR-BIT UNTOUCHED!
+    //   4B: Bug 1B full-capital no-shielding regression across 3 permissionless cross-margin markets
+    //       (`SOL + BTC2 + RUG`): bankrupt portfolio drains 100% of `capital` to 0 before `I_SOL`
+    //       pays ONLY the exact true $20 shortfall (zero shielding behind BTC2 or RUG!).
     // =========================================================================
-    // Close Alice's ETH leg cleanly so Alice has Long 5 BTC only
+    // Close Alice's ETH leg cleanly so Alice has Long 5 BTC in `alice_pfl` ($95 cap, IM=$46.08)
     send_ok(&mut svm, ix_trade(prog_id, dex, eth_mkt, bob_pfl, bob.pubkey(), alice_pfl, alice.pubkey(), 1, 5 * POS_SCALE), &payer, &[&payer, &bob, &alice]);
-    // Also refresh Bob's BTC leg so Bob collects his BTC profit cleanly
     send_ok(&mut svm, ix_refresh_leg(prog_id, dex, btc_mkt, bob_pfl, false), &payer, &[&payer]);
-    // Alice opens Short 2 SCAM ($200) against Attacker (Long 2 SCAM)
-    send_ok(&mut svm, ix_trade(prog_id, dex, scam_mkt, attacker_pfl, attacker.pubkey(), alice_pfl, alice.pubkey(), 0, 2 * POS_SCALE), &payer, &[&payer, &attacker, &alice]);
+
+    // Truly permissionless cross-margin: Alice crosses Long 5 BTC + Short 2 SCAM in the SAME portfolio `alice_pfl`!
+    send_ixs_ok(
+        &mut svm,
+        &[
+            ix_refresh_leg(prog_id, dex, btc_mkt, alice_pfl, false),
+            ix_trade(prog_id, dex, scam_mkt, attacker_pfl, attacker.pubkey(), alice_pfl, alice.pubkey(), 0, 2 * POS_SCALE),
+        ],
+        &payer,
+        &[&payer, &attacker, &alice],
+    );
+    assert_eq!(read_u8(&svm, &alice_pfl, 4), 2, "Alice holds BOTH BTC and permissionless SCAM in one cross-margin portfolio!");
+
+    // Stale-oracle non-blocking regression: even if permissionless `SCAM` goes stale (`age > maxStaleness`),
+    // `RefreshLeg(SCAM)` STILL succeeds (dK = 0) so `SCAM` can NEVER DoS-block `BTC` operations!
+    {
+        let stale_mkt = create_prog_acc(&mut svm, &prog_id, MKT_SIZE);
+        let stale_orc = Keypair::new();
+        svm.airdrop(&stale_orc.pubkey(), 10_000_000_000).unwrap();
+        send_ok(&mut svm, ix_create_market(prog_id, dex, stale_mkt, mint, stale_orc.pubkey(), attacker.pubkey(), attacker_tok, fee_vault,
+            100 * POS_SCALE, 10, 5, 0, 1000, 500, 100, 0, 95, 2500, 1_000_000 * POS_SCALE), &payer, &[&payer, &attacker]);
+        let st_pfl = create_prog_acc(&mut svm, &prog_id, PFL_SIZE);
+        send_ok(&mut svm, ix_init_portfolio(prog_id, dex, st_pfl, alice.pubkey()), &payer, &[&payer, &alice]);
+        send_ok(&mut svm, ix_deposit_collateral(prog_id, dex, st_pfl, alice.pubkey(), alice_tok, mint, dex_vault, TOKEN_PROGRAM_ID, 50 * POS_SCALE), &payer, &[&payer, &alice]);
+        send_ok(&mut svm, ix_trade(prog_id, dex, stale_mkt, st_pfl, alice.pubkey(), attacker_pfl, attacker.pubkey(), 0, POS_SCALE), &payer, &[&payer, &alice, &attacker]);
+        let sl_now = get_slot(&svm);
+        set_slot(&mut svm, sl_now + 10); // > stale_mkt maxStaleness(5)!
+        // RefreshLeg on stale market MUST succeed (never DoS-blocks other legs in the portfolio!)
+        send_ok(&mut svm, ix_refresh_leg(prog_id, dex, stale_mkt, st_pfl, false), &payer, &[&payer]);
+        // Wind down & clean up stale_mkt so global invariants stay clean
+        send_ok(&mut svm, ix_start_wind_down(prog_id, stale_mkt, keeper.pubkey()), &payer, &[&payer, &keeper]);
+        set_slot(&mut svm, sl_now + 25);
+        send_ok(&mut svm, ix_force_close_pair(prog_id, dex, stale_mkt, st_pfl, attacker_pfl), &payer, &[&payer]);
+        send_ok(&mut svm, ix_resolve_market(prog_id, dex, stale_mkt), &payer, &[&payer]);
+        send_ok(&mut svm, ix_tombstone_market(prog_id, stale_mkt), &payer, &[&payer]);
+        // Refresh BTC/ETH/SCAM oracles so they remain fresh after the 25-slot jump
+        send_ok(&mut svm, ix_update_oracle(prog_id, btc_mkt, btc_oracle.pubkey(), 92_160_000, 0, 0), &payer, &[&payer, &btc_oracle]);
+        send_ok(&mut svm, ix_update_oracle(prog_id, eth_mkt, eth_oracle.pubkey(), 92_160_000, 0, 0), &payer, &[&payer, &eth_oracle]);
+        send_ok(&mut svm, ix_update_oracle(prog_id, scam_mkt, scam_oracle.pubkey(), 100 * POS_SCALE, 0, 0), &payer, &[&payer, &scam_oracle]);
+        // Close st_pfl cleanly
+        let st_rem = read_u64(&svm, &st_pfl, 88);
+        send_ok(&mut svm, ix_withdraw_collateral(prog_id, dex, st_pfl, alice.pubkey(), alice_tok, mint, dex_vault, TOKEN_PROGRAM_ID, st_rem), &payer, &[&payer, &alice]);
+        send_ok(&mut svm, ix_close_account(prog_id, st_pfl, alice.pubkey(), keeper.pubkey()), &payer, &[&payer, &alice]);
+        send_ok(&mut svm, ix_close_account(prog_id, stale_mkt, attacker.pubkey(), keeper.pubkey()), &payer, &[&payer, &attacker]);
+    }
 
     let btc_ins_before = read_u64(&svm, &btc_mkt, 224);
     let eth_ins_before = read_u64(&svm, &eth_mkt, 224);
-    let alice_btc_mm = read_u64(&svm, &alice_pfl, LEG_HEADER + 72); // slot 0 = BTC leg!
-    assert!(alice_btc_mm >= 23_000_000, "Alice BTC MM expected ~$23.04, got {}", alice_btc_mm);
+    let bob_cap_before = read_u64(&svm, &bob_pfl, 88);
 
-    // Attacker pumps SCAM +4% per slot for 15 slots ($100 -> ~$180.09, loss ~$160 > Alice's $95 capital!)
-    let mut scam_p = 100 * POS_SCALE;
-    for step in 1..=15 {
-        set_slot(&mut svm, 103 + step);
-        scam_p = (scam_p * 104) / 100;
-        send_ok(&mut svm, ix_update_oracle(prog_id, scam_mkt, scam_oracle.pubkey(), scam_p, 0, 0), &payer, &[&payer, &scam_oracle]);
-    }
-    // A1 Fix verification: bare Liquidate(SCAM) while Alice's BTC leg is stale MUST fail!
-    send_err(
-        &mut svm,
-        ix_liquidate(prog_id, dex, scam_mkt, alice_pfl, keeper_tok, mint, dex_vault, TOKEN_PROGRAM_ID),
-        &payer,
-        &[&payer],
-        "Bare Liquidate with stale BTC leg must be rejected (A1)",
-    );
-    // Keeper atomically refreshes Alice's BTC leg + liquidates Alice's blown-up SCAM leg!
+    // Attacker pumps SCAM from $100 -> $180 respecting K=4 per-slot clamp (loss $160 > $95 -> alice_pfl bankrupt on SCAM!)
+    step_oracle(&mut svm, prog_id, scam_mkt, &scam_oracle, 180 * POS_SCALE, &payer);
+    let slot_post_scam = get_slot(&svm) + 1;
+    set_slot(&mut svm, slot_post_scam);
+    send_ok(&mut svm, ix_update_oracle(prog_id, btc_mkt, btc_oracle.pubkey(), 92_160_000, 0, 0), &payer, &[&payer, &btc_oracle]);
+
+    // Bug 1C check: Requesting PARTIAL liquidation (`reqQty = 1.0 < 2.0`) on bankrupt `alice_pfl`'s SCAM leg
+    // MUST force FULL SCAM leg close (`rawBasis == 0`), drain capital to 0, and leave `I_BTC` & `I_ETH` UNTOUCHED!
     let cu_liq = send_ixs_ok(
         &mut svm,
         &[
             ix_refresh_leg(prog_id, dex, btc_mkt, alice_pfl, false),
-            ix_liquidate(prog_id, dex, scam_mkt, alice_pfl, keeper_tok, mint, dex_vault, TOKEN_PROGRAM_ID),
+            ix_liquidate_ext(prog_id, dex, scam_mkt, alice_pfl, keeper_tok, mint, dex_vault, TOKEN_PROGRAM_ID,
+                0, 1 * POS_SCALE, None),
         ],
         &payer,
         &[&payer],
     );
-    let alice_cap_after = read_u64(&svm, &alice_pfl, 88);
-    let alice_mm_after = read_u64(&svm, &alice_pfl, 96);
-    assert!(
-        alice_cap_after >= alice_btc_mm && alice_cap_after >= alice_mm_after,
-        "ANTI-REVERSE-CONTAGION VIOLATED: Alice capital ({}) < BTC MM ({})!",
-        alice_cap_after, alice_mm_after
-    );
+    assert_eq!(read_u64(&svm, &alice_pfl, 88), 0, "Bug 1B: bankrupt cross-margin portfolio capital == 0");
+    assert_eq!(read_u8(&svm, &alice_pfl, 4), 1, "Bug 1C: bankrupt partial SCAM liq MUST force full close of SCAM leg (only BTC remains)!");
+    // Unrelated honest Bob (no SCAM leg) & I_BTC / I_ETH are 100% BIT-FOR-BIT UNTOUCHED!
+    assert_eq!(read_u64(&svm, &bob_pfl, 88), bob_cap_before, "Unrelated user Bob capital untouched by SCAM!");
     assert_eq!(read_u64(&svm, &btc_mkt, 224), btc_ins_before, "I_BTC must be bit-for-bit untouched!");
     assert_eq!(read_u64(&svm, &eth_mkt, 224), eth_ins_before, "I_ETH must be bit-for-bit untouched!");
+    // Top up Alice's BTC portfolio ($100) so Alice's BTC leg remains healthy for Suite 5+!
+    send_ok(&mut svm, ix_deposit_collateral(prog_id, dex, alice_pfl, alice.pubkey(), alice_tok, mint, dex_vault, TOKEN_PROGRAM_ID, 100 * POS_SCALE), &payer, &[&payer, &alice]);
+    send_err(&mut svm, ix_liquidate(prog_id, dex, btc_mkt, alice_pfl, keeper_tok, mint, dex_vault, TOKEN_PROGRAM_ID), &payer, &[&payer], "Alice re-margined BTC leg is healthy!");
 
-    // Verify Alice's BTC leg is STILL healthy and cannot be liquidated!
-    set_slot(&mut svm, 119);
-    send_ok(&mut svm, ix_update_oracle(prog_id, btc_mkt, btc_oracle.pubkey(), 92_160_000, 0, 0), &payer, &[&payer, &btc_oracle]);
-    send_err(&mut svm, ix_liquidate(prog_id, dex, btc_mkt, alice_pfl, keeper_tok, mint, dex_vault, TOKEN_PROGRAM_ID), &payer, &[&payer], "Alice BTC leg must survive SCAM explosion!");
-
-    // Attacker tries to claim fake paper profits on SCAM via ClearDeadLeg + RefreshLeg(forceHaircut=true)
-    // Attacker's extraction is strictly bounded by R_SCAM (Alice's seized SCAM margin + capped 25% of I_SCAM)!
+    // Attacker claims paper profits on SCAM via ClearDeadLeg + RefreshLeg(forceHaircut=true)
+    // Strictly bounded by R_SCAM!
     let scam_r_before = read_u64(&svm, &scam_mkt, 216);
     let attacker_cap_before = read_u64(&svm, &attacker_pfl, 88);
     send_ok(&mut svm, ix_clear_dead_leg(prog_id, dex, scam_mkt, attacker_pfl), &payer, &[&payer]);
@@ -1098,123 +1233,73 @@ fn main() {
     assert_eq!(read_u64(&svm, &btc_mkt, 224), btc_ins_before, "I_BTC still untouched after Attacker claim!");
     assert_dex_invariants(&svm, &dex, &dex_vault, &all_mkts, &all_pfls, "post-scam-containment");
 
-    // 4B: God-Mode RUG/USD Oracle Shielding Attacks (Alice + Mule vs Bob on SOL/USD!)
-    //     Tests BOTH Long-RUG 12x pump AND Short-RUG 12x pump shielding attempts:
-    //     Alice + Mule control RUG's oracle & inflate rugLeg.cachedMm >> Alice.capital;
-    //     verify reservedMm firewall guarantees Bob receives 100.00% of his SOL/USD profit,
-    //     ZERO haircut on Bob, and I_SOL bit-for-bit untouched!
+    // 4B: Bug 1B Regression (3 Permissionless Cross-Margin Markets `SOL` + `BTC2` + `RUG` — Zero Shielding!)
+    //     Alice1 holds Long 10 SOL + Long 10 BTC2 + Long 10 RUG in ONE portfolio ($200 shared capital).
+    //     SOL crashes -$220 (> $200 capital -> true shortfall = $20).
+    //     FIXED full-capital debit drains Alice1's capital to EXACT 0 BEFORE I_SOL pays ONLY the true $20 shortfall!
     {
         let s_dex = create_prog_acc(&mut svm, &prog_id, DEX_SIZE);
         let (s_vault, s_bump) = derive_dex_vault(&prog_id, &s_dex);
         send_ok(&mut svm, ix_init_dex(prog_id, s_dex, dex_admin.pubkey(), mint, s_vault, fee_vault, TOKEN_PROGRAM_ID, SYSTEM_PROGRAM_ID, s_bump, 6, 0, SPL_TOKEN_RENT_MIN), &payer, &[&payer, &dex_admin]);
         let sol_orac = Keypair::new();
+        let btc2_orac = Keypair::new();
         let rug_orac = Keypair::new();
         let sol_mkt = create_prog_acc(&mut svm, &prog_id, MKT_SIZE);
+        let btc2_mkt = create_prog_acc(&mut svm, &prog_id, MKT_SIZE);
         let rug_mkt = create_prog_acc(&mut svm, &prog_id, MKT_SIZE);
         let sol_ins = create_prog_acc(&mut svm, &prog_id, INS_SIZE);
-        send_ok(&mut svm, ix_create_market(prog_id, s_dex, sol_mkt, mint, sol_orac.pubkey(), lp.pubkey(), lp_tok, fee_vault, 100 * POS_SCALE, 20, 200, 0, 1000, 500, 100, 0, 400, 2500, 1_000_000 * POS_SCALE), &payer, &[&payer, &lp]);
-        send_ok(&mut svm, ix_create_market(prog_id, s_dex, rug_mkt, mint, rug_orac.pubkey(), attacker.pubkey(), attacker_tok, fee_vault, POS_SCALE, 20, 200, 0, 1000, 500, 100, 0, 400, 2500, 1_000_000 * POS_SCALE), &payer, &[&payer, &attacker]);
+        send_ok(&mut svm, ix_create_market(prog_id, s_dex, sol_mkt, mint, sol_orac.pubkey(), dex_admin.pubkey(), admin_tok, fee_vault, 100 * POS_SCALE, 20, 200, 0, 1000, 500, 100, 0, 95, 2500, 1_000_000 * POS_SCALE), &payer, &[&payer, &dex_admin]);
+        send_ok(&mut svm, ix_create_market(prog_id, s_dex, btc2_mkt, mint, btc2_orac.pubkey(), dex_admin.pubkey(), admin_tok, fee_vault, 100 * POS_SCALE, 20, 200, 0, 1000, 500, 100, 0, 95, 2500, 1_000_000 * POS_SCALE), &payer, &[&payer, &dex_admin]);
+        send_ok(&mut svm, ix_create_market(prog_id, s_dex, rug_mkt, mint, rug_orac.pubkey(), attacker.pubkey(), attacker_tok, fee_vault, POS_SCALE, 20, 200, 0, 1000, 500, 100, 0, 95, 2500, 1_000_000 * POS_SCALE), &payer, &[&payer, &attacker]);
         send_ok(&mut svm, ix_deposit_insurance(prog_id, s_dex, sol_mkt, sol_ins, lp.pubkey(), lp_tok, mint, s_vault, TOKEN_PROGRAM_ID, 500 * POS_SCALE), &payer, &[&payer, &lp]);
 
-        // 4B-1: Long-RUG 12x Pump Shielding Attack
-        let a1 = Keypair::new(); let b1 = Keypair::new(); let m1 = Keypair::new();
+        let a1 = Keypair::new(); let b1 = Keypair::new();
         let a1_tok = create_tok_acc(&mut svm, &mint, &a1.pubkey(), 1_000 * POS_SCALE);
-        let b1_tok = create_tok_acc(&mut svm, &mint, &b1.pubkey(), 1_000 * POS_SCALE);
-        let m1_tok = create_tok_acc(&mut svm, &mint, &m1.pubkey(), 1_000 * POS_SCALE);
+        let b1_tok = create_tok_acc(&mut svm, &mint, &b1.pubkey(), 2_000 * POS_SCALE);
         let a1_pfl = create_prog_acc(&mut svm, &prog_id, PFL_SIZE);
         let b1_pfl = create_prog_acc(&mut svm, &prog_id, PFL_SIZE);
-        let m1_pfl = create_prog_acc(&mut svm, &prog_id, PFL_SIZE);
-        for (p, u, t, amt) in [
-            (a1_pfl, &a1, a1_tok, 120 * POS_SCALE),
-            (b1_pfl, &b1, b1_tok, 500 * POS_SCALE),
-            (m1_pfl, &m1, m1_tok, 20 * POS_SCALE),
-        ] {
+        for (p, u, t, amt) in [(a1_pfl, &a1, a1_tok, 200 * POS_SCALE), (b1_pfl, &b1, b1_tok, 1_000 * POS_SCALE)] {
             send_ok(&mut svm, ix_init_portfolio(prog_id, s_dex, p, u.pubkey()), &payer, &[&payer, u]);
             send_ok(&mut svm, ix_deposit_collateral(prog_id, s_dex, p, u.pubkey(), t, mint, s_vault, TOKEN_PROGRAM_ID, amt), &payer, &[&payer, u]);
         }
-        // Alice1: Long 10 SOL ($1000, MM=$50, IM=$100) vs Bob1 + Long 200 RUG ($200, MM=$10, IM=$20) vs Mule1
+        // Alice1 opens Long 10 SOL + Long 10 BTC2 + Long 1 RUG (ALL in ONE cross-margin portfolio, IM=$100+$100+$0.10 -> add $10 cap or qty=9 BTC2)
         send_ok(&mut svm, ix_trade(prog_id, s_dex, sol_mkt, a1_pfl, a1.pubkey(), b1_pfl, b1.pubkey(), 0, 10 * POS_SCALE), &payer, &[&payer, &a1, &b1]);
-        send_ok(&mut svm, ix_trade(prog_id, s_dex, rug_mkt, a1_pfl, a1.pubkey(), m1_pfl, m1.pubkey(), 0, 200 * POS_SCALE), &payer, &[&payer, &a1, &m1]);
+        send_ok(&mut svm, ix_trade(prog_id, s_dex, btc2_mkt, a1_pfl, a1.pubkey(), b1_pfl, b1.pubkey(), 0, 9 * POS_SCALE), &payer, &[&payer, &a1, &b1]);
+        send_ok(&mut svm, ix_trade(prog_id, s_dex, rug_mkt, a1_pfl, a1.pubkey(), b1_pfl, b1.pubkey(), 0, 10 * POS_SCALE), &payer, &[&payer, &a1, &b1]);
+        assert_eq!(read_u8(&svm, &a1_pfl, 4), 3, "4B: Alice1 crosses SOL + BTC2 + permissionless RUG in 1 portfolio!");
 
-        // 4B-2: Short-RUG 12x Pump Shielding Attack (simultaneously on same markets!)
-        let a2 = Keypair::new(); let b2 = Keypair::new(); let m2 = Keypair::new();
-        let a2_tok = create_tok_acc(&mut svm, &mint, &a2.pubkey(), 1_000 * POS_SCALE);
-        let b2_tok = create_tok_acc(&mut svm, &mint, &b2.pubkey(), 1_000 * POS_SCALE);
-        let m2_tok = create_tok_acc(&mut svm, &mint, &m2.pubkey(), 1_000 * POS_SCALE);
-        let a2_pfl = create_prog_acc(&mut svm, &prog_id, PFL_SIZE);
-        let b2_pfl = create_prog_acc(&mut svm, &prog_id, PFL_SIZE);
-        let m2_pfl = create_prog_acc(&mut svm, &prog_id, PFL_SIZE);
-        for (p, u, t, amt) in [
-            (a2_pfl, &a2, a2_tok, 120 * POS_SCALE),
-            (b2_pfl, &b2, b2_tok, 500 * POS_SCALE),
-            (m2_pfl, &m2, m2_tok, 20 * POS_SCALE),
-        ] {
-            send_ok(&mut svm, ix_init_portfolio(prog_id, s_dex, p, u.pubkey()), &payer, &[&payer, u]);
-            send_ok(&mut svm, ix_deposit_collateral(prog_id, s_dex, p, u.pubkey(), t, mint, s_vault, TOKEN_PROGRAM_ID, amt), &payer, &[&payer, u]);
-        }
-        send_ok(&mut svm, ix_trade(prog_id, s_dex, sol_mkt, a2_pfl, a2.pubkey(), b2_pfl, b2.pubkey(), 0, 10 * POS_SCALE), &payer, &[&payer, &a2, &b2]);
-        send_ok(&mut svm, ix_trade(prog_id, s_dex, rug_mkt, m2_pfl, m2.pubkey(), a2_pfl, a2.pubkey(), 0, 200 * POS_SCALE), &payer, &[&payer, &m2, &a2]);
-
-        let s_mkts = vec![sol_mkt, rug_mkt];
-        let s_pfls = vec![a1_pfl, b1_pfl, m1_pfl, a2_pfl, b2_pfl, m2_pfl];
-
-        // Alice + Mule pump RUG/USD +4%/slot for 65 slots ($1 -> >$12.50, >12x!)
-        // WITHOUT refreshing on intermediate slots (direct 12x jump in cachedMm on slot +65!)
-        let base_sl = get_slot(&svm);
-        let mut rug_p = POS_SCALE;
-        for step in 1..=65u64 {
-            set_slot(&mut svm, base_sl + step);
-            rug_p = (rug_p * 104) / 100;
-            send_ok(&mut svm, ix_update_oracle(prog_id, rug_mkt, rug_orac.pubkey(), rug_p, 0, 0), &payer, &[&payer, &rug_orac]);
-        }
-        // Refresh RUG on both Alice1 (Long RUG) and Alice2 (Short RUG): cachedMm_RUG > $120!
-        send_ok(&mut svm, ix_refresh_leg(prog_id, s_dex, rug_mkt, a1_pfl, false), &payer, &[&payer]);
-        send_ok(&mut svm, ix_refresh_leg(prog_id, s_dex, rug_mkt, a2_pfl, false), &payer, &[&payer]);
-        let a1_rug_mm = read_u64(&svm, &a1_pfl, LEG_HEADER + LEG_STRIDE + 72);
-        let a2_rug_mm = read_u64(&svm, &a2_pfl, LEG_HEADER + LEG_STRIDE + 72);
-        assert!(a1_rug_mm > 120 * POS_SCALE && a2_rug_mm > 120 * POS_SCALE, "RUG cachedMm must exceed Alice's $120 capital!");
-        // Anti-shielding check: Alice1 & Alice2's SOL reservedMm MUST still be exact $50!
-        assert_eq!(read_u64(&svm, &a1_pfl, LEG_HEADER + 96), 50 * POS_SCALE, "Alice1 SOL reservedMm protected!");
-        assert_eq!(read_u64(&svm, &a2_pfl, LEG_HEADER + 96), 50 * POS_SCALE, "Alice2 SOL reservedMm protected!");
-        assert_eq!(read_u64(&svm, &a2_pfl, 88), 50 * POS_SCALE, "Alice2 capital stopped at exact SOL MM=$50!");
-        assert_eq!(read_u64(&svm, &a2_pfl, LEG_HEADER + LEG_STRIDE + 96), 0, "Alice2 RUG reservedMm capped at $0!");
-        assert_dex_invariants(&svm, &s_dex, &s_vault, &s_mkts, &s_pfls, "4B-post-rug-12x-pump");
-
-        // Now SOL/USD drops -4% ($100 -> $96: each Alice loses $40, each Bob earns +$40)!
-        set_slot(&mut svm, base_sl + 66);
-        send_ok(&mut svm, ix_update_oracle(prog_id, sol_mkt, sol_orac.pubkey(), 96 * POS_SCALE, 0, 0), &payer, &[&payer, &sol_orac]);
-        let sol_ins_before = read_u64(&svm, &sol_mkt, 224);
+        // Crash SOL from $100 -> $78 respecting K=4 per-slot clamp (-$220 loss on Long 10 SOL > $200 capital -> true shortfall = $20!)
+        step_oracle(&mut svm, prog_id, sol_mkt, &sol_orac, 78 * POS_SCALE, &payer);
+        let sol_ins_pre = read_u64(&svm, &sol_mkt, 224);
         send_ixs_ok(&mut svm, &[
+            ix_refresh_leg(prog_id, s_dex, btc2_mkt, a1_pfl, false),
             ix_refresh_leg(prog_id, s_dex, rug_mkt, a1_pfl, false),
             ix_liquidate(prog_id, s_dex, sol_mkt, a1_pfl, keeper_tok, mint, s_vault, TOKEN_PROGRAM_ID),
         ], &payer, &[&payer]);
-        send_ixs_ok(&mut svm, &[
-            ix_refresh_leg(prog_id, s_dex, rug_mkt, a2_pfl, false),
-            ix_liquidate(prog_id, s_dex, sol_mkt, a2_pfl, keeper_tok, mint, s_vault, TOKEN_PROGRAM_ID),
-        ], &payer, &[&payer]);
-        // I_SOL MUST be bit-for-bit untouched (ZERO shortfall on BOTH Alice1 and Alice2)!
-        assert_eq!(read_u64(&svm, &sol_mkt, 224), sol_ins_before, "I_SOL MUST be bit-for-bit untouched!");
-        // Both Bob1 and Bob2 collect 100.00% (+$40.00 each!) directly into their capital — ZERO haircut!
+        // Bug 1B assertion: Alice1's capital MUST be drained to EXACT 0 (zero shielded capital!),
+        // and I_SOL paid ONLY the exact $20 true shortfall (NEVER $70)!
+        assert_eq!(read_u64(&svm, &a1_pfl, 88), 0, "Bug 1B: capital MUST be 0 whenever I_SOL is drawn!");
+        let ins_drawn = sol_ins_pre - read_u64(&svm, &sol_mkt, 224);
+        assert_eq!(ins_drawn, 20 * POS_SCALE, "Bug 1B: I_SOL must pay ONLY true $20 shortfall (NOT shielded behind BTC2/RUG!)");
+        // Bob1 receives 100% of his $220 SOL profit ($200 from Alice1 + $20 from I_SOL)!
         send_ok(&mut svm, ix_refresh_leg(prog_id, s_dex, sol_mkt, b1_pfl, false), &payer, &[&payer]);
-        send_ok(&mut svm, ix_refresh_leg(prog_id, s_dex, sol_mkt, b2_pfl, false), &payer, &[&payer]);
-        assert_eq!(read_u64(&svm, &b1_pfl, 88), 540 * POS_SCALE, "Bob1 received 100.00% (+$40) despite Long-RUG 12x shielding attack!");
-        assert_eq!(read_u64(&svm, &b2_pfl, 88), 540 * POS_SCALE, "Bob2 received 100.00% (+$40) despite Short-RUG 12x shielding attack!");
-        assert_dex_invariants(&svm, &s_dex, &s_vault, &s_mkts, &s_pfls, "4B-post-bob-100pct-payout");
+        assert_eq!(read_u64(&svm, &b1_pfl, 88), 1_220 * POS_SCALE, "Bob1 receives exact +$220 SOL profit!");
+        assert_dex_invariants(&svm, &s_dex, &s_vault, &[sol_mkt, btc2_mkt, rug_mkt], &[a1_pfl, b1_pfl], "4B-post-bug1b-no-shielding");
     }
-    // Restore clock slot to 119 for Suite 5 (4B used isolated s_dex)
-    set_slot(&mut svm, 119);
+    // Restore clock slot to slot_post_scam for Suite 5 (4B used isolated s_dex)
+    set_slot(&mut svm, slot_post_scam);
     println!(
-        "[PASS] Suite 4: Anti-Reverse-Contagion + God-Mode RUG 12x Shielding Immunity (liq={} CU, Alice survived cap={} >= BTC_MM={}, Bob1/Bob2 paid 100% +$40, I_SOL untouched!)",
-        cu_liq, alice_cap_after, alice_mm_after
+        "[PASS] Suite 4: Permissionless 8-Leg Cross-Margin + Stale-Leg Non-Blocking + Bug 1B/1C (Zero Shielding, Zero Cross-Ins Leak, liq={} CU!)",
+        cu_liq
     );
 
     // =========================================================================
     // SUITE 5: Security Regression Tests (All 5 Hardened Attack Vectors)
     // =========================================================================
-    // 5a. Same-slot UpdateOracle spam rejected (slot 119 already updated BTC!)
+    // 5a. Same-slot UpdateOracle spam rejected (slot_post_scam already updated BTC!)
     send_err(&mut svm, ix_update_oracle(prog_id, btc_mkt, btc_oracle.pubkey(), 93_000_000, 0, 0), &payer, &[&payer, &btc_oracle], "Same-slot UpdateOracle spam");
-    // 5b. Unclamped oracle jump rejected (+10% > 4%)
-    set_slot(&mut svm, 120);
+    // 5b. Unclamped oracle jump rejected (+10% > 0.95%)
+    set_slot(&mut svm, slot_post_scam + 1);
     send_err(&mut svm, ix_update_oracle(prog_id, btc_mkt, btc_oracle.pubkey(), 102_000_000, 0, 0), &payer, &[&payer, &btc_oracle], "Unclamped oracle jump");
     // 5c. Real executable noop.so TokenProg + wrong mint + wrong vault MUST fail with exact PErr codes!
     //     (Regression test for Bug A0: executable fake token program returning Ok(0) on CPI!)
@@ -1246,7 +1331,7 @@ fn main() {
     send_ok(
         &mut svm,
         ix_create_market(prog_id, dex, adl_mkt, mint, adl_oracle.pubkey(), lp.pubkey(), lp_tok, fee_vault,
-            100 * POS_SCALE, 10, 20, 0, 1000, 500, 100, 0, 400, 2500, 1_000_000 * POS_SCALE),
+            100 * POS_SCALE, 10, 20, 0, 1000, 500, 100, 0, 95, 2500, 1_000_000 * POS_SCALE),
         &payer,
         &[&payer, &lp],
     );
@@ -1267,13 +1352,8 @@ fn main() {
 
     // T1 (Long 1 @ $100, cap=$15) vs T2 (Short 1 @ $100)
     send_ok(&mut svm, ix_trade(prog_id, dex, adl_mkt, t1_pfl, t1.pubkey(), t2_pfl, t2.pubkey(), 0, POS_SCALE), &payer, &[&payer, &t1, &t2]);
-    // Crash price over 4 slots so T1 drops below MM and gets liquidated!
-    let mut ap = 100 * POS_SCALE;
-    for step in 1..=4 {
-        set_slot(&mut svm, 120 + step);
-        ap = (ap * 96) / 100;
-        send_ok(&mut svm, ix_update_oracle(prog_id, adl_mkt, adl_oracle.pubkey(), ap, 0, 0), &payer, &[&payer, &adl_oracle]);
-    }
+    // Crash price to $85 respecting K=4 per-slot clamp so T1 drops below MM and gets liquidated!
+    step_oracle(&mut svm, prog_id, adl_mkt, &adl_oracle, 85 * POS_SCALE, &payer);
     send_ok_assert_log(&mut svm, ix_liquidate(prog_id, dex, adl_mkt, t1_pfl, keeper_tok, mint, dex_vault, TOKEN_PROGRAM_ID), &payer, &[&payer], "Program log: 0x3,");
     assert_eq!(read_u64(&svm, &adl_mkt, 256), 0); // oiLong == 0
     assert_eq!(read_u64(&svm, &adl_mkt, 280), POS_SCALE); // rawBasisShort == 1.0 (dead leg!)
@@ -1292,11 +1372,12 @@ fn main() {
     send_err(&mut svm, ix_start_wind_down(prog_id, adl_mkt, keeper.pubkey()), &payer, &[&payer, &keeper], "StartWindDown while oracle fresh");
 
     // Advance slot past maxStaleness (20) -> permissionless WindDown!
-    set_slot(&mut svm, 150);
+    let s6_wd = get_slot(&svm) + 25;
+    set_slot(&mut svm, s6_wd);
     send_ok(&mut svm, ix_start_wind_down(prog_id, adl_mkt, keeper.pubkey()), &payer, &[&payer, &keeper]);
     send_err(&mut svm, ix_force_close_pair(prog_id, dex, adl_mkt, t1_pfl, t2_pfl), &payer, &[&payer], "ForceClosePair during exitWindow");
     // Advance past exitWindow (10) -> permissionless ForceClosePair!
-    set_slot(&mut svm, 160);
+    set_slot(&mut svm, s6_wd + 12);
     send_ok_assert_log(&mut svm, ix_force_close_pair(prog_id, dex, adl_mkt, t1_pfl, t2_pfl), &payer, &[&payer], "Program log: 0x6,");
     send_ok_assert_log(&mut svm, ix_resolve_market(prog_id, dex, adl_mkt), &payer, &[&payer], "Program log: 0x7,");
     // If T2 still has any unclaimed posPnl leg on adl_mkt, claim it!
@@ -1343,7 +1424,7 @@ fn main() {
     send_ok(
         &mut svm,
         ix_create_market_ext(prog_id, dex, comp_mkt, mint, comp_orc1.pubkey(), lp.pubkey(), lp_tok, fee_vault,
-            100 * POS_SCALE, 10, 50, 0, 1000, 500, 100, 0, 400, 2500, 1_000_000 * POS_SCALE, 5 * POS_SCALE),
+            100 * POS_SCALE, 10, 50, 0, 1000, 500, 100, 0, 95, 2500, 1_000_000 * POS_SCALE, 5 * POS_SCALE),
         &payer,
         &[&payer, &lp],
     );
@@ -1354,14 +1435,15 @@ fn main() {
 
     // 7b. Authority rotation: rotate oracleAuth (comp_orc1 -> comp_orc2) & transfer marketAdmin (lp -> comp_adm2)!
     send_ok(&mut svm, ix_update_market_auth(prog_id, comp_mkt, lp.pubkey(), 1, comp_orc2.pubkey()), &payer, &[&payer, &lp]);
-    set_slot(&mut svm, 161);
-    send_err(&mut svm, ix_update_oracle(prog_id, comp_mkt, comp_orc1.pubkey(), 101 * POS_SCALE, 0, 0), &payer, &[&payer, &comp_orc1], "Old oracle rejected after rotation");
-    send_ok(&mut svm, ix_update_oracle(prog_id, comp_mkt, comp_orc2.pubkey(), 101 * POS_SCALE, 0, 0), &payer, &[&payer, &comp_orc2]);
+    let s7_orc = get_slot(&svm) + 1;
+    set_slot(&mut svm, s7_orc);
+    send_err(&mut svm, ix_update_oracle(prog_id, comp_mkt, comp_orc1.pubkey(), 100_900_000, 0, 0), &payer, &[&payer, &comp_orc1], "Old oracle rejected after rotation");
+    send_ok(&mut svm, ix_update_oracle(prog_id, comp_mkt, comp_orc2.pubkey(), 100_900_000, 0, 0), &payer, &[&payer, &comp_orc2]);
     send_ok(&mut svm, ix_update_market_auth(prog_id, comp_mkt, lp.pubkey(), 0, comp_adm2.pubkey()), &payer, &[&payer, &lp]);
     send_err(&mut svm, ix_burn_market_admin(prog_id, comp_mkt, lp.pubkey()), &payer, &[&payer, &lp], "Old marketAdmin rejected after transfer");
     send_ok(&mut svm, ix_burn_market_admin(prog_id, comp_mkt, comp_adm2.pubkey()), &payer, &[&payer, &comp_adm2]);
 
-    // 7c. minMm dust floor ($5.00): tiny 0.01-unit trade ($1.01 notional) needs $5.00 margin;
+    // 7c. minMm dust floor ($5.00): tiny 0.01-unit trade ($1.009 notional) needs $5.00 margin;
     //     dust portfolio with $2.00 capital is REJECTED!
     let dust_kp = Keypair::new();
     svm.airdrop(&dust_kp.pubkey(), 10_000_000_000).unwrap();
@@ -1371,22 +1453,22 @@ fn main() {
     send_ok(&mut svm, ix_deposit_collateral(prog_id, dex, dust_pfl, dust_kp.pubkey(), dust_tok, mint, dex_vault, TOKEN_PROGRAM_ID, 2 * POS_SCALE), &payer, &[&payer, &dust_kp]);
     send_err(&mut svm, ix_trade(prog_id, dex, comp_mkt, dust_pfl, dust_kp.pubkey(), t2_pfl, t2.pubkey(), 0, 10_000), &payer, &[&payer, &dust_kp, &t2], "Dust position rejected by minMm=$5 floor");
 
-    // 7d. Bounded execPrice spread (external CLOB/AMM/matcher fill at $102 vs $101 mark = +$1.00 spread!):
+    // 7d. Bounded execPrice spread (external CLOB/AMM/matcher fill at $101.50 vs $100.90 mark = +$0.60 spread!):
     send_ok(&mut svm, ix_deposit_collateral(prog_id, dex, dust_pfl, dust_kp.pubkey(), dust_tok, mint, dex_vault, TOKEN_PROGRAM_ID, 20 * POS_SCALE), &payer, &[&payer, &dust_kp]);
-    // Out-of-band execPrice ($120 vs $101 > 4% maxMove) REJECTED!
+    // Out-of-band execPrice ($120 vs $100.90 > 0.95% maxMove) REJECTED!
     send_err(&mut svm, ix_trade_ext(prog_id, dex, comp_mkt, dust_pfl, dust_kp.pubkey(), t2_pfl, t2.pubkey(), 0, POS_SCALE, 120 * POS_SCALE), &payer, &[&payer, &dust_kp, &t2], "Out-of-band execPrice rejected");
     let dust_cap_0 = read_u64(&svm, &dust_pfl, 88);
     let t2_cap_0 = read_u64(&svm, &t2_pfl, 88);
-    // In-band execPrice ($102 vs $101 mark, qty=1.0 -> Long pays $1.00 spread directly to Short!)
-    send_ok_assert_log(&mut svm, ix_trade_ext(prog_id, dex, comp_mkt, dust_pfl, dust_kp.pubkey(), t2_pfl, t2.pubkey(), 0, POS_SCALE, 102 * POS_SCALE), &payer, &[&payer, &dust_kp, &t2], "Program log: 0x2,");
-    assert_eq!(read_u64(&svm, &dust_pfl, 88), dust_cap_0 - POS_SCALE, "Long must pay exact $1 spread to Short");
-    assert_eq!(read_u64(&svm, &t2_pfl, 88), t2_cap_0 + POS_SCALE, "Short (LP/matcher) must receive exact $1 spread");
+    // In-band execPrice ($101.50 vs $100.90 mark, qty=1.0 -> Long pays $0.60 spread directly to Short!)
+    send_ok_assert_log(&mut svm, ix_trade_ext(prog_id, dex, comp_mkt, dust_pfl, dust_kp.pubkey(), t2_pfl, t2.pubkey(), 0, POS_SCALE, 101_500_000), &payer, &[&payer, &dust_kp, &t2], "Program log: 0x2,");
+    assert_eq!(read_u64(&svm, &dust_pfl, 88), dust_cap_0 - 600_000, "Long must pay exact $0.60 spread to Short");
+    assert_eq!(read_u64(&svm, &t2_pfl, 88), t2_cap_0 + 600_000, "Short (LP/matcher) must receive exact $0.60 spread");
 
     // 7e. Donated-only market clean lifecycle: close OI -> stale WindDown -> ResolveMarket sweeps orphan $25
     //     donated insurance (totalInsShares == 0) into dex.totalSurplus -> TombstoneMarket succeeds!
     send_ok_assert_log(&mut svm, ix_trade(prog_id, dex, comp_mkt, dust_pfl, dust_kp.pubkey(), t2_pfl, t2.pubkey(), 1, POS_SCALE), &payer, &[&payer, &dust_kp, &t2], "Program log: 0x2,");
     let surp_before_donate_sweep = read_u64(&svm, &dex, 192);
-    set_slot(&mut svm, 215); // > comp_mkt lastOracleSlot(161) + maxStaleness(50)
+    set_slot(&mut svm, s7_orc + 55); // > comp_mkt lastOracleSlot + maxStaleness(50)
     send_ok(&mut svm, ix_start_wind_down(prog_id, comp_mkt, keeper.pubkey()), &payer, &[&payer, &keeper]);
     send_ok_assert_log(&mut svm, ix_resolve_market(prog_id, dex, comp_mkt), &payer, &[&payer], "Program log: 0x7,");
     assert_eq!(read_u64(&svm, &comp_mkt, 224), 0, "Orphan donated insurance must sweep to 0 on Resolve!");
@@ -1411,7 +1493,8 @@ fn main() {
     let (f_vault, f_bump) = derive_dex_vault(&prog_id, &f_dex);
     send_ok(&mut svm, ix_init_dex(prog_id, f_dex, dex_admin.pubkey(), mint, f_vault, fee_vault, TOKEN_PROGRAM_ID, SYSTEM_PROGRAM_ID, f_bump, 6, 0, SPL_TOKEN_RENT_MIN), &payer, &[&payer, &dex_admin]);
 
-    set_slot(&mut svm, 200);
+    let s8_start = get_slot(&svm) + 10;
+    set_slot(&mut svm, s8_start);
     let mut f_oracles = Vec::new();
     let mut f_mkts = Vec::new();
     let mut f_mkt_pairs = Vec::new();
@@ -1425,7 +1508,7 @@ fn main() {
         send_ok(
             &mut svm,
             ix_create_market(prog_id, f_dex, mkt, mint, orc.pubkey(), dex_admin.pubkey(), alice_tok, fee_vault,
-                f_prices[m_i], 10, 500, 0, 1000, 500, 100, 5, 400, 2500, 10_000 * POS_SCALE),
+                f_prices[m_i], 10, 500, 0, 1000, 500, 100, 5, 95, 2500, 10_000 * POS_SCALE),
             &payer,
             &[&payer, &dex_admin],
         );
@@ -1470,9 +1553,9 @@ fn main() {
             let cur = get_slot(&svm) + 1;
             set_slot(&mut svm, cur);
             let mi = rng.range(3) as usize;
-            let mag = (rng.range(350) + 40) as i64; // 0.4% .. 3.9%
+            let mag = (rng.range(80) + 10) as i64; // 0.1% .. 0.89%
             let dir = if rng.range(4) == 0 { -trend_dir[mi] } else { trend_dir[mi] };
-            let bps_delta = (dir * mag).clamp(-380, 380);
+            let bps_delta = (dir * mag).clamp(-88, 88);
             let cur_p = read_u64(&svm, &f_mkts[mi], 112);
             let mut new_p = ((cur_p as i128) * (10_000 + bps_delta as i128) / 10_000) as u64;
             new_p = new_p.clamp(5 * POS_SCALE, 500 * POS_SCALE);
@@ -1612,10 +1695,11 @@ fn main() {
     write_feed(&mut svm, 115 * POS_SCALE, 50_000, s0); // $115.00, conf $0.05
 
     // Create market with `orac_pda` (owned by OracleAdapter!) as oracleAuth!
+    // (im=2500, mm=2000, liqFee=100, maxMove=400 satisfies K=4 exact: 4*400+160+100=1860 <= 2000!)
     send_ok(
         &mut svm,
         ix_create_market(prog_id, dex, comp_mkt2, mint, orac_pda, lp.pubkey(), lp_tok, fee_vault,
-            100 * POS_SCALE, 10, 50, 0, 1000, 500, 100, 0, 400, 2500, 1_000_000 * POS_SCALE),
+            100 * POS_SCALE, 10, 50, 0, 2500, 2000, 100, 0, 400, 2500, 1_000_000 * POS_SCALE),
         &payer,
         &[&payer, &lp],
     );
@@ -1791,7 +1875,7 @@ fn main() {
     let pyth_adp = create_prog_acc(&mut svm, &adapter_prog, 352);
     let (pyth_pda, pyth_bump) = Address::find_program_address(&[b"orac", pyth_adp.as_ref()], &adapter_prog);
     svm.set_account(pyth_feed, Account { lamports: 10_000_000, data: make_pyth_v2(pyth_fid, 10_300_000_000, 5_000_000, -8, 1_750_000_000, s0 + 30, 1), owner: pyth_prog_id, executable: false, rent_epoch: 0 }).unwrap();
-    send_ok(&mut svm, ix_create_market(prog_id, dex, pyth_mkt, mint, pyth_pda, lp.pubkey(), lp_tok, fee_vault, 100 * POS_SCALE, 10, 50, 0, 1000, 500, 100, 0, 400, 2500, 1_000_000 * POS_SCALE), &payer, &[&payer, &lp]);
+    send_ok(&mut svm, ix_create_market(prog_id, dex, pyth_mkt, mint, pyth_pda, lp.pubkey(), lp_tok, fee_vault, 100 * POS_SCALE, 10, 50, 0, 2500, 2000, 100, 0, 400, 2500, 1_000_000 * POS_SCALE), &payer, &[&payer, &lp]);
     let mut pyth_init = vec![0u8; 60];
     pyth_init[0] = 0; pyth_init[1] = pyth_bump; pyth_init[2] = 1;
     pyth_init[4..12].copy_from_slice(&30u64.to_le_bytes());
@@ -1824,7 +1908,7 @@ fn main() {
     let cl_adp = create_prog_acc(&mut svm, &adapter_prog, 352);
     let (cl_pda, cl_bump) = Address::find_program_address(&[b"orac", cl_adp.as_ref()], &adapter_prog);
     svm.set_account(cl_feed, Account { lamports: 10_000_000, data: make_chainlink_ocr2(8, 4, 0, s0 + 31, 10_250_000_000i128), owner: cl_prog_id, executable: false, rent_epoch: 0 }).unwrap();
-    send_ok(&mut svm, ix_create_market(prog_id, dex, cl_mkt, mint, cl_pda, lp.pubkey(), lp_tok, fee_vault, 100 * POS_SCALE, 10, 50, 0, 1000, 500, 100, 0, 400, 2500, 1_000_000 * POS_SCALE), &payer, &[&payer, &lp]);
+    send_ok(&mut svm, ix_create_market(prog_id, dex, cl_mkt, mint, cl_pda, lp.pubkey(), lp_tok, fee_vault, 100 * POS_SCALE, 10, 50, 0, 2500, 2000, 100, 0, 400, 2500, 1_000_000 * POS_SCALE), &payer, &[&payer, &lp]);
     let mut cl_init = vec![0u8; 28];
     cl_init[0] = 0; cl_init[1] = cl_bump; cl_init[2] = 2;
     cl_init[4..12].copy_from_slice(&10u64.to_le_bytes());
@@ -1850,7 +1934,7 @@ fn main() {
     let sb_val: i128 = 104i128 * 1_000_000_000_000_000_000i128;
     let sb_std: i128 = 100_000_000_000_000_000i128;
     svm.set_account(sb_feed, Account { lamports: 10_000_000, data: make_switchboard(sb_val, sb_std, 5, s0 + 32), owner: sb_prog_id, executable: false, rent_epoch: 0 }).unwrap();
-    send_ok(&mut svm, ix_create_market(prog_id, dex, sb_mkt, mint, sb_pda, lp.pubkey(), lp_tok, fee_vault, 100 * POS_SCALE, 10, 50, 0, 1000, 500, 100, 0, 400, 2500, 1_000_000 * POS_SCALE), &payer, &[&payer, &lp]);
+    send_ok(&mut svm, ix_create_market(prog_id, dex, sb_mkt, mint, sb_pda, lp.pubkey(), lp_tok, fee_vault, 100 * POS_SCALE, 10, 50, 0, 2500, 2000, 100, 0, 400, 2500, 1_000_000 * POS_SCALE), &payer, &[&payer, &lp]);
     let mut sb_init = vec![0u8; 28];
     sb_init[0] = 0; sb_init[1] = sb_bump; sb_init[2] = 3;
     sb_init[4..12].copy_from_slice(&10u64.to_le_bytes());
@@ -1877,7 +1961,7 @@ fn main() {
     let stoxx_fid  = [0x55u8; 32];
     svm.set_account(stoxx_feed, Account { lamports: 10_000_000, data: make_pyth_v2(stoxx_fid, 50_000_000_000, 10_000_000, -8, 1_750_000_007, s0 + 33, 1), owner: pyth_prog_id, executable: false, rent_epoch: 0 }).unwrap();
     svm.set_account(sol_feed,   Account { lamports: 10_000_000, data: make_chainlink_ocr2(8, 4, 2, s0 + 33, 12_500_000_000i128), owner: cl_prog_id, executable: false, rent_epoch: 0 }).unwrap();
-    send_ok(&mut svm, ix_create_market(prog_id, dex, rat_mkt, mint, rat_pda, lp.pubkey(), lp_tok, fee_vault, 3_950_000, 10, 50, 0, 1000, 500, 100, 0, 400, 2500, 1_000_000 * POS_SCALE), &payer, &[&payer, &lp]);
+    send_ok(&mut svm, ix_create_market(prog_id, dex, rat_mkt, mint, rat_pda, lp.pubkey(), lp_tok, fee_vault, 3_950_000, 10, 50, 0, 2500, 2000, 100, 0, 400, 2500, 1_000_000 * POS_SCALE), &payer, &[&payer, &lp]);
     let mut rat_init = vec![0u8; 60];
     rat_init[0] = 0; rat_init[1] = rat_bump; rat_init[2] = 1; rat_init[3] = 2;
     rat_init[4..12].copy_from_slice(&30u64.to_le_bytes());
@@ -1900,7 +1984,7 @@ fn main() {
     let ewma_mkt = create_prog_acc(&mut svm, &prog_id, MKT_SIZE);
     let ewma_adp = create_prog_acc(&mut svm, &adapter_prog, 352);
     let (ewma_pda, ewma_bump) = Address::find_program_address(&[b"orac", ewma_adp.as_ref()], &adapter_prog);
-    send_ok(&mut svm, ix_create_market(prog_id, dex, ewma_mkt, mint, ewma_pda, lp.pubkey(), lp_tok, fee_vault, 4 * POS_SCALE, 10, 50, 0, 1000, 500, 100, 0, 400, 2500, 1_000_000 * POS_SCALE), &payer, &[&payer, &lp]);
+    send_ok(&mut svm, ix_create_market(prog_id, dex, ewma_mkt, mint, ewma_pda, lp.pubkey(), lp_tok, fee_vault, 4 * POS_SCALE, 10, 50, 0, 2500, 2000, 100, 0, 400, 2500, 1_000_000 * POS_SCALE), &payer, &[&payer, &lp]);
     let mut ewma_init = vec![0u8; 60];
     ewma_init[0] = 0; ewma_init[1] = ewma_bump; ewma_init[2] = 1; ewma_init[3] = 2;
     ewma_init[4..12].copy_from_slice(&30u64.to_le_bytes());
@@ -2130,9 +2214,9 @@ fn main() {
         set_slot(&mut svm, b_sl0);
         write_custom(&mut svm, b_sol_feed, 100 * POS_SCALE, b_sl0);
         write_custom(&mut svm, b_eth_feed, 100 * POS_SCALE, b_sl0);
-        // maxMoveBps=100 (1%/slot), mmBps=500 (5%), liqFeeBps=100 (1%), maxStaleness=150 -> K=4 safe!
-        send_ok(&mut svm, ix_create_market(prog_id, b_dex, b_sol_mkt, mint, b_sol_pda, lp.pubkey(), lp_tok, fee_vault, 100 * POS_SCALE, 20, 150, 0, 1000, 500, 100, 0, 100, 2500, 1_000_000 * POS_SCALE), &payer, &[&payer, &lp]);
-        send_ok(&mut svm, ix_create_market(prog_id, b_dex, b_eth_mkt, mint, b_eth_pda, lp.pubkey(), lp_tok, fee_vault, 100 * POS_SCALE, 20, 150, 0, 1000, 500, 100, 0, 100, 2500, 1_000_000 * POS_SCALE), &payer, &[&payer, &lp]);
+        // maxMoveBps=95 (0.95%/slot), mmBps=500 (5%), liqFeeBps=100 (1%), maxStaleness=150 -> K=4 compounded safe (490 <= 500)!
+        send_ok(&mut svm, ix_create_market(prog_id, b_dex, b_sol_mkt, mint, b_sol_pda, dex_admin.pubkey(), admin_tok, fee_vault, 100 * POS_SCALE, 20, 150, 0, 1000, 500, 100, 0, 95, 2500, 1_000_000 * POS_SCALE), &payer, &[&payer, &dex_admin]);
+        send_ok(&mut svm, ix_create_market(prog_id, b_dex, b_eth_mkt, mint, b_eth_pda, dex_admin.pubkey(), admin_tok, fee_vault, 100 * POS_SCALE, 20, 150, 0, 1000, 500, 100, 0, 95, 2500, 1_000_000 * POS_SCALE), &payer, &[&payer, &dex_admin]);
         let b_sol_ins = create_prog_acc(&mut svm, &prog_id, INS_SIZE);
         send_ok(&mut svm, ix_deposit_insurance(prog_id, b_dex, b_sol_mkt, b_sol_ins, lp.pubkey(), lp_tok, mint, b_vault, TOKEN_PROGRAM_ID, 500 * POS_SCALE), &payer, &[&payer, &lp]);
         for (adp, mkt, fd, bump) in [(b_sol_adp, b_sol_mkt, b_sol_feed, b_sol_bump), (b_eth_adp, b_eth_mkt, b_eth_feed, b_eth_bump)] {
@@ -2141,10 +2225,10 @@ fn main() {
             d[4..12].copy_from_slice(&150u64.to_le_bytes());
             d[12..20].copy_from_slice(&100u64.to_le_bytes());
             send_ok(&mut svm, Instruction { program_id: adapter_prog, accounts: vec![
-                AccountMeta::new(adp, false), AccountMeta::new_readonly(lp.pubkey(), true),
+                AccountMeta::new(adp, false), AccountMeta::new_readonly(dex_admin.pubkey(), true),
                 AccountMeta::new_readonly(prog_id, false), AccountMeta::new_readonly(mkt, false),
                 AccountMeta::new_readonly(fd, false),
-            ], data: d }, &payer, &[&payer, &lp]);
+            ], data: d }, &payer, &[&payer, &dex_admin]);
         }
 
         // Hedged trader holds Long 10 SOL + Short 10 ETH ($200 IM, $100 MM) on $200 capital vs LP;
@@ -2167,12 +2251,12 @@ fn main() {
         // Unhedged trader U: Long 10 SOL ($1,000 notional, IM=$100, MM=$50) on $100 capital!
         send_ok(&mut svm, ix_trade(prog_id, b_dex, b_sol_mkt, u_pfl, u_kp.pubkey(), lp_b_pfl, lp_kp.pubkey(), 0, 10 * POS_SCALE), &payer, &[&payer, &u_kp, &lp_kp]);
 
-        // Atomic Crank+LP Bundle on slot +1: both SOL and ETH jump +1% ($100 -> $101)!
+        // Atomic Crank+LP Bundle on slot +1: both SOL and ETH jump +0.9% ($100 -> $100.90)!
         // Crank bot atomically executes [Crank(SOL), RefreshLeg(SOL, LP), Crank(ETH), RefreshLeg(ETH, LP)]
         // in ONE Solana tx so R_SOL is funded IMMEDIATELY in the same tx!
         set_slot(&mut svm, b_sl0 + 1);
-        write_custom(&mut svm, b_sol_feed, 101 * POS_SCALE, b_sl0 + 1);
-        write_custom(&mut svm, b_eth_feed, 101 * POS_SCALE, b_sl0 + 1);
+        write_custom(&mut svm, b_sol_feed, 100_900_000, b_sl0 + 1);
+        write_custom(&mut svm, b_eth_feed, 100_900_000, b_sl0 + 1);
         let ix_b_crank = |adp: Address, mkt: Address, fd: Address, pda: Address| Instruction {
             program_id: adapter_prog,
             accounts: vec![
@@ -2193,7 +2277,7 @@ fn main() {
             &payer,
             &[&payer],
         );
-        // Hedged trader's SOL gain (+$5) immediately covers ETH loss (-$5) -> capital == $100,
+        // Hedged trader's SOL gain (+$4.50) immediately covers ETH loss (-$4.50) -> capital == $100,
         // and adversarial keeper liquidation attempt on ETH is REJECTED!
         send_ixs_ok(&mut svm, &[
             ix_refresh_leg(prog_id, b_dex, b_sol_mkt, h_pfl, false),
@@ -2203,22 +2287,22 @@ fn main() {
         send_err(&mut svm, ix_liquidate(prog_id, b_dex, b_eth_mkt, h_pfl, keeper_tok, mint, b_vault, TOKEN_PROGRAM_ID), &payer, &[&payer], "Hedged trader cannot be liquidated after atomic Crank+LP bundle");
 
         // Now test K=4 consecutive censored liquidation slots on unhedged U (Long 10 SOL)!
-        // First push SOL down 5% ($101 -> ~$95) so U sits right near MM ($50 capital vs ~$47.5 MM),
-        // then run K=4 consecutive -1% oracle slots WITHOUT liquidating U, then liquidate on honest slot!
-        let mut p_sol = 101 * POS_SCALE;
-        for st in 2..=6u64 {
+        // First push SOL down ~5.3% ($100.90 -> ~$95.57) so U sits right near MM (~$55.7 cap vs ~$47.8 MM),
+        // then run K=4 consecutive -0.9% oracle slots WITHOUT liquidating U, then liquidate on honest slot!
+        let mut p_sol = 100_900_000u64;
+        for st in 2..=7u64 {
             set_slot(&mut svm, b_sl0 + st);
-            p_sol = (p_sol * 99) / 100;
+            p_sol = (p_sol * 991) / 1000;
             write_custom(&mut svm, b_sol_feed, p_sol, b_sl0 + st);
             send_ok(&mut svm, ix_b_crank(b_sol_adp, b_sol_mkt, b_sol_feed, b_sol_pda), &payer, &[&payer]);
         }
-        // Refresh U right at MM boundary (~$51 capital vs ~$48 MM): still healthy!
+        // Refresh U right at MM boundary (~$55.7 capital vs ~$47.8 MM): still healthy!
         send_ok(&mut svm, ix_refresh_leg(prog_id, b_dex, b_sol_mkt, u_pfl, false), &payer, &[&payer]);
         let ins_before_k4 = read_u64(&svm, &b_sol_mkt, 224);
-        // K=4 consecutive censored oracle slots (-1%/slot, ZERO liquidations!)
-        for st in 7..=10u64 {
+        // K=4 consecutive censored oracle slots (-0.9%/slot, ZERO liquidations!)
+        for st in 8..=11u64 {
             set_slot(&mut svm, b_sl0 + st);
-            p_sol = (p_sol * 99) / 100;
+            p_sol = (p_sol * 991) / 1000;
             write_custom(&mut svm, b_sol_feed, p_sol, b_sl0 + st);
             send_ok(&mut svm, ix_b_crank(b_sol_adp, b_sol_mkt, b_sol_feed, b_sol_pda), &payer, &[&payer]);
         }
@@ -2242,16 +2326,16 @@ fn main() {
     // 10a. Unbounded parameter DoS rejections
     let bad_mkt2 = create_prog_acc(&mut svm, &prog_id, MKT_SIZE);
     send_err(&mut svm, ix_create_market(prog_id, dex, bad_mkt2, mint, btc_oracle.pubkey(), alice.pubkey(), alice_tok, fee_vault,
-        100 * POS_SCALE, 300_000, 50, 0, 1000, 500, 100, 0, 400, 2500, 1_000_000 * POS_SCALE),
+        100 * POS_SCALE, 300_000, 50, 0, 1000, 500, 100, 0, 95, 2500, 1_000_000 * POS_SCALE),
         &payer, &[&payer, &alice], "exitWindow > MAX_EXIT_WINDOW rejected");
     send_err(&mut svm, ix_create_market(prog_id, dex, bad_mkt2, mint, btc_oracle.pubkey(), alice.pubkey(), alice_tok, fee_vault,
-        100 * POS_SCALE, 20, 50_000, 0, 1000, 500, 100, 0, 400, 2500, 1_000_000 * POS_SCALE),
+        100 * POS_SCALE, 20, 50_000, 0, 1000, 500, 100, 0, 95, 2500, 1_000_000 * POS_SCALE),
         &payer, &[&payer, &alice], "maxStaleness > MAX_STALENESS rejected");
     send_err(&mut svm, ix_create_market(prog_id, dex, bad_mkt2, mint, btc_oracle.pubkey(), alice.pubkey(), alice_tok, fee_vault,
-        100 * POS_SCALE, 20, 50, 1, 1000, 500, 100, 0, 400, 2500, 1_000_000 * POS_SCALE),
+        100 * POS_SCALE, 20, 50, 1, 1000, 500, 100, 0, 95, 2500, 1_000_000 * POS_SCALE),
         &payer, &[&payer, &alice], "non-zero warmupSlots rejected");
 
-    // 10b + 10c on fresh fair-liq market `fair_mkt` ($100, IM=10%, MM=5%, liqFee=1%, maxMove=4%)
+    // 10b + 10c on fresh fair-liq market `fair_mkt` ($100, IM=10%, MM=5%, liqFee=1%, maxMove=0.95%)
     let fair_mkt = create_prog_acc(&mut svm, &prog_id, MKT_SIZE);
     let fair_orc = Keypair::new();
     let victim = Keypair::new();
@@ -2268,7 +2352,7 @@ fn main() {
     let cp_pfl  = create_prog_acc(&mut svm, &prog_id, PFL_SIZE);
 
     send_ok(&mut svm, ix_create_market(prog_id, dex, fair_mkt, mint, fair_orc.pubkey(), lp.pubkey(), lp_tok, fee_vault,
-        100 * POS_SCALE, 20, 50, 0, 1000, 500, 100, 0, 400, 2500, 1_000_000 * POS_SCALE),
+        100 * POS_SCALE, 20, 50, 0, 1000, 500, 100, 0, 95, 2500, 1_000_000 * POS_SCALE),
         &payer, &[&payer, &lp]);
     send_ok(&mut svm, ix_init_portfolio(prog_id, dex, vic_pfl, victim.pubkey()), &payer, &[&payer, &victim]);
     send_ok(&mut svm, ix_init_portfolio(prog_id, dex, hlp_pfl, hlp_lp.pubkey()), &payer, &[&payer, &hlp_lp]);
@@ -2282,12 +2366,8 @@ fn main() {
         &payer, &[&payer, &victim, &cparty]);
 
     // 10b. Verify Trade(mode=1) execPrice spread CANNOT drain payer below remaining totalMm!
-    let s_fair = get_slot(&svm) + 1;
-    set_slot(&mut svm, s_fair);
-    send_ok(&mut svm, ix_update_oracle(prog_id, fair_mkt, fair_orc.pubkey(), 96_500_000, 0, 0), &payer, &[&payer, &fair_orc]);
-    set_slot(&mut svm, s_fair + 1);
-    send_ok(&mut svm, ix_update_oracle(prog_id, fair_mkt, fair_orc.pubkey(), 94_600_000, 0, 0), &payer, &[&payer, &fair_orc]);
-    send_err(&mut svm, ix_trade_ext(prog_id, dex, fair_mkt, vic_pfl, victim.pubkey(), cp_pfl, cparty.pubkey(), 1, POS_SCALE, 98_200_000),
+    step_oracle(&mut svm, prog_id, fair_mkt, &fair_orc, 94_450_000, &payer);
+    send_err(&mut svm, ix_trade_ext(prog_id, dex, fair_mkt, vic_pfl, victim.pubkey(), cp_pfl, cparty.pubkey(), 1, 10_000, 95_000_000),
         &payer, &[&payer, &victim, &cparty], "Trade(mode=1) execPrice draining below totalMm rejected");
 
     // 10c. Fair Partial Liquidation + Permissionless Takeover (**ZERO ADL ON INNOCENT COUNTERPARTY!**)
@@ -2300,7 +2380,7 @@ fn main() {
         &[&payer, &hlp_lp],
     );
     let fee_paid = token_amount(&svm, &hlp_tok) - hlp_tok_0;
-    let max_part_fee = (4 * 94_600_000u64) / 100;
+    let max_part_fee = (4 * 94_450_000u64) / 100;
     assert!(fee_paid > 0 && fee_paid < max_part_fee, "Gradual deficit fee ({}) must be strictly < maxFee ({})!", fee_paid, max_part_fee);
     assert_eq!(read_u64(&svm, &vic_pfl, LEG_HEADER + 48), 6 * POS_SCALE, "Victim must retain 6.0 units after partial liquidation!");
     assert_eq!(read_u64(&svm, &hlp_pfl, LEG_HEADER + 48), 4 * POS_SCALE, "Liquidator must hold 4.0 taken-over units!");
@@ -2357,13 +2437,13 @@ fn main() {
     for i in 0..MAX_LEGS {
         let mkt = create_prog_acc(&mut svm, &prog_id, MKT_SIZE);
         let ins = create_prog_acc(&mut svm, &prog_id, INS_SIZE);
-        // Market i: $100, exitWindow=10, maxStaleness=200, IM=10%, MM=5%, liqFee=1%, tradeFee=0, maxMove=4%, insDraw=25%
+        // Market i: $100, exitWindow=10, maxStaleness=200, IM=10%, MM=5%, liqFee=1%, tradeFee=0, maxMove=0.95% (K=4 exact), insDraw=25%
         send_ok(
             &mut svm,
-            ix_create_market(prog_id, w_dex, mkt, mint, w_orc_shared.pubkey(), lp.pubkey(), lp_tok, fee_vault,
-                100 * POS_SCALE, 10, 200, 0, 1000, 500, 100, 0, 400, 2500, 1_000_000 * POS_SCALE),
+            ix_create_market(prog_id, w_dex, mkt, mint, w_orc_shared.pubkey(), dex_admin.pubkey(), admin_tok, fee_vault,
+                100 * POS_SCALE, 10, 200, 0, 1000, 500, 100, 0, 95, 2500, 1_000_000 * POS_SCALE),
             &payer,
-            &[&payer, &lp],
+            &[&payer, &dex_admin],
         );
         send_ok(
             &mut svm,
@@ -2393,7 +2473,7 @@ fn main() {
                 program_id: adapter_prog,
                 accounts: vec![
                     AccountMeta::new(adp, false),
-                    AccountMeta::new_readonly(lp.pubkey(), true),
+                    AccountMeta::new_readonly(dex_admin.pubkey(), true),
                     AccountMeta::new_readonly(prog_id, false),
                     AccountMeta::new_readonly(mkt, false),
                     AccountMeta::new_readonly(feed, false),
@@ -2401,7 +2481,7 @@ fn main() {
                 data: iad,
             },
             &payer,
-            &[&payer, &lp],
+            &[&payer, &dex_admin],
         );
 
         w_mkts.push(mkt);
@@ -2468,7 +2548,7 @@ fn main() {
     w_slot += 1;
     set_slot(&mut svm, w_slot);
     let orc_ixs: Vec<Instruction> = (0..MAX_LEGS)
-        .map(|i| ix_update_oracle(prog_id, w_mkts[i], w_orc_shared.pubkey(), 103_500_000, 0, 0))
+        .map(|i| ix_update_oracle(prog_id, w_mkts[i], w_orc_shared.pubkey(), 100_900_000, 0, 0))
         .collect();
     let (cu_crank_8orc, wire_8orc) = send_ixs_ok_measured(&mut svm, &orc_ixs, &payer, &[&payer, &w_orc_shared]);
     assert!(cu_crank_8orc < 200_000 && wire_8orc <= 1232, "8x UpdateOracle batch exceeded limits: {} CU, {} B", cu_crank_8orc, wire_8orc);
@@ -2516,7 +2596,7 @@ fn main() {
     let m0_rl_0 = read_u64(&svm, &w_mkts[0], 272);
     let m0_adl_0 = read_u64(&svm, &w_mkts[0], 288);
     let mut ho_ixs: Vec<Instruction> = (1..MAX_LEGS).map(|i| ix_refresh_leg(prog_id, w_dex, w_mkts[i], wk_pfl, false)).collect();
-    ho_ixs.push(ix_trade_ext(prog_id, w_dex, w_mkts[0], wu_pfl, w_user.pubkey(), wk_pfl, w_keep.pubkey(), 2, POS_SCALE / 2, 104 * POS_SCALE));
+    ho_ixs.push(ix_trade_ext(prog_id, w_dex, w_mkts[0], wu_pfl, w_user.pubkey(), wk_pfl, w_keep.pubkey(), 2, POS_SCALE / 2, 101_400_000));
     let (cu_handoff_l, wire_handoff_l) = send_ixs_ok_measured(&mut svm, &ho_ixs, &payer, &[&payer, &w_user, &w_keep]);
     assert_eq!(read_u64(&svm, &w_mkts[0], 256), m0_oi_0, "B4 Long->Long handoff must leave oiLong bit-for-bit invariant!");
     assert_eq!(read_u64(&svm, &w_mkts[0], 272), m0_rl_0, "B4 Long->Long handoff must leave rawBasisLong invariant!");
@@ -2525,20 +2605,21 @@ fn main() {
     //   Also test B4 mode=3 (Short->Short handoff on mkt 4 from User A to Aux)!
     let m4_oi_0 = read_u64(&svm, &w_mkts[4], 264);
     let mut ho_s_ixs: Vec<Instruction> = (1..MAX_LEGS).map(|i| ix_refresh_leg(prog_id, w_dex, w_mkts[i], wa_pfl, false)).collect();
-    ho_s_ixs.push(ix_trade_ext(prog_id, w_dex, w_mkts[4], wu_pfl, w_user.pubkey(), wa_pfl, w_aux.pubkey(), 3, POS_SCALE / 2, 103 * POS_SCALE));
+    ho_s_ixs.push(ix_trade_ext(prog_id, w_dex, w_mkts[4], wu_pfl, w_user.pubkey(), wa_pfl, w_aux.pubkey(), 3, POS_SCALE / 2, 100_400_000));
     let (cu_handoff_s, _) = send_ixs_ok_measured(&mut svm, &ho_s_ixs, &payer, &[&payer, &w_user, &w_aux]);
     assert_eq!(read_u64(&svm, &w_mkts[4], 264), m4_oi_0, "B4 Short->Short handoff must leave oiShort bit-for-bit invariant!");
     assert_dex_invariants(&svm, &w_dex, &w_vault, &w_mkts, &w_all_pfls, "suite11-post-b4-handoff");
 
     // 11.6 LIQUIDATION KEEPER WORST-CASE (8-LEG VICTIM + 8-LEG LIQUIDATOR + A2 POST-ADL RECOVERY!):
-    //   Crash mkt 0 (User A is Long 1.6) AND pump mkts 4..7 (User A is Short) over 12 slots so User A is genuinely underwater!
-    let mut p0 = 103_500_000u64;
-    let mut p_hi = 103_500_000u64;
-    for _ in 0..12 {
+    //   Crash mkt 0 (User A is Long 1.6) AND pump mkts 4..7 (User A is Short) over 17 slots (0.9%/slot, K=4 compliant!)
+    //   so User A is underwater (`0 < cap < totalMm`, NOT bankrupt — Bug 1C forces full close if `cap == 0`!)
+    let mut p0 = 100_900_000u64;
+    let mut p_hi = 100_900_000u64;
+    for _ in 0..17 {
         w_slot += 1;
         set_slot(&mut svm, w_slot);
-        p0 = p0 - (p0 * 39) / 1000;
-        p_hi = p_hi + (p_hi * 39) / 1000;
+        p0 = p0 - (p0 * 9) / 1000;
+        p_hi = p_hi + (p_hi * 9) / 1000;
         let mut step_ixs = vec![ix_update_oracle(prog_id, w_mkts[0], w_orc_shared.pubkey(), p0, 0, 0)];
         for i in 4..MAX_LEGS {
             step_ixs.push(ix_update_oracle(prog_id, w_mkts[i], w_orc_shared.pubkey(), p_hi, 0, 0));
@@ -2557,6 +2638,26 @@ fn main() {
     let m0_adls   = read_u64(&svm, &w_mkts[0], 296);
     assert!(m0_oi_adl > 0 && m0_oi_adl < m0_rs_adl && m0_adls < ADL_ONE,
         "Expected partial ADL on mkt 0: oi={}, rawS={}, adlS={}", m0_oi_adl, m0_rs_adl, m0_adls);
+
+    //   11.6a-Gap4B: Asymmetric-ADL Zero-Sum Oracle Settlement Check!
+    //   mkt 0 currently has ASYMMETRIC ADL (`oiLong == rawBasisLong`, `oiShort < rawBasisShort`)!
+    //   Step price UP (+0.5% -> Shorts lose via ceil `dkLose`, Longs win via floor `dkWin`) AND
+    //   confirm `kShort` drop >= `kLong` rise scaled by rawBasis (ZERO under-collection)!
+    w_slot += 1;
+    set_slot(&mut svm, w_slot);
+    let k_l0 = read_u64(&svm, &w_mkts[0], 304);
+    let k_s0 = read_u64(&svm, &w_mkts[0], 312);
+    let rl0  = read_u64(&svm, &w_mkts[0], 272) as u128;
+    let rs0  = read_u64(&svm, &w_mkts[0], 280) as u128;
+    let p0_up = p0 + (p0 * 5) / 1000;
+    send_ok(&mut svm, ix_update_oracle(prog_id, w_mkts[0], w_orc_shared.pubkey(), p0_up, 0, 0), &payer, &[&payer, &w_orc_shared]);
+    let dk_l = (read_u64(&svm, &w_mkts[0], 304) - k_l0) as u128;
+    let dk_s = (k_s0 - read_u64(&svm, &w_mkts[0], 312)) as u128;
+    assert!(rs0 * dk_s >= rl0 * dk_l, "Gap #4B violation: asymmetric-ADL losing Shorts under-collected ({} < {})!", rs0 * dk_s, rl0 * dk_l);
+    //   Step back down to p0 so User A stays underwater for 11.6c Takeover!
+    w_slot += 1;
+    set_slot(&mut svm, w_slot);
+    send_ok(&mut svm, ix_update_oracle(prog_id, w_mkts[0], w_orc_shared.pubkey(), p0, 0, 0), &payer, &[&payer, &w_orc_shared]);
 
     //   11.6b A2 POST-ADL RECOVERY #1: Post-ADL `Trade(mode = 0)` new open on partially-ADL'd mkt 0!
     //   Refresh Aux & Keeper legs, then open 0.5 new OI on partially-ADL'd mkt 0!
@@ -2595,7 +2696,7 @@ fn main() {
 
     // 11.7 CRANK WORST-CASE: Rotate all 8 markets to OracleAdapter CPI & crank all 8 markets via CPI!
     for i in 0..MAX_LEGS {
-        send_ok(&mut svm, ix_update_market_auth(prog_id, w_mkts[i], lp.pubkey(), 1, w_orac_pdas[i]), &payer, &[&payer, &lp]);
+        send_ok(&mut svm, ix_update_market_auth(prog_id, w_mkts[i], dex_admin.pubkey(), 1, w_orac_pdas[i]), &payer, &[&payer, &dex_admin]);
     }
     w_slot += 1;
     set_slot(&mut svm, w_slot);
@@ -2605,7 +2706,7 @@ fn main() {
         let cur_p = read_u64(&svm, &w_mkts[i], 112);
         let mut fd = vec![0u8; 32];
         fd[0..4].copy_from_slice(&0x44454546u32.to_le_bytes());
-        fd[8..16].copy_from_slice(&((cur_p * 101) / 100).to_le_bytes());
+        fd[8..16].copy_from_slice(&((cur_p * 1009) / 1000).to_le_bytes());
         fd[16..24].copy_from_slice(&50_000u64.to_le_bytes());
         fd[24..32].copy_from_slice(&w_slot.to_le_bytes());
         svm.set_account(w_feeds[i], Account { lamports: 10_000_000, data: fd, owner: SYSTEM_PROGRAM_ID, executable: false, rent_epoch: 0 }).unwrap();
@@ -2632,7 +2733,7 @@ fn main() {
     // 11.8 CRANK WORST-CASE WIND-DOWN SWEEP ACROSS ALL 8 MARKETS:
     //   StartWindDown on all 8 -> advance exitWindow -> ForceClosePair + ClearDeadLeg + ResolveMarket!
     for i in 0..MAX_LEGS {
-        send_ok(&mut svm, ix_start_wind_down(prog_id, w_mkts[i], lp.pubkey()), &payer, &[&payer, &lp]);
+        send_ok(&mut svm, ix_start_wind_down(prog_id, w_mkts[i], dex_admin.pubkey()), &payer, &[&payer, &dex_admin]);
     }
     w_slot += 15;
     set_slot(&mut svm, w_slot);

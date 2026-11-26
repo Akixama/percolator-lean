@@ -125,6 +125,12 @@ impl BoringEnv {
         trade_fee_bps: u64,
         max_move_bps: u64,
     ) -> Address {
+        // Clamp legacy test max_move_bps into the exact Solana K=4 compounding leader-window budget
+        // (`4*m + ceil(m^2/1000) + liqFeeBps <= mmBps`) — e.g. `95` bps for `mm=500, liqFee=100`!
+        let mut safe_move = max_move_bps.min(2500);
+        while 4 * safe_move + (safe_move * safe_move + 999) / 1000 + liq_fee_bps > mm_bps && safe_move > 1 {
+            safe_move -= 1;
+        }
         let mkt = create_prog_acc(&mut self.svm, &self.prog_id, MKT_SIZE);
         let creator_tok = create_tok_acc(&mut self.svm, &self.mint, &self.admin.pubkey(), 0);
         send_ok(
@@ -146,7 +152,7 @@ impl BoringEnv {
                 mm_bps,
                 liq_fee_bps,
                 trade_fee_bps,
-                max_move_bps,
+                safe_move,
                 2500, // max_ins_draw_bps
                 1_000_000 * POS_SCALE,
             ),
@@ -241,21 +247,44 @@ impl BoringEnv {
         cap
     }
 
-    fn update_oracle(&mut self, mkt: Address, new_price: u64, fund_sign: u8, fund_e6: u64) {
-        self.advance_slot(1);
-        send_ok(
-            &mut self.svm,
-            ix_update_oracle(
-                self.prog_id,
-                mkt,
-                self.oracle.pubkey(),
-                new_price,
-                fund_sign,
-                fund_e6,
-            ),
-            &self.payer,
-            &[&self.payer, &self.oracle],
-        );
+    fn update_oracle(&mut self, mkt: Address, target_price: u64, fund_sign: u8, fund_e6: u64) {
+        let max_move_bps = read_u64(&self.svm, &mkt, 192);
+        let mut cur_price = read_u64(&self.svm, &mkt, 112);
+        loop {
+            let max_allowed = ((cur_price as u128 * max_move_bps as u128) / 10_000u128) as u64;
+            let diff = cur_price.abs_diff(target_price);
+            if diff + fund_e6 <= max_allowed {
+                self.advance_slot(1);
+                send_ok(
+                    &mut self.svm,
+                    ix_update_oracle(
+                        self.prog_id,
+                        mkt,
+                        self.oracle.pubkey(),
+                        target_price,
+                        fund_sign,
+                        fund_e6,
+                    ),
+                    &self.payer,
+                    &[&self.payer, &self.oracle],
+                );
+                break;
+            }
+            let step = diff.min(max_allowed.max(1));
+            let next_p = if target_price >= cur_price {
+                cur_price + step
+            } else {
+                cur_price - step
+            };
+            self.advance_slot(1);
+            send_ok(
+                &mut self.svm,
+                ix_update_oracle(self.prog_id, mkt, self.oracle.pubkey(), next_p, 0, 0),
+                &self.payer,
+                &[&self.payer, &self.oracle],
+            );
+            cur_price = next_p;
+        }
     }
 
     fn refresh(&mut self, mkt: Address, t: &Trader) {
@@ -771,14 +800,20 @@ pub fn test_boring_partial_and_full_liquidation_normal(elf: &[u8]) {
     );
     assert_eq!(e.oi_long(btc), 0, "Full liquidation closes remaining 0.5 BTC");
 
-    // Bob clears dead leg and collects 100% of his profit ($11 on 1 BTC + $2 on 0.5 BTC = $13 total, 0 bad debt!)
+    // Bob clears dead leg and collects his profit ($11 on 1 BTC + ~$2 on 0.5 BTC = $13 total, <= 5 micro-units conservative floor dust across multi-slot clamped steps!)
     send_ok(&mut e.svm, ix_clear_dead_leg(e.prog_id, e.dex, btc, bob.pfl), &e.payer, &[&e.payer]);
-    assert_eq!(e.capital(&bob), 213 * POS_SCALE, "Bob collects 100% of profit ($13)");
+    assert!(
+        e.capital(&bob) >= 213 * POS_SCALE - 5 && e.capital(&bob) <= 213 * POS_SCALE,
+        "Bob collects profit ($13 minus <=5 atoms conservative multi-step floor dust), got {}",
+        e.capital(&bob)
+    );
     // Alice withdraws leftover margin ($1.555 - $0.425 liq fee = $1.130)
     assert_eq!(e.capital(&alice), 1_130_000);
     e.withdraw_all(&alice);
     e.withdraw_all(&bob);
-    assert_eq!(token_amount(&e.svm, &e.dex_vault), 0);
+    let dust_res = read_u64(&e.svm, &btc, 216);
+    assert!(dust_res <= 5, "Conservative multi-step floor dust <= 5 atoms, got {}", dust_res);
+    assert_eq!(token_amount(&e.svm, &e.dex_vault), dust_res);
     e.check("t8-final");
 }
 
@@ -1772,7 +1807,212 @@ pub fn test_audited_security_regressions(elf: &[u8], matcher_elf: &[u8]) {
     e.check("t16-final");
 }
 
-/// Runs all 16 boring everyday exchange + security regression LiteSVM tests as Suite 12.
+/// Test 17: I_m-contained cross-PnL fronting, optimistic LP NAV anti-arbitrage, Gap A bad-debt
+///          write-off (no double-draw), SweepSurplus, and InitDex allowFreeze opt-in.
+pub fn test_17_ins_fronting_lp_nav_sweep_and_freeze_flag(elf: &[u8]) {
+    let mut e = BoringEnv::new(elf);
+
+    // 1. Create trusted cross-margin markets: MKT_A with `maxFrontBps = 10000` (100% of I_m) + BTC (`maxFrontBps = 0`)
+    let admin_tok = create_tok_acc(&mut e.svm, &e.mint, &e.admin.pubkey(), 0);
+    let mkt_a = create_prog_acc(&mut e.svm, &e.prog_id, MKT_SIZE);
+    // Gap #1 LiteSVM regression: linear 4*100+100<=500 FAILS exact compounding K=4 check (`4*100+10+100=510 > 500`)!
+    send_err_custom(
+        &mut e.svm,
+        ix_create_market(
+            e.prog_id, e.dex, mkt_a, e.mint, e.oracle.pubkey(), e.admin.pubkey(), admin_tok, e.fee_vault,
+            100 * POS_SCALE, 10, 50, 0, 1000, 500, 100, 0, 100, 10_000, 1_000_000 * POS_SCALE,
+        ),
+        &e.payer, &[&e.payer, &e.admin], 103,
+        "Gap #1: maxMove=100, liqFee=100, mm=500 must fail exact K=4 compounding check (510 > 500)",
+    );
+    // Gap #2a LiteSVM regression: maxFrontBps (5000) > maxInsDrawBps (2500) MUST fail with Custom(103)!
+    let mut bad_front_ix = ix_create_market(
+        e.prog_id, e.dex, mkt_a, e.mint, e.oracle.pubkey(), e.admin.pubkey(), admin_tok, e.fee_vault,
+        100 * POS_SCALE, 10, 50, 0, 1000, 500, 100, 0, 95, 2500, 1_000_000 * POS_SCALE,
+    );
+    bad_front_ix.data[2..4].copy_from_slice(&5000u16.to_le_bytes());
+    send_err_custom(
+        &mut e.svm, bad_front_ix, &e.payer, &[&e.payer, &e.admin], 103,
+        "Gap #2: maxFrontBps > maxInsDrawBps must be rejected",
+    );
+    let mut cm_ix = ix_create_market(
+        e.prog_id, e.dex, mkt_a, e.mint, e.oracle.pubkey(), e.admin.pubkey(), admin_tok, e.fee_vault,
+        100 * POS_SCALE, 10, 50, 0, 1000, 500, 100, 0, 95, 10_000, 1_000_000 * POS_SCALE,
+    );
+    cm_ix.data[2..4].copy_from_slice(&10_000u16.to_le_bytes()); // maxFrontBps = 10000 <= maxInsDrawBps = 10000
+    send_ok(&mut e.svm, cm_ix, &e.payer, &[&e.payer, &e.admin]);
+    e.markets.push(mkt_a);
+    let btc = e.create_market(100 * POS_SCALE, 10, 1000, 500, 100, 0, 95);
+
+    // Seed I_A with $50 from LP1 (50M shares) and I_BTC with $50 from LP1
+    let lp1 = Keypair::new();
+    e.svm.airdrop(&lp1.pubkey(), 1_000_000_000).unwrap();
+    let lp1_tok = create_tok_acc(&mut e.svm, &e.mint, &lp1.pubkey(), 200 * POS_SCALE);
+    let r_a1 = create_prog_acc(&mut e.svm, &e.prog_id, INS_SIZE);
+    let r_btc1 = create_prog_acc(&mut e.svm, &e.prog_id, INS_SIZE);
+    send_ok(&mut e.svm, ix_deposit_insurance(e.prog_id, e.dex, mkt_a, r_a1, lp1.pubkey(), lp1_tok, e.mint, e.dex_vault, TOKEN_PROGRAM_ID, 50 * POS_SCALE), &e.payer, &[&e.payer, &lp1]);
+    send_ok(&mut e.svm, ix_deposit_insurance(e.prog_id, e.dex, btc, r_btc1, lp1.pubkey(), lp1_tok, e.mint, e.dex_vault, TOKEN_PROGRAM_ID, 50 * POS_SCALE), &e.payer, &[&e.payer, &lp1]);
+
+    let alice = e.create_trader(200 * POS_SCALE, 100 * POS_SCALE);
+    let bob   = e.create_trader(200 * POS_SCALE, 100 * POS_SCALE);
+
+    // Alice Long 10 MKT_A vs Bob Short 10 MKT_A at $100 (notional $1,000, IM $100)
+    e.trade(mkt_a, &alice, &bob, 0, 10 * POS_SCALE);
+
+    // MKT_A moves +3% ($100 -> $103): Alice gains +$30, Bob loses -$30.
+    // Crucially: Bob does NOT refresh yet -> R_A == 0!
+    e.update_oracle(mkt_a, 103 * POS_SCALE, 0, 0);
+    assert_eq!(read_u64(&e.svm, &mkt_a, 216), 0, "R_A must be 0 before Bob refreshes");
+
+    // Alice refreshes FIRST: I_A fronts exact $30 into Alice.capital ($100 -> $130)!
+    e.refresh(mkt_a, &alice);
+    assert_eq!(e.capital(&alice), 130 * POS_SCALE, "Alice must receive $30 fronted from I_A immediately!");
+    assert_eq!(read_u64(&e.svm, &mkt_a, 224), 20 * POS_SCALE, "I_A cash must drop $50 -> $20");
+    assert_eq!(read_u64(&e.svm, &mkt_a, 232), 30 * POS_SCALE, "MktOff.insFronted must record $30 senior receivable");
+    assert_eq!(read_u64(&e.svm, &btc, 224), 50 * POS_SCALE, "I_BTC must be 100% untouched");
+    e.check("t17-after-front");
+
+    // Alice immediately uses her fronted $30 cross-margin to open 2 BTC ($20 IM) on BTC/USD!
+    // (Need fresh Bob leg on MKT_A before Bob opens BTC? Bob hasn't refreshed MKT_A in this slot;
+    //  use Carol as BTC counterparty so Bob stays unrefreshed during LP arb check!)
+    let carol_tr = e.create_trader(200 * POS_SCALE, 100 * POS_SCALE);
+    e.trade(btc, &alice, &carol_tr, 0, 2 * POS_SCALE);
+    e.check("t17-after-cross-btc-open");
+
+    // ADVERSARIAL LP RECEIVABLE ARB CHECK:
+    // While I_A cash = $20 and insFronted = $30 (optimistic NAV = $50, totSh = 50M),
+    // Attacker Carol deposits $50 into DepositInsurance hoping to steal part of Bob's $30 repayment!
+    let carol = Keypair::new();
+    e.svm.airdrop(&carol.pubkey(), 1_000_000_000).unwrap();
+    let carol_tok = create_tok_acc(&mut e.svm, &e.mint, &carol.pubkey(), 50 * POS_SCALE);
+    let r_carol = create_prog_acc(&mut e.svm, &e.prog_id, INS_SIZE);
+    send_ok(&mut e.svm, ix_deposit_insurance(e.prog_id, e.dex, mkt_a, r_carol, carol.pubkey(), carol_tok, e.mint, e.dex_vault, TOKEN_PROGRAM_ID, 50 * POS_SCALE), &e.payer, &[&e.payer, &carol]);
+    assert_eq!(read_u64(&e.svm, &r_carol, 80), 50 * POS_SCALE, "Carol MUST be priced at optimistic NAV ($20+$30=$50) -> 50M shares, NOT 125M!");
+
+    // Now Bob refreshes MKT_A and pays $30 -> SENIOR REPAYMENT restores I_A ($70 -> $100) and clears insFronted ($30 -> $0)!
+    e.refresh(mkt_a, &bob);
+    assert_eq!(read_u64(&e.svm, &mkt_a, 232), 0, "Bob's $30 must repay insFronted to 0 senior!");
+    assert_eq!(read_u64(&e.svm, &mkt_a, 224), 100 * POS_SCALE, "I_A must be fully restored to $100!");
+    assert_eq!(read_u64(&e.svm, &mkt_a, 216), 0, "Exact $30 went to senior repayment, 0 excess to R_A");
+    e.check("t17-after-senior-repay");
+
+    // Close MKT_A positions so LPs can withdraw and verify Carol made $0 arbitrage profit!
+    e.trade(mkt_a, &alice, &bob, 1, 10 * POS_SCALE);
+    send_ok(&mut e.svm, ix_withdraw_insurance(e.prog_id, e.dex, mkt_a, r_carol, carol.pubkey(), carol_tok, e.mint, e.dex_vault, TOKEN_PROGRAM_ID, 50 * POS_SCALE), &e.payer, &[&e.payer, &carol]);
+    assert_eq!(token_amount(&e.svm, &carol_tok), 50 * POS_SCALE, "Carol must recover ONLY her $50 deposit ($0 receivable arb!)");
+    assert_eq!(read_u64(&e.svm, &mkt_a, 224), 50 * POS_SCALE, "LP1's $50 must be 100% undiluted!");
+    e.check("t17-after-arb-defeated");
+
+    // 1b. GAP A TEST: Fronted bad-debt write-off (ZERO double-draw & ZERO overstated insFronted!)
+    //     Open Long 10 MKT_A (Alice) vs Short 10 MKT_A (Bob2 with $10 cap after moving price? Open with $100 cap,
+    //     pump MKT_A +12% over 3 slots so Bob2 loses $120 > $100 cap -> $20 bad debt!).
+    //     Alice fronts first -> I_A drops by $120? I_A has $50, top up I_A by $100 -> $150.
+    //     Alice fronts $120 (I_A: $150 -> $30, insFronted = $120).
+    //     Keeper liquidates bankrupt Bob2: Bob2 pays $100 (I_A: $30 -> $130, insFronted: $120 -> $20),
+    //     writeOffShortfall clears insFronted ($20 -> $0) and remShortfall = $0 -> I_A stays exact $130 & R_A == 0!
+    {
+        let lp_top = create_tok_acc(&mut e.svm, &e.mint, &lp1.pubkey(), 100 * POS_SCALE);
+        send_ok(&mut e.svm, ix_deposit_insurance(e.prog_id, e.dex, mkt_a, r_a1, lp1.pubkey(), lp_top, e.mint, e.dex_vault, TOKEN_PROGRAM_ID, 100 * POS_SCALE), &e.payer, &[&e.payer, &lp1]);
+        assert_eq!(read_u64(&e.svm, &mkt_a, 224), 150 * POS_SCALE);
+        let a_win = e.create_trader(200 * POS_SCALE, 110 * POS_SCALE);
+        let b_los = e.create_trader(200 * POS_SCALE, 103 * POS_SCALE);
+        e.trade(mkt_a, &a_win, &b_los, 0, 10 * POS_SCALE); // at $103 -> IM=$103
+        // Pump $103 -> $107 -> $111 -> $115 (+$12/unit = +$120 gain for a_win, -$120 loss for b_los -> $17 bad debt!)
+        e.update_oracle(mkt_a, 107 * POS_SCALE, 0, 0);
+        e.update_oracle(mkt_a, 111 * POS_SCALE, 0, 0);
+        e.update_oracle(mkt_a, 115 * POS_SCALE, 0, 0);
+        // Winner fronts $120 from I_A FIRST!
+        e.refresh(mkt_a, &a_win);
+        assert_eq!(e.capital(&a_win), 230 * POS_SCALE, "Winner fronted exact $120");
+        assert_eq!(read_u64(&e.svm, &mkt_a, 224), 30 * POS_SCALE, "I_A cash $150 - $120 = $30");
+        assert_eq!(read_u64(&e.svm, &mkt_a, 232), 120 * POS_SCALE, "insFronted == $120");
+        // Keeper liquidates bankrupt b_los (only $103 capital vs $120 loss -> $17 bad debt!)
+        let keep_tok = create_tok_acc(&mut e.svm, &e.mint, &e.admin.pubkey(), 0);
+        send_ok(&mut e.svm, ix_liquidate(e.prog_id, e.dex, mkt_a, b_los.pfl, keep_tok, e.mint, e.dex_vault, TOKEN_PROGRAM_ID), &e.payer, &[&e.payer]);
+        assert_eq!(e.capital(&b_los), 0, "Bankrupt loser capital == 0");
+        assert_eq!(read_u64(&e.svm, &mkt_a, 232), 0, "Gap A: uncollectible $17 written off -> insFronted == 0!");
+        assert_eq!(read_u64(&e.svm, &mkt_a, 224), 133 * POS_SCALE, "Gap A: I_A == $150 - $17 = $133 (ZERO double-draw!)");
+        assert_eq!(read_u64(&e.svm, &mkt_a, 216), 0, "Gap A: R_A == 0 (no stranded double-drawn funds!)");
+        e.check("t17-gapA-bad-debt-writeoff");
+    }
+
+    // 1c. Gap #2b LiteSVM regression: cumulative NAV-based fronting cap blocks 2nd sequential front past maxFrontBps!
+    //     Market has maxFrontBps = 2500, maxInsDrawBps = 2500, I_m = $200 (25% cap = $50).
+    //     Winner 1 fronts $50 (I_m = $150, insFronted = $50). Winner 2 gains $10 and refreshes -> MUST NOT front!
+    {
+        let cap_mkt = create_prog_acc(&mut e.svm, &e.prog_id, MKT_SIZE);
+        let mut cix = ix_create_market(
+            e.prog_id, e.dex, cap_mkt, e.mint, e.oracle.pubkey(), e.admin.pubkey(), admin_tok, e.fee_vault,
+            100 * POS_SCALE, 10, 50, 0, 1000, 500, 100, 0, 95, 2500, 1_000_000 * POS_SCALE,
+        );
+        cix.data[2..4].copy_from_slice(&2500u16.to_le_bytes()); // maxFrontBps = 2500 == maxInsDrawBps
+        send_ok(&mut e.svm, cix, &e.payer, &[&e.payer, &e.admin]);
+        e.markets.push(cap_mkt);
+        let r_cap = create_prog_acc(&mut e.svm, &e.prog_id, INS_SIZE);
+        let cap_lp_tok = create_tok_acc(&mut e.svm, &e.mint, &lp1.pubkey(), 200 * POS_SCALE);
+        send_ok(&mut e.svm, ix_deposit_insurance(e.prog_id, e.dex, cap_mkt, r_cap, lp1.pubkey(), cap_lp_tok, e.mint, e.dex_vault, TOKEN_PROGRAM_ID, 200 * POS_SCALE), &e.payer, &[&e.payer, &lp1]);
+        let w1 = e.create_trader(300 * POS_SCALE, 200 * POS_SCALE);
+        let w2 = e.create_trader(300 * POS_SCALE, 200 * POS_SCALE);
+        let l1 = e.create_trader(500 * POS_SCALE, 400 * POS_SCALE);
+        let l2 = e.create_trader(500 * POS_SCALE, 400 * POS_SCALE);
+        e.trade(cap_mkt, &w1, &l1, 0, 10 * POS_SCALE); // w1 Long 10 vs l1
+        e.trade(cap_mkt, &w2, &l2, 0, 10 * POS_SCALE); // w2 Long 10 vs l2 (distinct unrefreshed losers!)
+        e.update_oracle(cap_mkt, 105 * POS_SCALE, 0, 0); // +$50 each for w1 & w2; neither loser settled!
+        e.refresh(cap_mkt, &w1);
+        assert_eq!(e.capital(&w1), 250 * POS_SCALE, "w1 fronts exact $50 (= 25% of $200 NAV)");
+        assert_eq!(read_u64(&e.svm, &cap_mkt, 224), 150 * POS_SCALE, "I_m cash drops $200 -> $150");
+        assert_eq!(read_u64(&e.svm, &cap_mkt, 232), 50 * POS_SCALE, "insFronted == $50 (exact 25% cap)");
+        // Now w2 refreshes while insFronted == $50 (still unrepaid!):
+        // Under old buggy formula `floor(150 * 25%) = $37.50`, w2 would front $37.50 pushing insFronted=$87.50 > $50!
+        // Under fixed cumulative NAV cap `floor((150+50)*25%) - 50 = 0`, w2 MUST NOT front!
+        let w2_cap_pre = e.capital(&w2);
+        e.refresh(cap_mkt, &w2);
+        assert_eq!(e.capital(&w2), w2_cap_pre, "Gap #2b: 2nd sequential front MUST be blocked once cumulative insFronted hits maxFrontBps of NAV!");
+        assert_eq!(read_u64(&e.svm, &cap_mkt, 232), 50 * POS_SCALE, "Cumulative insFronted MUST stay <= 25% of NAV ($50)!");
+        assert_eq!(read_u64(&e.svm, &cap_mkt, 224), 150 * POS_SCALE, "I_m cash MUST NOT be drained past maxFrontBps!");
+        e.check("t17-gap2b-cumulative-nav-cap");
+    }
+
+    // 2. SweepSurplus: create $7 of real Dex.totalSurplus via a donated-only resolved market,
+    //    verify non-admin & over-sweep are rejected, and admin sweeps exact $7 to feeVault!
+    let dust_mkt = e.create_market(100 * POS_SCALE, 10, 1000, 500, 100, 0, 400);
+    let r_dust = create_prog_acc(&mut e.svm, &e.prog_id, INS_SIZE);
+    let mut don_ix = ix_deposit_insurance(e.prog_id, e.dex, dust_mkt, r_dust, lp1.pubkey(), lp1_tok, e.mint, e.dex_vault, TOKEN_PROGRAM_ID, 7 * POS_SCALE);
+    don_ix.data[9] = 1u8; // donate = 1 (byte 9 of 10-byte ix_deposit_insurance payload)
+    send_ok(&mut e.svm, don_ix, &e.payer, &[&e.payer, &lp1]);
+    send_ok(&mut e.svm, ix_start_wind_down(e.prog_id, dust_mkt, e.admin.pubkey()), &e.payer, &[&e.payer, &e.admin]);
+    send_ok(&mut e.svm, ix_resolve_market(e.prog_id, e.dex, dust_mkt), &e.payer, &[&e.payer]);
+    assert_eq!(read_u64(&e.svm, &e.dex, 192), 7 * POS_SCALE, "Resolved donated market must route $7 to Dex.totalSurplus");
+
+    // Negative: non-admin cannot sweep surplus
+    send_err_custom(&mut e.svm, ix_sweep_surplus(e.prog_id, e.dex, alice.kp.pubkey(), e.mint, e.dex_vault, e.fee_vault, TOKEN_PROGRAM_ID, 0), &e.payer, &[&e.payer, &alice.kp], 102, "non-admin SweepSurplus must fail");
+    // Negative: admin cannot sweep > totalSurplus (user C+I+R 100% untouchable!)
+    send_err_custom(&mut e.svm, ix_sweep_surplus(e.prog_id, e.dex, e.admin.pubkey(), e.mint, e.dex_vault, e.fee_vault, TOKEN_PROGRAM_ID, 8 * POS_SCALE), &e.payer, &[&e.payer, &e.admin], 103, "over-surplus SweepSurplus must fail");
+    // Positive: admin sweeps exact $7 to feeVault
+    let fv_before = token_amount(&e.svm, &e.fee_vault);
+    send_ok(&mut e.svm, ix_sweep_surplus(e.prog_id, e.dex, e.admin.pubkey(), e.mint, e.dex_vault, e.fee_vault, TOKEN_PROGRAM_ID, 0), &e.payer, &[&e.payer, &e.admin]);
+    assert_eq!(token_amount(&e.svm, &e.fee_vault), fv_before + 7 * POS_SCALE, "feeVault must receive exact $7 swept surplus");
+    assert_eq!(read_u64(&e.svm, &e.dex, 192), 0, "Dex.totalSurplus must be 0 after full sweep");
+    e.check("t17-after-sweep");
+
+    // 3. InitDex `allowFreeze = 1` opt-in (mainnet USDC/USDT compatibility!)
+    let mut frz_mint_data = vec![0u8; 82];
+    frz_mint_data[44] = 6;
+    frz_mint_data[45] = 1;
+    frz_mint_data[46..50].copy_from_slice(&1u32.to_le_bytes()); // freeze_authority = Some(...)
+    frz_mint_data[50..82].copy_from_slice(e.admin.pubkey().as_ref());
+    let frz_mint = Keypair::new().pubkey();
+    e.svm.set_account(frz_mint, Account { lamports: 10_000_000, data: frz_mint_data, owner: TOKEN_PROGRAM_ID, executable: false, rent_epoch: 0 }).unwrap();
+    let frz_dex = create_prog_acc(&mut e.svm, &e.prog_id, DEX_SIZE);
+    let (frz_vault, frz_bump) = Address::find_program_address(&[b"dvlt", frz_dex.as_ref()], &e.prog_id);
+    let frz_fee = create_tok_acc(&mut e.svm, &frz_mint, &e.admin.pubkey(), 0);
+    let mut init_frz = ix_init_dex(e.prog_id, frz_dex, e.admin.pubkey(), frz_mint, frz_vault, frz_fee, TOKEN_PROGRAM_ID, SYSTEM_PROGRAM_ID, frz_bump, 6, 0, 3_000_000);
+    init_frz.data[3] = 1; // allowFreeze = 1 (explicit opt-in for mainnet USDC/USDT)
+    send_ok(&mut e.svm, init_frz, &e.payer, &[&e.payer, &e.admin]);
+    assert_eq!(read_u8(&e.svm, &frz_dex, 7), 1, "DexOff.allowFreeze must record 1 immutably");
+}
+
+/// Runs all 17 boring everyday exchange + security regression LiteSVM tests as Suite 12.
 pub fn run_all_boring_tests(elf: &[u8], matcher_elf: &[u8]) {
     test_boring_deposit_withdraw_roundtrip(elf);
     test_boring_simple_long_short_profit_and_loss(elf);
@@ -1790,9 +2030,11 @@ pub fn run_all_boring_tests(elf: &[u8], matcher_elf: &[u8]) {
     test_boring_market_winddown_exit_orders_and_tombstone(elf);
     test_security_revival_and_dirty_init_regressions(elf);
     test_audited_security_regressions(elf, matcher_elf);
-    println!("[PASS] Suite 12: 16 Boring Exchange & Audited Security Regression LiteSVM Tests (Deposits, Scale-In/Out,");
+    test_17_ins_fronting_lp_nav_sweep_and_freeze_flag(elf);
+    println!("[PASS] Suite 12: 17 Boring Exchange & Audited Security Regression LiteSVM Tests (Deposits, Scale-In/Out,");
     println!("       Flips, Spreads, Funding, 3 Exit-Order Permutations, Partial+Full Liq, HLP Takeover, Cross-Margin Reuse,");
-    println!("       AMM Matcher, LP Yield, WindDown, Revival/Dirty-Init, ForceHaircut, FreezeMint, SharePool & Self-Transfer!)");
+    println!("       AMM Matcher, LP Yield, WindDown, Revival/Dirty-Init, ForceHaircut, FreezeMint, SharePool, Self-Transfer,");
+    println!("       I_m-Contained Cross-PnL Fronting, Optimistic LP NAV Anti-Arb, SweepSurplus & AllowFreeze Opt-In!)");
 }
 
 #[cfg(test)]
@@ -1824,4 +2066,5 @@ mod tests {
     #[test] fn boring_14_market_winddown_exit_and_tombstone() { let (e, _) = load_elfs(); test_boring_market_winddown_exit_orders_and_tombstone(&e); }
     #[test] fn boring_15_security_revival_and_dirty_init_regressions() { let (e, _) = load_elfs(); test_security_revival_and_dirty_init_regressions(&e); }
     #[test] fn boring_16_audited_security_regressions() { let (e, m) = load_elfs(); test_audited_security_regressions(&e, &m); }
+    #[test] fn boring_17_ins_fronting_lp_nav_sweep_and_freeze_flag() { let (e, _) = load_elfs(); test_17_ins_fronting_lp_nav_sweep_and_freeze_flag(&e); }
 }

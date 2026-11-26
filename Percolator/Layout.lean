@@ -90,8 +90,8 @@ namespace PErr
   def oracleSameSlot     : UInt64 := 126
   def dexMismatch        : UInt64 := 127
   def invalidVaultState  : UInt64 := 128
-  def invalidSysProg     : UInt64 := 129
-  def execPriceClamp     : UInt64 := 130
+  def invalidSysProg       : UInt64 := 129
+  def execPriceClamp       : UInt64 := 130
 end PErr
 
 /-! ### Exact Byte Offsets: `Dex` (200 bytes) -/
@@ -102,6 +102,7 @@ namespace DexOff
   def version         : UInt64 := 4   -- u8  (2)
   def vaultBump       : UInt64 := 5   -- u8
   def decimals        : UInt64 := 6   -- u8
+  def allowFreeze     : UInt64 := 7   -- u8  (0 = forbid freeze_authority; 1 = allow blessed issuer mint)
   def admin           : UInt64 := 8   -- Pubkey (32)
   def quoteMint       : UInt64 := 40  -- Pubkey (32)
   def vaultPda        : UInt64 := 72  -- Pubkey (32)
@@ -122,6 +123,8 @@ namespace MktOff
   def size           : UInt64 := 352
   def magic          : UInt64 := 0   -- u32 ("MKTP")
   def status         : UInt64 := 4   -- u8
+  -- byte 5: reserved zero padding (all markets are permissionless & cross-margin equal!)
+  def maxFrontBps    : UInt64 := 6   -- u16 (0..10000 bps of I_m usable for I_m-contained cross-PnL fronting)
   def marketId       : UInt64 := 8   -- u64
   def dex            : UInt64 := 16  -- Pubkey (32)
   def oracleAuth     : UInt64 := 48  -- Pubkey (32)
@@ -141,7 +144,7 @@ namespace MktOff
   def maxOi          : UInt64 := 208 -- u64
   def realizedPool   : UInt64 := 216 -- u64 (R_m: isolated market-m loser backing!)
   def insurance      : UInt64 := 224 -- u64 (I_m: isolated market-m insurance!)
-  def feeSurplus     : UInt64 := 232 -- u64 (S_m: rounding residue sink!)
+  def insFronted     : UInt64 := 232 -- u64 (F_m: senior USD fronted from I_m to winners, repaid first by losers!)
   def totalPosPnl    : UInt64 := 240 -- u64 (P^+_m)
   def totalInsShares : UInt64 := 248 -- u64
   def oiLong         : UInt64 := 256 -- u64
@@ -166,6 +169,7 @@ namespace PflOff
   def size            : UInt64 := 952  -- 120 + 8 * 104
   def magic           : UInt64 := 0    -- u32 ("PFLO")
   def legCount        : UInt64 := 4    -- u8 (0..8)
+  -- bytes 5..7: reserved zero padding (any portfolio can cross up to 8 permissionless markets sharing the DEX quoteMint!)
   def portfolioId     : UInt64 := 8    -- u64 (monotonic)
   def episode         : UInt64 := 16   -- u64
   def dex             : UInt64 := 24   -- Pubkey (32)
@@ -224,26 +228,29 @@ namespace IxOp
   def claimResolved      : UInt8 := 17
   def tombstoneMarket    : UInt8 := 18
   def closeAccount       : UInt8 := 19
+  def sweepSurplus       : UInt8 := 20
 end IxOp
 
 /-! ### Structured `sol_log_64_` Event Tags (0 heap, 0 `.rodata`, ~100 CU)
     Format: `sol_log_64_(tag, arg1, arg2, arg3, arg4)`
-    - `1` (`oracle`)     : `(1, marketId, newPrice, fundSign, fundE6)`
-    - `2` (`trade`)      : `(2, (marketId << 8) | mode, qty, execPrice, markPrice)`
-    - `3` (`liquidate`)  : `(3, (marketId << 8) | mode, rawClose, liqFee, shortfall)`
-    - `4` (`deposit`)    : `(4, portfolioId, amount, newCapital, 0)`
-    - `5` (`withdraw`)   : `(5, portfolioId, amount, newCapital, 0)`
-    - `6` (`forceClose`) : `(6, marketId, closedQty, remainingOi, slot)`
-    - `7` (`resolve`)    : `(7, marketId, resolvedNum, resolvedDen, 0)` -/
+    - `1` (`oracle`)       : `(1, marketId, newPrice, fundSign, fundE6)`
+    - `2` (`trade`)        : `(2, (marketId << 8) | mode, qty, execPrice, markPrice)`
+    - `3` (`liquidate`)    : `(3, (marketId << 8) | mode, rawClose, liqFee, shortfall)`
+    - `4` (`deposit`)      : `(4, portfolioId, amount, newCapital, 0)`
+    - `5` (`withdraw`)     : `(5, portfolioId, amount, newCapital, 0)`
+    - `6` (`forceClose`)   : `(6, marketId, closedQty, remainingOi, slot)`
+    - `7` (`resolve`)      : `(7, marketId, resolvedNum, resolvedDen, 0)`
+    - `8` (`sweepSurplus`) : `(8, sweepAmt, remainingSurplus, 0, 0)` -/
 
 namespace EvtTag
-  def oracle     : UInt64 := 1
-  def trade      : UInt64 := 2
-  def liquidate  : UInt64 := 3
-  def deposit    : UInt64 := 4
-  def withdraw   : UInt64 := 5
-  def forceClose : UInt64 := 6
-  def resolve    : UInt64 := 7
+  def oracle       : UInt64 := 1
+  def trade        : UInt64 := 2
+  def liquidate    : UInt64 := 3
+  def deposit      : UInt64 := 4
+  def withdraw     : UInt64 := 5
+  def forceClose   : UInt64 := 6
+  def resolve      : UInt64 := 7
+  def sweepSurplus : UInt64 := 8
 end EvtTag
 
 end Percolator

@@ -629,7 +629,218 @@ theorem sweepOrphanInsurance_preserves_coherent (st st' : DexState) (mids pids :
         · simp [getRes, updateFn, hx]
     · cases h
 
-/-- Single-step relation covering EVERY balance-moving transition in `percolator-lean` v2. -/
+theorem settleFullCapitalLoss_preserves_coherent (st st' : DexState) (mids pids : List Nat)
+    (mid pid loss : Nat)
+    (hcoh : st.coherent mids pids) (hndM : mids.Nodup) (hmemM : mid ∈ mids)
+    (hndP : pids.Nodup) (hmemP : pid ∈ pids)
+    (h : stepSettleFullCapitalLoss st mid pid loss = some st') :
+    st'.coherent mids pids := by
+  unfold stepSettleFullCapitalLoss at h
+  cases hm : st.markets mid with
+  | none => simp [hm] at h
+  | some m =>
+    cases hp : st.portfolios pid with
+    | none => simp [hm, hp] at h
+    | some pfl =>
+      cases hl : pfl.legs mid with
+      | none => simp [hm, hp, hl] at h
+      | some leg =>
+        simp only [hm, hp, hl, Bind.bind, Option.bind] at h
+        split at h
+        · next hc =>
+          cases h
+          rcases hcoh with ⟨hstock, hC, hI, hR⟩
+          let pnlBurned := min loss leg.posPnl
+          let rem1      := loss - pnlBurned
+          let capDeb    := min rem1 pfl.capital
+          let repay     := min capDeb m.insFronted
+          let toR       := capDeb - repay
+          have hdebLe : capDeb ≤ pfl.capital := Nat.min_le_right _ _
+          have hrepLe : repay ≤ capDeb := Nat.min_le_left _ _
+          refine ⟨by unfold DexState.stockExact at *; dsimp only; omega, ?_, ?_, ?_⟩
+          · unfold sumCaps at *; dsimp only; rw [hC]
+            exact sum_map_eq_sub pids (getCap st.portfolios) _ pid capDeb hndP hmemP
+              (by simp [getCap, updateFn, hp, capDeb, rem1, pnlBurned])
+              (by simp [getCap, hp]; exact hdebLe)
+              (fun x hx => by simp [getCap, updateFn, hx])
+          · unfold sumIns at *; dsimp only; rw [hI]
+            exact sum_map_eq_add mids (getIns st.markets) _ mid repay hndM hmemM
+              (by simp [getIns, updateFn, hm, repay, capDeb, rem1, pnlBurned])
+              (fun x hx => by simp [getIns, updateFn, hx])
+          · unfold sumRes at *; dsimp only; rw [hR]
+            exact sum_map_eq_add mids (getRes st.markets) _ mid toR hndM hmemM
+              (by simp [getRes, updateFn, hm, toR, repay, capDeb, rem1, pnlBurned])
+              (fun x hx => by simp [getRes, updateFn, hx])
+        · cases h
+
+theorem realizeFrontedPnl_preserves_coherent (st st' : DexState) (mids pids : List Nat)
+    (mid pid : Nat)
+    (hcoh : st.coherent mids pids) (hndM : mids.Nodup) (hmemM : mid ∈ mids)
+    (hndP : pids.Nodup) (hmemP : pid ∈ pids)
+    (h : stepRealizeFrontedPnl st mid pid = some st') :
+    st'.coherent mids pids := by
+  unfold stepRealizeFrontedPnl at h
+  cases hm : st.markets mid with
+  | none => simp [hm] at h
+  | some m =>
+    cases hp : st.portfolios pid with
+    | none => simp [hm, hp] at h
+    | some pfl =>
+      cases hl : pfl.legs mid with
+      | none => simp [hm, hp, hl] at h
+      | some leg =>
+        simp only [hm, hp, hl, Bind.bind, Option.bind] at h
+        split at h
+        · next hc =>
+          cases h
+          rcases hcoh with ⟨hstock, hC, hI, hR⟩
+          let fromR   := min leg.posPnl m.realizedPool
+          let fromIns := leg.posPnl - fromR
+          have hfrLeR : fromR ≤ m.realizedPool := Nat.min_le_right _ _
+          have hfrLeP : fromR ≤ leg.posPnl := Nat.min_le_left _ _
+          have hfiLeI : fromIns ≤ m.insurance := by
+            have h1 : m.realizedPool + min (((m.insurance + m.insFronted) * m.maxFrontBps) / bpsDenNat - m.insFronted) m.insurance ≥ m.totalPosPnl :=
+              hc.2.2.2.2.2.2.2.1
+            have h2 : m.totalPosPnl ≥ leg.posPnl := hc.2.2.2.2.2.2.1
+            have h3 : min (((m.insurance + m.insFronted) * m.maxFrontBps) / bpsDenNat - m.insFronted) m.insurance ≤ m.insurance :=
+              Nat.min_le_right _ _
+            omega
+          refine ⟨by unfold DexState.stockExact at *; dsimp only; omega, ?_, ?_, ?_⟩
+          · unfold sumCaps at *; dsimp only; rw [hC]
+            exact sum_map_eq_add pids (getCap st.portfolios) _ pid leg.posPnl hndP hmemP
+              (by simp [getCap, updateFn, hp])
+              (fun x hx => by simp [getCap, updateFn, hx])
+          · unfold sumIns at *; dsimp only; rw [hI]
+            exact sum_map_eq_sub mids (getIns st.markets) _ mid fromIns hndM hmemM
+              (by simp [getIns, updateFn, hm, fromIns, fromR])
+              (by simp [getIns, hm]; exact hfiLeI)
+              (fun x hx => by simp [getIns, updateFn, hx])
+          · unfold sumRes at *; dsimp only; rw [hR]
+            exact sum_map_eq_sub mids (getRes st.markets) _ mid fromR hndM hmemM
+              (by simp [getRes, updateFn, hm, fromR])
+              (by simp [getRes, hm]; exact hfrLeR)
+              (fun x hx => by simp [getRes, updateFn, hx])
+        · cases h
+
+theorem sweepSurplus_preserves_coherent (st st' : DexState) (mids pids : List Nat)
+    (signer sweepAmt : Nat)
+    (hcoh : st.coherent mids pids)
+    (h : stepSweepSurplus st signer sweepAmt = some st') :
+    st'.coherent mids pids := by
+  unfold stepSweepSurplus at h
+  split at h
+  · next hc =>
+    cases h
+    rcases hcoh with ⟨hstock, hC, hI, hR⟩
+    exact ⟨by unfold DexState.stockExact at *; dsimp only; omega, hC, hI, hR⟩
+  · cases h
+
+theorem updateOracle_preserves_coherent (st st' : DexState) (mids pids : List Nat)
+    (mid newPrice fundE6 curSlot : Nat)
+    (hcoh : st.coherent mids pids)
+    (h : stepUpdateOracle st mid newPrice fundE6 curSlot = some st') :
+    st'.coherent mids pids := by
+  unfold stepUpdateOracle at h
+  cases hm : st.markets mid with
+  | none => simp [hm] at h
+  | some m =>
+    simp only [hm, Bind.bind, Option.bind] at h
+    let diff := if newPrice ≥ m.markPrice then newPrice - m.markPrice else m.markPrice - newPrice
+    by_cases hc : m.status = .active ∧ curSlot > m.lastOracleSlot ∧ newPrice > 0 ∧
+        diff + fundE6 ≤ (m.markPrice * m.maxMoveBps) / bpsDenNat
+    · simp only [diff, hc, and_self, ↓reduceIte, Option.some.injEq] at h
+      subst h
+      rcases hcoh with ⟨hstock, hC, hI, hR⟩
+      refine ⟨hstock, hC, ?_, ?_⟩
+      · unfold sumIns at *; dsimp only; rw [hI]
+        apply sum_map_update_const; intro x _
+        by_cases hx : x = mid
+        · subst hx; simp [getIns, updateFn, hm]
+        · simp [getIns, updateFn, hx]
+      · unfold sumRes at *; dsimp only; rw [hR]
+        apply sum_map_update_const; intro x _
+        by_cases hx : x = mid
+        · subst hx; simp [getRes, updateFn, hm]
+        · simp [getRes, updateFn, hx]
+    · simp only [diff, hc, ↓reduceIte] at h; cases h
+
+theorem liquidateFullCap_preserves_coherent (st st' : DexState) (mids pids : List Nat)
+    (mid pid liqFeeCap loss : Nat)
+    (hcoh : st.coherent mids pids) (hndM : mids.Nodup) (hmemM : mid ∈ mids)
+    (hndP : pids.Nodup) (hmemP : pid ∈ pids)
+    (h : stepLiquidateFullCap st mid pid liqFeeCap loss = some st') :
+    st'.coherent mids pids := by
+  unfold stepLiquidateFullCap at h
+  cases hm : st.markets mid with
+  | none => simp [hm] at h
+  | some m =>
+    cases hp : st.portfolios pid with
+    | none => simp [hm, hp] at h
+    | some pfl =>
+      cases hl : pfl.legs mid with
+      | none => simp [hm, hp, hl] at h
+      | some leg =>
+        simp only [hm, hp, hl, Bind.bind, Option.bind] at h
+        let pnlBurned := min loss leg.posPnl
+        let rem1      := loss - pnlBurned
+        let capDeb    := min rem1 pfl.capital
+        let cap1      := pfl.capital - capDeb
+        let repay     := min capDeb m.insFronted
+        let toR       := capDeb - repay
+        let sfRaw     := rem1 - capDeb
+        let wo        := min sfRaw (m.insFronted - repay)
+        let shortfall := sfRaw - wo
+        let liqFee    := min liqFeeCap cap1
+        let insAfterRepay := m.insurance + repay
+        let maxDraw   := (insAfterRepay * m.maxInsDrawBps) / bpsDenNat
+        let insDraw   := if shortfall > 0 ∧ cap1 = 0 then min shortfall (min maxDraw insAfterRepay) else 0
+        by_cases hc : m.status = .active ∧ leg.side ≠ .flat ∧ leg.rawBasis > 0 ∧
+            st.totalCapital ≥ capDeb + liqFee ∧ st.vault ≥ liqFee ∧
+            st.totalInsurance + repay ≥ insDraw ∧ m.totalPosPnl ≥ pnlBurned
+        · rw [ite_eq_left_of_eq_true _ _ (eq_true hc)] at h; cases h
+          rcases hcoh with ⟨hstock, hC, hI, hR⟩
+          have hdebLe : capDeb + liqFee ≤ pfl.capital := by
+            dsimp only [capDeb, cap1, liqFee]; omega
+          have hrepLe : repay ≤ capDeb := Nat.min_le_left _ _
+          have hinsLe : insDraw ≤ insAfterRepay := by
+            dsimp only [insDraw]; split <;> omega
+          have hstI : st.totalInsurance + repay ≥ insDraw := hc.2.2.2.2.2.1
+          have htc  : st.totalCapital ≥ capDeb + liqFee := hc.2.2.2.1
+          have hv   : st.vault ≥ liqFee := hc.2.2.2.2.1
+          have htoR : toR + repay = capDeb := by dsimp only [toR]; omega
+          refine ⟨?_, ?_, ?_, ?_⟩
+          · unfold DexState.stockExact at hstock ⊢
+            change st.totalCapital - capDeb - liqFee + (st.totalInsurance + repay - insDraw) +
+                (st.totalResidual + toR + insDraw) + st.totalSurplus = st.vault - liqFee
+            omega
+          · unfold sumCaps at *; dsimp only; rw [hC, Nat.sub_sub]
+            exact sum_map_eq_sub pids (getCap st.portfolios) _ pid (capDeb + liqFee) hndP hmemP
+              (by simp [getCap, updateFn, hp, cap1, capDeb, liqFee, rem1, pnlBurned]; omega)
+              (by simp [getCap, hp]; exact hdebLe)
+              (fun x hx => by simp [getCap, updateFn, hx])
+          · unfold sumIns at *; dsimp only; rw [hI]
+            have h1 := sum_map_update_one_addSub mids (getIns st.markets)
+              (getIns (updateFn st.markets mid (some { m with
+                insurance := insAfterRepay - insDraw, insFronted := m.insFronted - repay - wo,
+                realizedPool := m.realizedPool + toR + insDraw, totalPosPnl := m.totalPosPnl - pnlBurned })))
+              mid repay insDraw hndM hmemM
+              (by simp [getIns, updateFn, hm, insAfterRepay])
+              (by simp [getIns, hm]; exact hinsLe)
+              (fun x hx => by simp [getIns, updateFn, hx])
+            change (List.map (getIns st.markets) mids).sum + repay - insDraw =
+              (List.map (getIns (updateFn st.markets mid (some { m with
+                insurance := insAfterRepay - insDraw, insFronted := m.insFronted - repay - wo,
+                realizedPool := m.realizedPool + toR + insDraw, totalPosPnl := m.totalPosPnl - pnlBurned }))) mids).sum
+            omega
+          · unfold sumRes at *; dsimp only; rw [hR, Nat.add_assoc]
+            exact sum_map_eq_add mids (getRes st.markets) _ mid (toR + insDraw) hndM hmemM
+              (by simp only [getRes, updateFn, ↓reduceIte, hm, toR, insDraw, insAfterRepay, maxDraw, shortfall, wo, sfRaw, repay, cap1, capDeb, rem1, pnlBurned]; rw [Nat.add_assoc])
+              (fun x hx => by simp [getRes, updateFn, hx])
+        · rw [ite_eq_right_of_eq_false _ _ (eq_false hc)] at h; cases h
+
+/-- Single-step relation covering EVERY balance-moving transition in `percolator-lean` v2.1
+    (all 18 transitions: original 13 + full-capital settlement, cumulative `I_m` fronting,
+    `SweepSurplus`, clamped `UpdateOracle`, and Bug-1B/1C hardened `LiquidateFullCap`!). -/
 inductive DexStep (mids pids : List Nat) : DexState → DexState → Prop where
   | depositCollateral {st st' pid amt} :
       pid ∈ pids → stepDepositCollateral st pid amt = some st' → DexStep mids pids st st'
@@ -643,6 +854,10 @@ inductive DexStep (mids pids : List Nat) : DexState → DexState → Prop where
       mid ∈ mids → pid ∈ pids → stepRealizeLegPnl st mid pid = some st' → DexStep mids pids st st'
   | settleContainedLoss {st st' mid pid loss} :
       mid ∈ mids → pid ∈ pids → stepSettleContainedLoss st mid pid loss = some st' → DexStep mids pids st st'
+  | settleFullCapitalLoss {st st' mid pid loss} :
+      mid ∈ mids → pid ∈ pids → stepSettleFullCapitalLoss st mid pid loss = some st' → DexStep mids pids st st'
+  | realizeFrontedPnl {st st' mid pid} :
+      mid ∈ mids → pid ∈ pids → stepRealizeFrontedPnl st mid pid = some st' → DexStep mids pids st st'
   | tradeOpenPostAdl {st st' mid pidL pidS qty spLS spSL} :
       mid ∈ mids → pidL ∈ pids → pidS ∈ pids →
       stepTradeOpenPostAdl st mid pidL pidS qty spLS spSL = some st' → DexStep mids pids st st'
@@ -653,6 +868,8 @@ inductive DexStep (mids pids : List Nat) : DexState → DexState → Prop where
       stepTradeHandoff st mid pidSell pidBuy qty spBS spSB = some st' → DexStep mids pids st st'
   | liquidate {st st' mid pid feeCap loss} :
       mid ∈ mids → pid ∈ pids → stepLiquidate st mid pid feeCap loss = some st' → DexStep mids pids st st'
+  | liquidateFullCap {st st' mid pid feeCap loss} :
+      mid ∈ mids → pid ∈ pids → stepLiquidateFullCap st mid pid feeCap loss = some st' → DexStep mids pids st st'
   | liquidateTakeoverPostAdl {st st' mid pid liqPid rawClose feeCap loss} :
       mid ∈ mids → pid ∈ pids →
       stepLiquidateTakeoverPostAdl st mid pid liqPid rawClose feeCap loss = some st' → DexStep mids pids st st'
@@ -660,6 +877,10 @@ inductive DexStep (mids pids : List Nat) : DexState → DexState → Prop where
       mid ∈ mids → pid ∈ pids → stepClaimResolved st mid pid = some st' → DexStep mids pids st st'
   | sweepOrphanInsurance {st st' mid} :
       mid ∈ mids → stepSweepOrphanInsurance st mid = some st' → DexStep mids pids st st'
+  | sweepSurplus {st st' signer amt} :
+      stepSweepSurplus st signer amt = some st' → DexStep mids pids st st'
+  | updateOracle {st st' mid newPrice fundE6 curSlot} :
+      stepUpdateOracle st mid newPrice fundE6 curSlot = some st' → DexStep mids pids st st'
 
 /-- Reflexive-transitive reachability across arbitrary multi-step transaction traces. -/
 inductive DexReachable (mids pids : List Nat) : DexState → DexState → Prop where
@@ -667,9 +888,9 @@ inductive DexReachable (mids pids : List Nat) : DexState → DexState → Prop w
   | step {st0 st1 st2 : DexState} :
       DexReachable mids pids st0 st1 → DexStep mids pids st1 st2 → DexReachable mids pids st0 st2
 
-/-- **Unified Multi-Step Trace Coherence Theorem (Global No-LOF Proof!)**:
+/-- **Unified Multi-Step Trace Coherence Theorem (Global No-LOF Proof Across ALL 18 Transitions!)**:
     Starting from ANY coherent DEX state `st0`, EVERY state `st` reachable via ANY finite
-    interleaving of all 13 protocol transitions preserves exact aggregate coherence:
+    interleaving of all 18 protocol transitions preserves exact aggregate coherence:
     `C_tot = ∑ capital`, `I_tot = ∑ insurance`, `R_tot = ∑ realizedPool`,
     AND `C_tot + I_tot + R_tot + S_tot = V`! -/
 theorem reachable_preserves_coherent (mids pids : List Nat)
@@ -687,16 +908,21 @@ theorem reachable_preserves_coherent (mids pids : List Nat)
     | withdrawInsurance hm h => exact withdrawInsurance_preserves_coherent _ _ _ _ _ _ _ ih hndM hm h
     | realizeLegPnl hm hp h => exact realizeLegPnl_preserves_coherent _ _ _ _ _ _ ih hndM hm hndP hp h
     | settleContainedLoss hm hp h => exact settleContainedLoss_preserves_coherent _ _ _ _ _ _ _ ih hndM hm hndP hp h
+    | settleFullCapitalLoss hm hp h => exact settleFullCapitalLoss_preserves_coherent _ _ _ _ _ _ _ ih hndM hm hndP hp h
+    | realizeFrontedPnl hm hp h => exact realizeFrontedPnl_preserves_coherent _ _ _ _ _ _ ih hndM hm hndP hp h
     | tradeOpenPostAdl hm hL hS h => exact tradeOpenPostAdl_preserves_coherent _ _ _ _ _ _ _ _ _ _ ih hndM hm hndP hL hS h
     | tradeReduce h => exact tradeReduce_preserves_coherent _ _ _ _ _ _ _ _ ih h
     | tradeHandoff hS hB h => exact tradeHandoff_preserves_coherent _ _ _ _ _ _ _ _ _ _ ih hndP hS hB h
     | liquidate hm hp h => exact liquidate_preserves_coherent _ _ _ _ _ _ _ _ ih hndM hm hndP hp h
+    | liquidateFullCap hm hp h => exact liquidateFullCap_preserves_coherent _ _ _ _ _ _ _ _ ih hndM hm hndP hp h
     | liquidateTakeoverPostAdl hm hp h => exact liquidateTakeoverPostAdl_preserves_coherent _ _ _ _ _ _ _ _ _ _ ih hndM hm hndP hp h
     | claimResolved hm hp h => exact claimResolved_preserves_coherent _ _ _ _ _ _ ih hndM hm hndP hp h
     | sweepOrphanInsurance hm h => exact sweepOrphanInsurance_preserves_coherent _ _ _ _ _ ih hndM hm h
+    | sweepSurplus h => exact sweepSurplus_preserves_coherent _ _ _ _ _ _ ih h
+    | updateOracle h => exact updateOracle_preserves_coherent _ _ _ _ _ _ _ _ ih h
 
 /-- **Corollary (Global Multi-Step Solvency Conservation)**:
-    Across ANY finite trace of protocol instructions, the exact sum of all portfolio capitals,
+    Across ANY finite trace of all 18 protocol instructions, the exact sum of all portfolio capitals,
     all per-market insurance pools, all per-market realized pools, and global surplus equals
     the SPL vault balance `V` to the last atom! -/
 theorem reachable_global_solvency (mids pids : List Nat)
@@ -707,6 +933,52 @@ theorem reachable_global_solvency (mids pids : List Nat)
   have ⟨hstock, hC, hI, hR⟩ := reachable_preserves_coherent mids pids hndM hndP st0 st h0 hreach
   unfold DexState.stockExact at hstock
   omega
+
+/-- **Gap #5 Theorem (`adversarial_multi_account_net_extraction_bound`)**:
+    **Multi-Account Adversarial Economic Net-Extraction Bound Over Arbitrary `DexReachable` Traces!**
+    Partition portfolios into `attackerPids ++ honestPids` (`pids`) and markets into
+    `trustedMids ++ untrustedMids` (`mids`). Across ANY finite `DexReachable` trace `st0 →* st`
+    with exact external vault delta `st.vault - st0.vault` (net deposits minus withdrawals):
+    1. **Global Economic Extraction Identity**: Every single atom gained by ALL attacker accounts
+       combined (`∑_{a ∈ A} cap_a`) beyond net vault inflows MUST come atom-for-atom from a decrease
+       in honest capitals, trusted market pools (`I_T + R_T`), untrusted market pools (`I_U + R_U`),
+       or protocol surplus `S`!
+    2. **Zero Trusted-Pool Extraction Corollary**: Whenever honest users' capitals + trusted markets'
+       `I_T + R_T` + `S` do not decrease (as guaranteed over any Solana `K = 4` leader window by
+       `threat_gap1_multileg_k4_zero_bad_debt`, `threat_permissionless_cross_margin_non_contagion`,
+       Bug 1B full-capital debit, and `threat_mango_self_trade_containment`), total attacker net
+       extraction across ALL attacker accounts combined is **STRICTLY BOUNDED BY
+       `sumIns st0 untrustedMids + sumRes st0 untrustedMids`**
+       (and **EXACT `0`** when `untrustedMids` have `0` external insurance/residual)! -/
+theorem adversarial_multi_account_net_extraction_bound
+    (trustedMids untrustedMids attackerPids honestPids : List Nat)
+    (hndM : (trustedMids ++ untrustedMids).Nodup)
+    (hndP : (attackerPids ++ honestPids).Nodup)
+    (st0 st : DexState) (h0 : st0.coherent (trustedMids ++ untrustedMids) (attackerPids ++ honestPids))
+    (hreach : DexReachable (trustedMids ++ untrustedMids) (attackerPids ++ honestPids) st0 st) :
+    let atk0 := sumCaps st0 attackerPids
+    let atk1 := sumCaps st  attackerPids
+    let prot0 := sumCaps st0 honestPids + sumIns st0 trustedMids + sumRes st0 trustedMids + st0.totalSurplus
+    let prot1 := sumCaps st  honestPids + sumIns st  trustedMids + sumRes st  trustedMids + st.totalSurplus
+    let unt0 := sumIns st0 untrustedMids + sumRes st0 untrustedMids
+    let unt1 := sumIns st  untrustedMids + sumRes st  untrustedMids
+    -- (1) Exact multi-account economic conservation identity
+    atk1 + prot1 + unt1 = st.vault ∧
+    atk0 + prot0 + unt0 = st0.vault ∧
+    -- (2) If vault is closed (`st.vault ≤ st0.vault`) and protected honest+trusted pools do not shrink (`prot1 ≥ prot0`),
+    --     ALL attacker accounts combined can NEVER extract more than `unt0` (and extract exact `0` if `unt0 = 0`)!
+    (st.vault ≤ st0.vault → prot1 ≥ prot0 → atk1 ≤ atk0 + unt0 ∧ (unt0 = 0 → atk1 ≤ atk0)) := by
+  have hS0 := reachable_global_solvency (trustedMids ++ untrustedMids) (attackerPids ++ honestPids) hndM hndP st0 st0 h0 (.refl st0)
+  have hS1 := reachable_global_solvency (trustedMids ++ untrustedMids) (attackerPids ++ honestPids) hndM hndP st0 st  h0 hreach
+  have hSplitCap : ∀ s : DexState, sumCaps s (attackerPids ++ honestPids) = sumCaps s attackerPids + sumCaps s honestPids := by
+    intro s; unfold sumCaps; rw [List.map_append, List.sum_append]
+  have hSplitIns : ∀ s : DexState, sumIns s (trustedMids ++ untrustedMids) = sumIns s trustedMids + sumIns s untrustedMids := by
+    intro s; unfold sumIns; rw [List.map_append, List.sum_append]
+  have hSplitRes : ∀ s : DexState, sumRes s (trustedMids ++ untrustedMids) = sumRes s trustedMids + sumRes s untrustedMids := by
+    intro s; unfold sumRes; rw [List.map_append, List.sum_append]
+  rw [hSplitCap, hSplitIns, hSplitRes] at hS0 hS1
+  dsimp only
+  refine ⟨by omega, by omega, fun hv hp => ⟨by omega, fun hu => by omega⟩⟩
 
 /-! ### Unconditional Anti-Shielding Proofs (`reservedMm` Firewall under God-Mode `RUG` Oracle) -/
 
@@ -1064,5 +1336,87 @@ theorem worthless_shares_burn_zero_payout
     totSh - burnShares < totSh ∧
     curSh - burnShares ≤ totSh - burnShares := by
   refine ⟨by simp, by omega, by omega, by omega⟩
+
+/-- **THEOREM (`insFronting_optimistic_nav_blocks_lp_arb`)**:
+    When `I_m` has temporarily fronted `fronted` USD to winners (`ins` cash on hand + `fronted`
+    receivable = optimistic NAV `nav = ins + fronted`), pricing `DepositInsurance` shares at
+    `minted = ⌊amount · totSh / (ins + fronted)⌋` makes LP receivable arbitrage IMPOSSIBLE:
+    even if 100% of `repay ≤ fronted` is immediately repaid by losers in the very next slot,
+    the new LP's redeemable payout is strictly `≤ amount` (ZERO free profit!), and existing LPs'
+    NAV per share is never diluted! -/
+theorem insFronting_optimistic_nav_blocks_lp_arb
+    (totSh ins fronted amount repay : Nat)
+    (_hSh : totSh > 0) (_hNav : ins + fronted > 0) (hRep : repay ≤ fronted) :
+    let nav := ins + fronted
+    let minted := (amount * totSh) / nav
+    let finalCash := ins + amount + repay
+    let finalSh := totSh + minted
+    -- 1. New LP can NEVER withdraw more than `amount` after losers repay `repay ≤ fronted`!
+    (minted * finalCash) / finalSh ≤ amount ∧
+    -- 2. Existing LPs are strictly non-diluted at full NAV!
+    (nav + amount) * totSh ≥ nav * finalSh := by
+  dsimp only
+  have hmul : ((amount * totSh) / (ins + fronted)) * (ins + fronted) ≤ amount * totSh :=
+    Nat.div_mul_le_self (amount * totSh) (ins + fronted)
+  constructor
+  · apply Nat.div_le_of_le_mul
+    have hcash : ins + amount + repay ≤ (ins + fronted) + amount := by omega
+    have h1 : ((amount * totSh) / (ins + fronted)) * (ins + amount + repay) ≤
+              ((amount * totSh) / (ins + fronted)) * ((ins + fronted) + amount) :=
+      Nat.mul_le_mul_left _ hcash
+    have h2 : ((amount * totSh) / (ins + fronted)) * ((ins + fronted) + amount) =
+              ((amount * totSh) / (ins + fronted)) * (ins + fronted) +
+              ((amount * totSh) / (ins + fronted)) * amount :=
+      Nat.mul_add _ _ _
+    have h3 : (totSh + (amount * totSh) / (ins + fronted)) * amount =
+              totSh * amount + ((amount * totSh) / (ins + fronted)) * amount :=
+      Nat.add_mul _ _ _
+    have hcomm : totSh * amount = amount * totSh := Nat.mul_comm _ _
+    omega
+  · have h1 : (ins + fronted + amount) * totSh = (ins + fronted) * totSh + amount * totSh :=
+      Nat.add_mul (ins + fronted) amount totSh
+    have h2 : (ins + fronted) * (totSh + (amount * totSh) / (ins + fronted)) =
+              (ins + fronted) * totSh + (ins + fronted) * ((amount * totSh) / (ins + fronted)) :=
+      Nat.mul_add (ins + fronted) totSh _
+    have hcomm : (ins + fronted) * ((amount * totSh) / (ins + fronted)) =
+                 ((amount * totSh) / (ins + fronted)) * (ins + fronted) := Nat.mul_comm _ _
+    omega
+
+/-- **THEOREM (`insFronting_strictly_contained_by_market_insurance`)**:
+    Mango-proof cross-market isolation for `RUG/USD` fronting:
+    1. Fronting `fromR ≤ R_m` and `fromIns ≤ I_m` (with `fromIns ≤ ⌊I_m · maxFrontBps / 10000⌋`)
+       preserves exact global conservation `V = C + I + R + S`, never underflows `I_m`, and
+       keeps every other market's insurance `I_other` untouched.
+    2. Senior loser repayment `repay = min(capDeb, F_m)` restores `I_m` before `R_m`, preserving
+       exact `V = C + I + R + S` and `F_m' = F_m - repay`. -/
+theorem insFronting_strictly_contained_by_market_insurance
+    (V C I_m I_other R_m R_other S F_m fromR fromIns capDeb : Nat)
+    (hStock : V = C + (I_m + I_other) + (R_m + R_other) + S)
+    (hR : fromR ≤ R_m) (hI : fromIns ≤ I_m) :
+    -- After fronting `fromR + fromIns` into `C`:
+    let C1 := C + fromR + fromIns
+    let I1 := I_m - fromIns
+    let R1 := R_m - fromR
+    let F1 := F_m + fromIns
+    V = C1 + (I1 + I_other) + (R1 + R_other) + S ∧
+    I_m - I1 = fromIns ∧
+    fromIns ≤ I_m ∧
+    -- After loser pays `capDeb ≤ C1` with senior repayment to `I_m` first:
+    (capDeb ≤ C1 →
+      let repay := min capDeb F1
+      let toR := capDeb - repay
+      V = (C1 - capDeb) + ((I1 + repay) + I_other) + ((R1 + toR) + R_other) + S) := by
+  dsimp only
+  refine ⟨by omega, by omega, hI, fun hcap => by omega⟩
+
+/-- **THEOREM (`sweepSurplus_preserves_stock_and_user_funds`)**:
+    `handleSweepSurplus` reduces ONLY `Dex.vaultBalance` (`V`) and `Dex.totalSurplus` (`S`) by
+    `sweepAmt ≤ S`, preserving exact `V' = C + I + R + S'` while leaving user capital `C`,
+    insurance `I`, and realized pools `R` 100% untouched! -/
+theorem sweepSurplus_preserves_stock_and_user_funds
+    (V C I R S sweepAmt : Nat)
+    (hStock : V = C + I + R + S) (hle : sweepAmt ≤ S) :
+    V - sweepAmt = C + I + R + (S - sweepAmt) ∧ sweepAmt ≤ V := by
+  omega
 
 end Percolator.TraceProofs

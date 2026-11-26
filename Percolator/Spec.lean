@@ -32,11 +32,17 @@ def haircutPayout (p realizedPool posPnlTot : Nat) : Nat :=
   if posPnlTot = 0 then 0
   else (p * min realizedPool posPnlTot) / posPnlTot
 
-/-- Exact derived side ADL index `max(1, ⌊ADL_ONE * oi / rawBasis⌋)`. -/
+/-- Exact derived side ADL index `⌊ADL_ONE * oi / rawBasis⌋` (unconditional `effectiveQty ≤ oi`
+    without artificial `max 1` floor-clamp!). -/
 def deriveAdl (oi rawBasis : Nat) : Nat :=
   if rawBasis = 0 then adlOneNat
   else if oi >= rawBasis then adlOneNat
-  else max 1 ((adlOneNat * oi) / rawBasis)
+  else (adlOneNat * oi) / rawBasis
+
+/-- Exact compounded 4-slot Solana leader-window upper bound in bps:
+    for EVERY `m ≤ 2500`, `(10000 + m)^4 - 10000^4 ≤ k4CompoundedBps m * 10000^3`! -/
+def k4CompoundedBps (maxMoveBps : Nat) : Nat :=
+  4 * maxMoveBps + (maxMoveBps * maxMoveBps + 999) / 1000
 
 /-- Effective position quantity `⌊rawBasis * adlSide / ADL_ONE⌋`. -/
 def effectiveQty (rawBasis adlSide : Nat) : Nat :=
@@ -110,6 +116,8 @@ structure MarketState where
   resolvedNum    : Nat
   resolvedDen    : Nat
   activeLegs     : Nat
+  maxFrontBps    : Nat  := 0
+  insFronted     : Nat  := 0
   deriving DecidableEq, Repr
 
 structure LegState where
@@ -129,6 +137,7 @@ structure PortfolioState where
   totalMm     : Nat              -- sum of active legs' `cachedMm`
   totalIm     : Nat              -- sum of active legs' `cachedIm`
   legs        : Nat → Option LegState   -- marketId → active LegState
+  legCount    : Nat  := 0
 
 structure DexState where
   protocolAdmin   : Nat
@@ -837,5 +846,136 @@ def stepRugReservedState (cap totRes rugRes rugLoss rugFee newTotMm newRugMm : N
   let cap2     := cap1 - feeDeb
   let (rugRes', totRes') := syncReservedMm cap2 totRes rugRes newTotMm newRugMm
   (cap2, totRes', rugRes')
+
+/-! ### Gap #5 Sync: v2.1 Full-Capital Settlement, Cumulative `I_m`-Fronting, `SweepSurplus`, & Clamped Oracle Step -/
+
+/-- Exact v2.1 Full-Capital Loss Settlement (`Program.settleAndRefreshLeg` + `creditMarketFromLoser`
+    + `writeOffShortfall`):
+    1. Debits FULL `pfl.capital` (`capDeb = min rem1 pfl.capital`, NEVER shielding capital behind other legs!).
+    2. Repays `m.insFronted` senior into `m.insurance` (`I_m`), remainder to `m.realizedPool` (`R_m`).
+    3. Writes off any uncollectible fronted bad debt `wo = min (rem1 - capDeb) (m.insFronted - repay)`. -/
+def stepSettleFullCapitalLoss (st : DexState) (mid pid loss : Nat) : Option DexState := do
+  let m ← st.markets mid
+  let pfl ← st.portfolios pid
+  let leg ← pfl.legs mid
+  let pnlBurned := min loss leg.posPnl
+  let rem1      := loss - pnlBurned
+  let capDeb    := min rem1 pfl.capital
+  let repay     := min capDeb m.insFronted
+  let toR       := capDeb - repay
+  let sfRaw     := rem1 - capDeb
+  let wo        := min sfRaw (m.insFronted - repay)
+  if (m.status = .active ∨ m.status = .windDown) ∧
+     st.totalCapital ≥ capDeb ∧ m.totalPosPnl ≥ pnlBurned then
+    let m' := { m with
+      insurance    := m.insurance + repay
+      insFronted   := m.insFronted - repay - wo
+      realizedPool := m.realizedPool + toR
+      totalPosPnl  := m.totalPosPnl - pnlBurned }
+    let leg' := { leg with posPnl := leg.posPnl - pnlBurned }
+    let pfl' := { pfl with capital := pfl.capital - capDeb, legs := updateFn pfl.legs mid (some leg') }
+    some { st with
+      totalCapital   := st.totalCapital - capDeb
+      totalInsurance := st.totalInsurance + repay
+      totalResidual  := st.totalResidual + toR
+      markets        := updateFn st.markets mid (some m')
+      portfolios     := updateFn st.portfolios pid (some pfl') }
+  else none
+
+/-- Exact v2.1 `I_m`-Contained Cross-PnL Fronting (`Program.realizeWinnerPnl` + `realizeFrontedPnl`
+    with Gap #2 cumulative NAV-based cap `availIns = min(ins, floor((ins + insFronted) * maxFrontBps / 10000) - insFronted)`). -/
+def stepRealizeFrontedPnl (st : DexState) (mid pid : Nat) : Option DexState := do
+  let m ← st.markets mid
+  let pfl ← st.portfolios pid
+  let leg ← pfl.legs mid
+  let nav      := m.insurance + m.insFronted
+  let capIns   := (nav * m.maxFrontBps) / bpsDenNat
+  let availIns := min (capIns - m.insFronted) m.insurance
+  if m.status = .active ∧ m.adlLong = adlOneNat ∧ m.adlShort = adlOneNat ∧
+     m.maxFrontBps > 0 ∧ m.maxFrontBps ≤ m.maxInsDrawBps ∧
+     leg.posPnl > 0 ∧ m.totalPosPnl ≥ leg.posPnl ∧
+     m.realizedPool + availIns ≥ m.totalPosPnl ∧
+     st.totalResidual ≥ min leg.posPnl m.realizedPool ∧
+     st.totalInsurance ≥ leg.posPnl - min leg.posPnl m.realizedPool then
+    let fromR   := min leg.posPnl m.realizedPool
+    let fromIns := leg.posPnl - fromR
+    let m' := { m with
+      realizedPool := m.realizedPool - fromR
+      insurance    := m.insurance - fromIns
+      insFronted   := m.insFronted + fromIns
+      totalPosPnl  := m.totalPosPnl - leg.posPnl }
+    let leg' := { leg with posPnl := 0 }
+    let pfl' := { pfl with capital := pfl.capital + leg.posPnl, legs := updateFn pfl.legs mid (some leg') }
+    some { st with
+      totalCapital   := st.totalCapital + leg.posPnl
+      totalResidual  := st.totalResidual - fromR
+      totalInsurance := st.totalInsurance - fromIns
+      markets        := updateFn st.markets mid (some m')
+      portfolios     := updateFn st.portfolios pid (some pfl') }
+  else none
+
+/-- Exact v2.1 `SweepSurplus` (`Program.handleSweepSurplus`): admin sweeps `sweepAmt ≤ S_tot`,
+    leaving `C_tot`, `I_tot`, `R_tot`, and all markets/portfolios bit-for-bit invariant. -/
+def stepSweepSurplus (st : DexState) (signer sweepAmt : Nat) : Option DexState :=
+  if signer = st.protocolAdmin ∧ sweepAmt > 0 ∧ sweepAmt ≤ st.totalSurplus ∧ sweepAmt ≤ st.vault then
+    some { st with
+      vault        := st.vault - sweepAmt
+      totalSurplus := st.totalSurplus - sweepAmt }
+  else none
+
+/-- Exact v2.1 Clamped `UpdateOracle` (`Program.handleUpdateOracle` with per-slot rate limit):
+    updates `markPrice` and `lastOracleSlot` within `maxMoveBps`, leaving all vault/pool balances
+    bit-for-bit unchanged! -/
+def stepUpdateOracle (st : DexState) (mid newPrice fundE6 curSlot : Nat) : Option DexState := do
+  let m ← st.markets mid
+  let diff := if newPrice ≥ m.markPrice then newPrice - m.markPrice else m.markPrice - newPrice
+  if m.status = .active ∧ curSlot > m.lastOracleSlot ∧ newPrice > 0 ∧
+     diff + fundE6 ≤ (m.markPrice * m.maxMoveBps) / bpsDenNat then
+    let m' := { m with markPrice := newPrice, lastOracleSlot := curSlot }
+    some { st with markets := updateFn st.markets mid (some m') }
+  else none
+
+/-- Exact v2.1 Hardened `Liquidate` (`Program.handleLiquidate` Bug 1B full-capital + `cap == 0` guard
+    + Bug 1C bankrupt full-close). -/
+def stepLiquidateFullCap (st : DexState) (mid pid liqFeeCap loss : Nat) : Option DexState := do
+  let m ← st.markets mid
+  let pfl ← st.portfolios pid
+  let leg ← pfl.legs mid
+  let pnlBurned := min loss leg.posPnl
+  let rem1      := loss - pnlBurned
+  let capDeb    := min rem1 pfl.capital
+  let cap1      := pfl.capital - capDeb
+  let repay     := min capDeb m.insFronted
+  let toR       := capDeb - repay
+  let sfRaw     := rem1 - capDeb
+  let wo        := min sfRaw (m.insFronted - repay)
+  let shortfall := sfRaw - wo
+  let liqFee    := min liqFeeCap cap1
+  let cap2      := cap1 - liqFee
+  let insAfterRepay := m.insurance + repay
+  let maxDraw   := (insAfterRepay * m.maxInsDrawBps) / bpsDenNat
+  let insDraw   := if shortfall > 0 ∧ cap1 = 0 then min shortfall (min maxDraw insAfterRepay) else 0
+  if m.status = .active ∧ leg.side ≠ .flat ∧ leg.rawBasis > 0 ∧
+     st.totalCapital ≥ capDeb + liqFee ∧ st.vault ≥ liqFee ∧
+     st.totalInsurance + repay ≥ insDraw ∧ m.totalPosPnl ≥ pnlBurned then
+    let m' := { m with
+      insurance    := insAfterRepay - insDraw
+      insFronted   := m.insFronted - repay - wo
+      realizedPool := m.realizedPool + toR + insDraw
+      totalPosPnl  := m.totalPosPnl - pnlBurned }
+    let leg' := { leg with side := .flat, rawBasis := 0, posPnl := leg.posPnl - pnlBurned, cachedMm := 0, cachedIm := 0 }
+    let pfl' := { pfl with
+      capital := cap2
+      totalMm := pfl.totalMm - leg.cachedMm
+      totalIm := pfl.totalIm - leg.cachedIm
+      legs    := updateFn pfl.legs mid (some leg') }
+    some { st with
+      vault          := st.vault - liqFee
+      totalCapital   := st.totalCapital - capDeb - liqFee
+      totalInsurance := st.totalInsurance + repay - insDraw
+      totalResidual  := st.totalResidual + toR + insDraw
+      markets        := updateFn st.markets mid (some m')
+      portfolios     := updateFn st.portfolios pid (some pfl') }
+  else none
 
 end Percolator.Spec
