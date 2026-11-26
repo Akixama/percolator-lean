@@ -601,6 +601,21 @@ fn ix_refresh_leg(prog: Address, dex: Address, mkt: Address, pfl: Address, force
     }
 }
 
+fn ix_refresh_leg_signed(
+    prog: Address, dex: Address, mkt: Address, pfl: Address, owner: Address, force_haircut: bool,
+) -> Instruction {
+    Instruction {
+        program_id: prog,
+        accounts: vec![
+            AccountMeta::new(dex, false),
+            AccountMeta::new(mkt, false),
+            AccountMeta::new(pfl, false),
+            AccountMeta::new_readonly(owner, true),
+        ],
+        data: vec![10, if force_haircut { 1 } else { 0 }],
+    }
+}
+
 fn ix_trade_ext(
     prog: Address, dex: Address, mkt: Address,
     pfl_l: Address, owner_l: Address, pfl_s: Address, owner_s: Address,
@@ -1077,7 +1092,7 @@ fn main() {
     let scam_r_before = read_u64(&svm, &scam_mkt, 216);
     let attacker_cap_before = read_u64(&svm, &attacker_pfl, 88);
     send_ok(&mut svm, ix_clear_dead_leg(prog_id, dex, scam_mkt, attacker_pfl), &payer, &[&payer]);
-    send_ok(&mut svm, ix_refresh_leg(prog_id, dex, scam_mkt, attacker_pfl, true), &payer, &[&payer]);
+    send_ok(&mut svm, ix_refresh_leg_signed(prog_id, dex, scam_mkt, attacker_pfl, attacker.pubkey(), true), &payer, &[&payer, &attacker]);
     let attacker_gain = read_u64(&svm, &attacker_pfl, 88) - attacker_cap_before;
     assert!(attacker_gain <= scam_r_before, "Attacker extracted {} > R_SCAM ({})!", attacker_gain, scam_r_before);
     assert_eq!(read_u64(&svm, &btc_mkt, 224), btc_ins_before, "I_BTC still untouched after Attacker claim!");
@@ -1521,7 +1536,12 @@ fn main() {
             let mi = rng.range(3) as usize;
             let ti = rng.range(5) as usize;
             let force = rng.range(4) == 0;
-            if let Ok(cu) = send_ixs_try(&mut svm, &[ix_refresh_leg(prog_id, f_dex, f_mkts[mi], f_pfls[ti], force)], &payer, &[&payer]) {
+            let res = if force {
+                send_ixs_try(&mut svm, &[ix_refresh_leg_signed(prog_id, f_dex, f_mkts[mi], f_pfls[ti], f_traders[ti].pubkey(), true)], &payer, &[&payer, &f_traders[ti]])
+            } else {
+                send_ixs_try(&mut svm, &[ix_refresh_leg(prog_id, f_dex, f_mkts[mi], f_pfls[ti], false)], &payer, &[&payer])
+            };
+            if let Ok(cu) = res {
                 stats[5] += 1;
                 ok_txs += 1;
                 max_cu = max_cu.max(cu);
@@ -1919,7 +1939,7 @@ fn main() {
     );
 
     // 9B: Passive LP AMM Matcher CPI composition (Single-Signer Taker Open & Close!)
-    let mtch_cfg = create_prog_acc(&mut svm, &matcher_prog, 128);
+    let mtch_cfg = create_prog_acc(&mut svm, &matcher_prog, 160);
     let (lp_auth_pda, lp_bump) = Address::find_program_address(&[b"lpau", mtch_cfg.as_ref()], &matcher_prog);
     let lp_pfl = create_prog_acc(&mut svm, &prog_id, PFL_SIZE);
     let mut init_m_data = vec![0u8; 28];
@@ -1939,6 +1959,7 @@ fn main() {
                 AccountMeta::new(lp_pfl, false),
                 AccountMeta::new_readonly(lp_auth_pda, false),
                 AccountMeta::new_readonly(prog_id, false),
+                AccountMeta::new_readonly(comp_mkt2, false),
             ],
             data: init_m_data,
         },

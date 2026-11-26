@@ -638,7 +638,7 @@ def handleCrank (input : Ptr) : SolanaM Unit := do
 
   -- Read `oldPrice` & `maxMoveBps` from `percolator::Market`
   SolanaM.require (← pubkeyEq (AccountView.ownerPtr mkt) (AccountView.keyPtr percProg)) Err.illegalOwner
-  SolanaM.require ((← AccountView.dataLen mkt) >= MktOff.size) Err.accountDataTooSmall
+  SolanaM.require ((← AccountView.dataLen mkt) == MktOff.size) Err.invalidAccountData
   let mData := AccountView.dataPtr mkt
   SolanaM.require ((← loadU32 mData MktOff.magic) == MAGIC_MARKET) PErr.invalidMagic
   let oldP ← loadU64 mData MktOff.markPrice

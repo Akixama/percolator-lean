@@ -24,6 +24,7 @@ def MIN_EXIT_WINDOW  : UInt64 := 10                 -- minimum wind-down exit wi
 def MAX_EXIT_WINDOW  : UInt64 := 216_000            -- maximum wind-down exit window (~24h at 400ms/slot)
 def MAX_STALENESS    : UInt64 := 9_000              -- maximum oracle staleness (~1h at 400ms/slot)
 def MAX_LEGS         : UInt64 := 8                  -- max cross-margin legs per Portfolio
+def MIN_FIRST_INS_DEPOSIT : UInt64 := 1_000_000     -- 1.0 quote unit min first LP deposit (anti-ERC4626 inflation)
 
 /-! ### Pinned Canonical SPL Token Program ID (`TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA`) -/
 

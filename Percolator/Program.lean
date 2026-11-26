@@ -110,6 +110,9 @@ def checkOracleFresh (mData : Ptr) (curSlot : UInt64) : SolanaM Unit := do
   SolanaM.require (age <= maxStale) PErr.oracleStale
 
 def checkDexVaultAndMint (dexData : Ptr) (mint vaultPda tokProg : AccountView) : SolanaM Unit := do
+  SolanaM.require ((← rawLoadU8 tokProg)  == ABI.nonDupMarker) PErr.aliasedAccounts
+  SolanaM.require ((← rawLoadU8 mint)     == ABI.nonDupMarker) PErr.aliasedAccounts
+  SolanaM.require ((← rawLoadU8 vaultPda) == ABI.nonDupMarker) PErr.aliasedAccounts
   checkTokenProg tokProg
   requireKeyEq (AccountView.keyPtr mint)     (dexData + DexOff.quoteMint) PErr.mintMismatch
   requireKeyEq (AccountView.keyPtr vaultPda) (dexData + DexOff.vaultPda)  PErr.vaultMismatch
@@ -418,6 +421,16 @@ def handleInitDex (input : Ptr) : SolanaM Unit := do
   let rentLamports ← loadU64 ix.ptr 12
   SolanaM.require (createFee <= MAX_CREATE_FEE && rentLamports >= 2_039_280) PErr.invalidParams
 
+  -- Validate SPL `quoteMint`: owned by canonical Token Program, exact 82B initialized Mint,
+  -- matching `decimals` (byte 44), AND `freeze_authority == COption::None` (bytes 46..50 == 0)
+  -- so a malicious mint freeze authority can NEVER freeze `DexVault` custody!
+  requireKeyEq (AccountView.ownerPtr mint) (AccountView.keyPtr tokProg) Err.illegalOwner
+  SolanaM.require ((← AccountView.dataLen mint) == 82) Err.invalidAccountData
+  let mintData := AccountView.dataPtr mint
+  SolanaM.require ((← loadU8 mintData 45) == 1) Err.uninitializedAccount
+  SolanaM.require ((← loadU8 mintData 44) == decimals) PErr.invalidParams
+  SolanaM.require ((← loadU32 mintData 46) == 0) PErr.invalidParams
+
   -- Create & initialize the `DexVault` PDA token account on-chain (works on real clusters &
   -- immune to 1-lamport pre-funding griefing; runtime enforces PDA seeds ["dvlt", dex, bump]!).
   let curLam ← AccountView.lamports vaultPda
@@ -492,6 +505,7 @@ def handleCreateMarket (input : Ptr) : SolanaM Unit := do
   let createFee ← loadU64 dData DexOff.createFee
   if createFee > 0 then
     requireKeyEq (AccountView.keyPtr feeVaultTok) (dData + DexOff.feeVault) PErr.vaultMismatch
+    requireKeyNe (AccountView.keyPtr feeVaultTok) (dData + DexOff.vaultPda) PErr.aliasedAccounts
     let dec ← loadU8 dData DexOff.decimals
     tokenTransferChecked tokProg creatorTok mint feeVaultTok creator createFee dec
 
@@ -623,6 +637,7 @@ def handleDepositCollateral (input : Ptr) : SolanaM Unit := do
   let fData := AccountView.dataPtr pfl
   requireKeyEq (AccountView.keyPtr dex) (fData + PflOff.dex) PErr.dexMismatch
   checkDexVaultAndMint dData mint vaultPda tokProg
+  requireKeyNe (AccountView.keyPtr ownerTok) (AccountView.keyPtr vaultPda) PErr.aliasedAccounts
 
   let amount ← loadU64 ix.ptr 1
   SolanaM.require (amount > 0) PErr.invalidParams
@@ -645,6 +660,7 @@ def handleWithdrawCollateral (input : Ptr) : SolanaM Unit := do
   requireKeyEq (AccountView.keyPtr dex)   (fData + PflOff.dex)   PErr.dexMismatch
   requireKeyEq (AccountView.keyPtr owner) (fData + PflOff.owner) PErr.ownerMismatch
   checkDexVaultAndMint dData mint vaultPda tokProg
+  requireKeyNe (AccountView.keyPtr destTok) (AccountView.keyPtr vaultPda) PErr.aliasedAccounts
 
   let amount ← loadU64 ix.ptr 1
   SolanaM.require (amount > 0) PErr.invalidParams
@@ -677,6 +693,7 @@ def handleDepositInsurance (input : Ptr) : SolanaM Unit := do
   let mData := AccountView.dataPtr mkt
   requireKeyEq (AccountView.keyPtr dex) (mData + MktOff.dex) PErr.dexMismatch
   checkDexVaultAndMint dData mint vaultPda tokProg
+  requireKeyNe (AccountView.keyPtr lpTok) (AccountView.keyPtr vaultPda) PErr.aliasedAccounts
 
   let st ← loadU8 mData MktOff.status
   SolanaM.require (st == STATUS_ACTIVE || st == STATUS_WINDDOWN) PErr.invalidStatus
@@ -711,7 +728,19 @@ def handleDepositInsurance (input : Ptr) : SolanaM Unit := do
 
     let totSh ← loadU64 mData MktOff.totalInsShares
     let ins   ← loadU64 mData MktOff.insurance
-    let minted ← if totSh == 0 || ins == 0 then pure amount else mulDiv64 amount totSh ins
+    -- Share-pool pricing hardening:
+    -- 1. If `totSh == 0`, forbid capturing pre-existing unowned fees/donations (`ins == 0`)
+    --    and enforce `amount >= MIN_FIRST_INS_DEPOSIT` (blocks 1-atom ERC-4626 inflation!).
+    -- 2. If `totSh > 0`, forbid depositing into a wiped-out pool (`ins == 0`) where old
+    --    worthless shares would steal the new LP's deposit (old LPs must burn shares first!).
+    let minted ←
+      if totSh == 0 then do
+        SolanaM.require (ins == 0) PErr.nonzeroState
+        SolanaM.require (amount >= MIN_FIRST_INS_DEPOSIT) PErr.invalidParams
+        pure amount
+      else do
+        SolanaM.require (ins > 0) PErr.nonzeroState
+        mulDiv64 amount totSh ins
     SolanaM.require (minted > 0) PErr.invalidParams
 
     tokenTransferChecked tokProg lpTok mint vaultPda lp amount dec
@@ -737,8 +766,12 @@ def handleWithdrawInsurance (input : Ptr) : SolanaM Unit := do
   requireKeyEq (AccountView.keyPtr mkt) (rData + InsOff.market) PErr.marketMismatch
   SolanaM.require ((← loadU64 rData InsOff.marketId) == (← loadU64 mData MktOff.marketId)) PErr.marketMismatch
   checkDexVaultAndMint dData mint vaultPda tokProg
+  requireKeyNe (AccountView.keyPtr destTok) (AccountView.keyPtr vaultPda) PErr.aliasedAccounts
 
-  SolanaM.require ((← loadU8 mData MktOff.status) != STATUS_TOMBSTONED) PErr.invalidStatus
+  let ins ← loadU64 mData MktOff.insurance
+  -- Allow burning worthless shares (`ins == 0`) even on `STATUS_TOMBSTONED` so `InsReceipt` rent
+  -- can NEVER be permanently trapped by a permissionless `TombstoneMarket` call!
+  SolanaM.require ((← loadU8 mData MktOff.status) != STATUS_TOMBSTONED || ins == 0) PErr.invalidStatus
   -- Insurance CANNOT be withdrawn while ANY OI or post-ADL rawBasis exists on this market!
   SolanaM.require ((← loadU64 mData MktOff.oiLong) == 0 && (← loadU64 mData MktOff.oiShort) == 0 &&
                    (← loadU64 mData MktOff.rawBasisLong) == 0 && (← loadU64 mData MktOff.rawBasisShort) == 0) PErr.nonzeroOi
@@ -749,7 +782,6 @@ def handleWithdrawInsurance (input : Ptr) : SolanaM Unit := do
   let totSh ← loadU64 mData MktOff.totalInsShares
   SolanaM.require (curSh <= totSh) PErr.nonzeroState
   SolanaM.require (curSh >= burnShares) PErr.insufficientFunds
-  let ins   ← loadU64 mData MktOff.insurance
   let payout ← mulDiv64 burnShares ins totSh
 
   storeU64 rData InsOff.shares (curSh - burnShares)
@@ -764,7 +796,10 @@ def handleWithdrawInsurance (input : Ptr) : SolanaM Unit := do
       TAG_DEX_VAULT (AccountView.keyPtr dex) bump
 
 def handleRefreshLeg (input : Ptr) : SolanaM Unit := do
-  let (dex, mkt, pfl, ix, progId) ← parse3 input
+  let (n, dex, ix, progId) ← parseIxOnly input
+  SolanaM.require (n >= 3) Err.notEnoughAccountKeys
+  let mkt ← AccountView.nextCursor dex
+  let pfl ← AccountView.nextCursor mkt
   requireWritable dex; requireWritable mkt; requireWritable pfl
   checkOwnedMagic dex progId DexOff.size MAGIC_DEX
   checkOwnedMagic mkt progId MktOff.size MAGIC_MARKET
@@ -785,7 +820,14 @@ def handleRefreshLeg (input : Ptr) : SolanaM Unit := do
   SolanaM.require (slotIdx < MAX_LEGS) PErr.legNotFound
   requireKeyEq (AccountView.keyPtr mkt) (legPtrAt fData slotIdx + LegOff.market) PErr.marketMismatch
 
+  -- Opt-in `forceHaircut = true` MUST be signed by `pfl.owner` (4th account) so no third party
+  -- can permissionlessly force-haircut & wipe a winner's `posPnl` before losing counterparties settle!
   let forceHaircut ← if ix.len >= 2 then do pure ((← loadU8 ix.ptr 1) != 0) else pure false
+  if forceHaircut then
+    SolanaM.require (n >= 4) Err.notEnoughAccountKeys
+    let owner ← AccountView.nextCursor pfl
+    requireSigner owner
+    requireKeyEq (AccountView.keyPtr owner) (fData + PflOff.owner) PErr.ownerMismatch
   let _ ← settleAndRefreshLeg dData mData fData slotIdx curSlot forceHaircut
   freeLegIfEmpty fData slotIdx
 
@@ -970,12 +1012,15 @@ def handleTrade (input : Ptr) : SolanaM Unit := do
 
     syncLegMargins mData fLData slotL curSlot
     syncLegMargins mData fSData slotS curSlot
-    -- Paying an `execPrice` spread during reduce can NEVER drop payer below `newTotalMm`!
+    -- Paying an `execPrice` spread during reduce requires fresh margins across ALL active legs
+    -- on the spread payer AND can NEVER drop payer below `newTotalMm`!
     let markP ← loadU64 mData MktOff.markPrice
     if execPrice != 0 && execPrice != markP then
       if execPrice > markP then
+        checkAllLegsFreshLoop fLData curSlot 0
         SolanaM.require ((← loadU64 fLData PflOff.capital) >= (← loadU64 fLData PflOff.totalMm)) PErr.insufficientMargin
       else
+        checkAllLegsFreshLoop fSData curSlot 0
         SolanaM.require ((← loadU64 fSData PflOff.capital) >= (← loadU64 fSData PflOff.totalMm)) PErr.insufficientMargin
     freeLegIfEmpty fLData slotL
     freeLegIfEmpty fSData slotS
@@ -1030,11 +1075,12 @@ def handleTrade (input : Ptr) : SolanaM Unit := do
     -- Buyer MUST satisfy full cross-margin IM with all legs fresh!
     checkAllLegsFreshLoop fSData curSlot 0
     SolanaM.require ((← loadU64 fSData PflOff.capital) >= (← loadU64 fSData PflOff.totalIm)) PErr.insufficientMargin
-    -- If seller paid an `execPrice` spread, seller MUST remain above `totalMm`!
+    -- If seller paid an `execPrice` spread, all seller legs MUST be fresh and seller >= `totalMm`!
     let markP ← loadU64 mData MktOff.markPrice
     if execPrice != 0 && execPrice != markP then
       let sellerPaid := (mode == 2 && execPrice < markP) || (mode == 3 && execPrice > markP)
       if sellerPaid then
+        checkAllLegsFreshLoop fLData curSlot 0
         SolanaM.require ((← loadU64 fLData PflOff.capital) >= (← loadU64 fLData PflOff.totalMm)) PErr.insufficientMargin
     freeLegIfEmpty fLData slotSell
   else
@@ -1069,6 +1115,7 @@ def handleLiquidate (input : Ptr) : SolanaM Unit := do
   requireKeyEq (AccountView.keyPtr dex) (mData + MktOff.dex) PErr.dexMismatch
   requireKeyEq (AccountView.keyPtr dex) (fData + PflOff.dex) PErr.dexMismatch
   checkDexVaultAndMint dData mint vaultPda tokProg
+  requireKeyNe (AccountView.keyPtr liqTok) (AccountView.keyPtr vaultPda) PErr.aliasedAccounts
 
   SolanaM.require ((← loadU8 mData MktOff.status) == STATUS_ACTIVE) PErr.invalidStatus
   let curSlot ← getClockSlot

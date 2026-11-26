@@ -2504,4 +2504,18 @@ theorem closeAccount_blocks_same_tx_revival
   rw [mem_writeU32_outside s0 data x MAGIC_CLOSED (by omega) (Or.inr hx1)]
   exact hzero0 x (by omega) (by omega)
 
+/-- **Refinement #17 (Permissionless `RefreshLeg` Never Force-Haircuts Unbacked Winner PnL)**:
+    When `forceHaircut = false` (the permissionless 3-account `RefreshLeg` path) and
+    `rPool < totalPosPnl` (e.g. losing counterparties have not settled into `R_m` yet),
+    the realization guard `(rPool >= totPnl && totPnl > 0) || forceHaircut` in
+    `Program.settleAndRefreshLeg` ALWAYS evaluates to `false` — so a third party can
+    NEVER permissionlessly wipe a winner's accrued `posPnl` to `0`! -/
+theorem permissionless_refresh_guard_preserves_unbacked_posPnl
+    (rPool totPnl : UInt64) (hunbacked : rPool.toNat < totPnl.toNat) :
+    ((rPool >= totPnl && totPnl > 0) || false) = false := by
+  have hnot : ¬ (rPool ≥ totPnl) := by
+    simp only [ge_iff_le, UInt64.le_iff_toNat_le]
+    omega
+  simp [hnot]
+
 end Percolator.Refinement

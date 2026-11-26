@@ -981,12 +981,12 @@ pub fn test_boring_matcher_amm_single_signer_fills(elf: &[u8], matcher_elf: &[u8
     e.svm.airdrop(&lp_owner.pubkey(), 10_000_000_000).unwrap();
     let lp_tok = create_tok_acc(&mut e.svm, &e.mint, &lp_owner.pubkey(), 2_000 * POS_SCALE);
 
-    let mtch_cfg = create_prog_acc(&mut e.svm, &matcher_prog, 128);
+    let mtch_cfg = create_prog_acc(&mut e.svm, &matcher_prog, 160);
     let (lp_auth_pda, lp_bump) = Address::find_program_address(&[b"lpau", mtch_cfg.as_ref()], &matcher_prog);
     let lp_pfl = create_prog_acc(&mut e.svm, &e.prog_id, PFL_SIZE);
     e.portfolios.push(lp_pfl);
 
-    // InitMatcher: halfSpread=50bps, impact=10bps/unit, maxFill=10 BTC
+    // InitMatcher: halfSpread=50bps, impact=10bps/unit, maxFill=10 BTC, pinned strictly to `btc` market!
     let mut init_d = vec![0u8; 28];
     init_d[0] = 0;
     init_d[1] = lp_bump;
@@ -1004,6 +1004,7 @@ pub fn test_boring_matcher_amm_single_signer_fills(elf: &[u8], matcher_elf: &[u8
                 AccountMeta::new(lp_pfl, false),
                 AccountMeta::new_readonly(lp_auth_pda, false),
                 AccountMeta::new_readonly(e.prog_id, false),
+                AccountMeta::new_readonly(btc, false),
             ],
             data: init_d,
         },
@@ -1495,7 +1496,253 @@ pub fn test_security_revival_and_dirty_init_regressions(elf: &[u8]) {
     assert_eq!(token_amount(&e.svm, &e.dex_vault), 70 * POS_SCALE + 1);
 }
 
-/// Runs all 15 boring everyday exchange + security regression LiteSVM tests as Suite 12.
+/// 16. Audited Security Regressions across ALL 7 newly-hardened vectors:
+///     (a) Permissionless `RefreshLeg(..., forceHaircut=1)` profit-wipe attack REJECTED!
+///     (b) `Matcher::Fill` `mode=2/3` LP spread-drain & rogue-market fill REJECTED!
+///     (c) `InitDex` with active `quoteMint` freeze authority REJECTED!
+///     (d) Insurance share-pool attacks (`totSh=0 && ins>0` fee/donation capture, `<1 USDC` dust
+///         first-LP deposit, drained-pool `totSh>0 && ins=0` revival) ALL REJECTED!
+///     (e) SPL self-transfers (`destTok == vaultPda`, `liqTok == vaultPda`, `ownerTok == vaultPda`) REJECTED!
+///     (f) Stale cross-leg spread payer in `Trade(mode=1, execPrice != markP)` REJECTED!
+///     (g) Worthless `InsReceipt` (`shares > 0, ins == 0`) still burnable & rent-reclaimable AFTER `TombstoneMarket`!
+pub fn test_audited_security_regressions(elf: &[u8], matcher_elf: &[u8]) {
+    let mut e = BoringEnv::new(elf);
+    let matcher_prog = Keypair::new().pubkey();
+    e.svm.add_program(matcher_prog, matcher_elf).expect("matcher ELF load failed");
+
+    let btc = e.create_market(100 * POS_SCALE, 10, 1000, 500, 100, 0, 400);
+    let eth = e.create_market(100 * POS_SCALE, 10, 1000, 500, 100, 0, 400);
+    let alice = e.create_trader(1_000 * POS_SCALE, 200 * POS_SCALE);
+    let bob   = e.create_trader(1_000 * POS_SCALE, 200 * POS_SCALE);
+
+    // (a) Permissionless `RefreshLeg(..., forceHaircut=1)` profit-wipe attack MUST FAIL!
+    //     Alice Short 10 BTC vs Bob Long 10 BTC at $100; BTC pumps +4% -> Bob gains +$40 while R_btc == 0.
+    e.trade(btc, &bob, &alice, 0, 10 * POS_SCALE);
+    e.update_oracle(btc, 104 * POS_SCALE, 0, 0);
+    assert_eq!(read_u64(&e.svm, &btc, 216), 0, "R_btc must be 0 before losing Short settles");
+    // 3-account permissionless RefreshLeg(forceHaircut=1) on Bob MUST fail!
+    send_err(
+        &mut e.svm,
+        ix_refresh_leg(e.prog_id, e.dex, btc, bob.pfl, true),
+        &e.payer,
+        &[&e.payer],
+        "Permissionless RefreshLeg(forceHaircut=1) must fail",
+    );
+    // 4-account RefreshLeg(forceHaircut=1) signed by Alice (wrong owner!) MUST fail!
+    send_err(
+        &mut e.svm,
+        ix_refresh_leg_signed(e.prog_id, e.dex, btc, bob.pfl, alice.kp.pubkey(), true),
+        &e.payer,
+        &[&e.payer, &alice.kp],
+        "RefreshLeg(forceHaircut=1) signed by non-owner must fail",
+    );
+    // Normal permissionless RefreshLeg(forceHaircut=0) on Bob preserves his $40 posPnl intact!
+    send_ok(&mut e.svm, ix_refresh_leg(e.prog_id, e.dex, btc, bob.pfl, false), &e.payer, &[&e.payer]);
+    assert_eq!(read_u64(&e.svm, &btc, 240), 40 * POS_SCALE, "Bob's $40 totalPosPnl must NOT be wiped");
+    // Once Alice settles (-$40 into R_btc), Bob refreshes & receives 100% of his $40!
+    send_ok(&mut e.svm, ix_refresh_leg(e.prog_id, e.dex, btc, alice.pfl, false), &e.payer, &[&e.payer]);
+    send_ok(&mut e.svm, ix_refresh_leg(e.prog_id, e.dex, btc, bob.pfl, false), &e.payer, &[&e.payer]);
+    assert_eq!(read_u64(&e.svm, &bob.pfl, 88), 240 * POS_SCALE, "Bob must receive full $40 profit");
+
+    // (f) Stale-leg spread payer in Trade(mode=1, execPrice != markP) MUST FAIL!
+    //     Open an ETH leg on Bob & Alice, advance slot & refresh ONLY BTC (leaving ETH stale),
+    //     then try Trade(mode=1, BTC, execPrice=$106 > $104) where Bob pays spread while ETH is stale!
+    e.trade(eth, &bob, &alice, 0, 2 * POS_SCALE);
+    e.update_oracle(btc, 104 * POS_SCALE, 0, 0); // advances slot -> ETH leg is now stale!
+    send_err(
+        &mut e.svm,
+        ix_trade_ext(e.prog_id, e.dex, btc, bob.pfl, bob.kp.pubkey(), alice.pfl, alice.kp.pubkey(), 1, 2 * POS_SCALE, 106 * POS_SCALE),
+        &e.payer,
+        &[&e.payer, &bob.kp, &alice.kp],
+        "Trade(mode=1) with execPrice spread must reject stale second leg on spread payer",
+    );
+    // Close both legs cleanly at mark (0 spread)
+    e.trade(btc, &bob, &alice, 1, 10 * POS_SCALE);
+    e.trade(eth, &bob, &alice, 1, 2 * POS_SCALE);
+
+    // (b) Matcher::Fill mode=2 LP spread-drain & rogue-market fill MUST FAIL!
+    let lp_owner = Keypair::new();
+    e.svm.airdrop(&lp_owner.pubkey(), 10_000_000_000).unwrap();
+    let lp_tok = create_tok_acc(&mut e.svm, &e.mint, &lp_owner.pubkey(), 2_000 * POS_SCALE);
+    let mtch_cfg = create_prog_acc(&mut e.svm, &matcher_prog, 160);
+    let (lp_auth_pda, lp_bump) = Address::find_program_address(&[b"lpau", mtch_cfg.as_ref()], &matcher_prog);
+    let lp_pfl = create_prog_acc(&mut e.svm, &e.prog_id, PFL_SIZE);
+    e.portfolios.push(lp_pfl);
+    let mut init_m = vec![0u8; 28];
+    init_m[0] = 0; init_m[1] = lp_bump;
+    init_m[4..12].copy_from_slice(&100u64.to_le_bytes()); // 100 bps halfSpread
+    init_m[12..20].copy_from_slice(&0u64.to_le_bytes());
+    init_m[20..28].copy_from_slice(&(10 * POS_SCALE).to_le_bytes());
+    send_ok(
+        &mut e.svm,
+        Instruction {
+            program_id: matcher_prog,
+            accounts: vec![
+                AccountMeta::new(mtch_cfg, false),
+                AccountMeta::new_readonly(lp_owner.pubkey(), true),
+                AccountMeta::new(e.dex, false),
+                AccountMeta::new(lp_pfl, false),
+                AccountMeta::new_readonly(lp_auth_pda, false),
+                AccountMeta::new_readonly(e.prog_id, false),
+                AccountMeta::new_readonly(btc, false), // pinned strictly to BTC!
+            ],
+            data: init_m,
+        },
+        &e.payer,
+        &[&e.payer, &lp_owner],
+    );
+    send_ok(
+        &mut e.svm,
+        ix_deposit_collateral(e.prog_id, e.dex, lp_pfl, lp_owner.pubkey(), lp_tok, e.mint, e.dex_vault, TOKEN_PROGRAM_ID, 500 * POS_SCALE),
+        &e.payer,
+        &[&e.payer, &lp_owner],
+    );
+    // Open a real Long on Bob via Matcher(mode=0), then attempt mode=2 hand-off spread-drain!
+    let mk_mfill = |mkt_addr: Address, mode: u8, qty: u64| {
+        let mut d = vec![0u8; 19];
+        d[0] = 2; d[1] = mode; d[2] = 1; // takerIsLong = 1
+        d[3..11].copy_from_slice(&qty.to_le_bytes());
+        Instruction {
+            program_id: matcher_prog,
+            accounts: vec![
+                AccountMeta::new_readonly(mtch_cfg, false),
+                AccountMeta::new(e.dex, false),
+                AccountMeta::new(mkt_addr, false),
+                AccountMeta::new(lp_pfl, false),
+                AccountMeta::new_readonly(lp_auth_pda, false),
+                AccountMeta::new(bob.pfl, false),
+                AccountMeta::new_readonly(bob.kp.pubkey(), true),
+                AccountMeta::new_readonly(e.prog_id, false),
+            ],
+            data: d,
+        }
+    };
+    send_ok(&mut e.svm, mk_mfill(btc, 0, POS_SCALE), &e.payer, &[&e.payer, &bob.kp]);
+    send_err_custom(&mut e.svm, mk_mfill(btc, 2, POS_SCALE), &e.payer, &[&e.payer, &bob.kp], 206, "Matcher::Fill must reject mode=2 hand-off");
+    send_err_custom(&mut e.svm, mk_mfill(btc, 3, POS_SCALE), &e.payer, &[&e.payer, &bob.kp], 206, "Matcher::Fill must reject mode=3 hand-off");
+    send_err_custom(&mut e.svm, mk_mfill(eth, 0, POS_SCALE), &e.payer, &[&e.payer, &bob.kp], 205, "Matcher::Fill must reject unpinned market");
+    send_ok(&mut e.svm, mk_mfill(btc, 1, POS_SCALE), &e.payer, &[&e.payer, &bob.kp]);
+
+    // (c) InitDex with active `quoteMint` freeze authority MUST FAIL (legacy #487)!
+    let frozen_mint = Keypair::new().pubkey();
+    let mut frozen_data = make_spl_mint(6, 100_000_000_000, &e.admin.pubkey());
+    frozen_data[46..50].copy_from_slice(&1u32.to_le_bytes()); // COption::Some
+    frozen_data[50..82].copy_from_slice(e.admin.pubkey().as_ref());
+    e.svm.set_account(
+        frozen_mint,
+        Account { lamports: 10_000_000, data: frozen_data, owner: TOKEN_PROGRAM_ID, executable: false, rent_epoch: 0 },
+    ).unwrap();
+    let bad_dex = create_prog_acc(&mut e.svm, &e.prog_id, DEX_SIZE);
+    let (bad_vault, bad_bump) = derive_dex_vault(&e.prog_id, &bad_dex);
+    send_err(
+        &mut e.svm,
+        ix_init_dex(e.prog_id, bad_dex, e.admin.pubkey(), frozen_mint, bad_vault, e.fee_vault, TOKEN_PROGRAM_ID, SYSTEM_PROGRAM_ID, bad_bump, 6, 0, SPL_TOKEN_RENT_MIN),
+        &e.payer,
+        &[&e.payer, &e.admin],
+        "InitDex must reject quoteMint with active freeze authority",
+    );
+
+    // (d) Insurance share-pool hardening:
+    //     1. Dust first-LP deposit (`amount = 1 < 1_000_000`) on empty pool MUST fail!
+    let r_dust = create_prog_acc(&mut e.svm, &e.prog_id, INS_SIZE);
+    send_err(
+        &mut e.svm,
+        ix_deposit_insurance(e.prog_id, e.dex, eth, r_dust, lp_owner.pubkey(), lp_tok, e.mint, e.dex_vault, TOKEN_PROGRAM_ID, 1),
+        &e.payer,
+        &[&e.payer, &lp_owner],
+        "First insurance LP deposit < MIN_FIRST_INS_DEPOSIT must fail",
+    );
+    //     2. Donate $10 into ETH (`totSh == 0, ins == $10`), then attempt donate=0 capture -> MUST fail!
+    send_ok(
+        &mut e.svm,
+        ix_deposit_insurance_ext(e.prog_id, e.dex, eth, eth, lp_owner.pubkey(), lp_tok, e.mint, e.dex_vault, TOKEN_PROGRAM_ID, 10 * POS_SCALE, true),
+        &e.payer,
+        &[&e.payer, &lp_owner],
+    );
+    send_err_custom(
+        &mut e.svm,
+        ix_deposit_insurance(e.prog_id, e.dex, eth, r_dust, lp_owner.pubkey(), lp_tok, e.mint, e.dex_vault, TOKEN_PROGRAM_ID, 5 * POS_SCALE),
+        &e.payer,
+        &[&e.payer, &lp_owner],
+        119,
+        "DepositInsurance(donate=0) must reject capturing pre-existing unowned insurance (totSh=0, ins>0)",
+    );
+
+    // (e) SPL self-transfer (`destTok == vaultPda`, `ownerTok == vaultPda`) MUST FAIL!
+    send_err_custom(
+        &mut e.svm,
+        ix_withdraw_collateral(e.prog_id, e.dex, bob.pfl, bob.kp.pubkey(), e.dex_vault, e.mint, e.dex_vault, TOKEN_PROGRAM_ID, POS_SCALE),
+        &e.payer,
+        &[&e.payer, &bob.kp],
+        109,
+        "WithdrawCollateral must reject destTok == vaultPda self-transfer",
+    );
+    send_err_custom(
+        &mut e.svm,
+        ix_deposit_collateral(e.prog_id, e.dex, bob.pfl, bob.kp.pubkey(), e.dex_vault, e.mint, e.dex_vault, TOKEN_PROGRAM_ID, POS_SCALE),
+        &e.payer,
+        &[&e.payer, &bob.kp],
+        109,
+        "DepositCollateral must reject ownerTok == vaultPda self-transfer",
+    );
+
+    // (g) Drained pool (`totSh > 0, ins == 0`) blocks new LP deposit revival, AND worthless shares
+    //     remain burnable + rent-reclaimable EVEN AFTER permissionless TombstoneMarket!
+    let dead_mkt = e.create_market(100 * POS_SCALE, 10, 1000, 500, 100, 0, 400);
+    let r_lp1 = create_prog_acc(&mut e.svm, &e.prog_id, INS_SIZE);
+    send_ok(
+        &mut e.svm,
+        ix_deposit_insurance(e.prog_id, e.dex, dead_mkt, r_lp1, lp_owner.pubkey(), lp_tok, e.mint, e.dex_vault, TOKEN_PROGRAM_ID, 5 * POS_SCALE),
+        &e.payer,
+        &[&e.payer, &lp_owner],
+    );
+    // Simulate market insurance drained to 0 while LP1 still holds 5_000_000 worthless shares
+    // (keep Dex.totalInsurance & Dex.vaultBalance coherent by moving $5 to Dex.totalSurplus / resolved dust).
+    let mut dm = e.svm.get_account(&dead_mkt).unwrap();
+    dm.data[224..232].copy_from_slice(&0u64.to_le_bytes()); // MktOff.insurance = 0 (totSh still 5M!)
+    e.svm.set_account(dead_mkt, dm).unwrap();
+    let mut dx = e.svm.get_account(&e.dex).unwrap();
+    let old_ti = u64::from_le_bytes(dx.data[176..184].try_into().unwrap());
+    let old_ts = u64::from_le_bytes(dx.data[192..200].try_into().unwrap());
+    dx.data[176..184].copy_from_slice(&(old_ti - 5 * POS_SCALE).to_le_bytes());
+    dx.data[192..200].copy_from_slice(&(old_ts + 5 * POS_SCALE).to_le_bytes());
+    e.svm.set_account(e.dex, dx).unwrap();
+
+    // New LP2 attempting to deposit into drained pool (`totSh > 0, ins == 0`) MUST FAIL!
+    let r_lp2 = create_prog_acc(&mut e.svm, &e.prog_id, INS_SIZE);
+    send_err_custom(
+        &mut e.svm,
+        ix_deposit_insurance(e.prog_id, e.dex, dead_mkt, r_lp2, alice.kp.pubkey(), alice.tok, e.mint, e.dex_vault, TOKEN_PROGRAM_ID, 10 * POS_SCALE),
+        &e.payer,
+        &[&e.payer, &alice.kp],
+        119,
+        "DepositInsurance must reject drained pool with nonzero dead shares (totSh>0, ins=0)",
+    );
+
+    // Permissionless StartWindDown -> ResolveMarket -> TombstoneMarket succeeds even while r_lp1 has shares!
+    send_ok(&mut e.svm, ix_start_wind_down(e.prog_id, dead_mkt, e.admin.pubkey()), &e.payer, &[&e.payer, &e.admin]);
+    send_ok(&mut e.svm, ix_resolve_market(e.prog_id, e.dex, dead_mkt), &e.payer, &[&e.payer]);
+    send_ok(&mut e.svm, ix_tombstone_market(e.prog_id, dead_mkt), &e.payer, &[&e.payer]);
+
+    // LP1 burns worthless shares (`payout == 0`) EVEN ON TOMBSTONED MARKET, then closes InsReceipt for 100% rent!
+    let tok_before = token_amount(&e.svm, &lp_tok);
+    send_ok(
+        &mut e.svm,
+        ix_withdraw_insurance(e.prog_id, e.dex, dead_mkt, r_lp1, lp_owner.pubkey(), lp_tok, e.mint, e.dex_vault, TOKEN_PROGRAM_ID, 5 * POS_SCALE),
+        &e.payer,
+        &[&e.payer, &lp_owner],
+    );
+    assert_eq!(token_amount(&e.svm, &lp_tok), tok_before, "Worthless share burn must pay 0");
+    assert_eq!(read_u64(&e.svm, &r_lp1, 80), 0, "InsReceipt shares must now be 0");
+    let dest = Keypair::new().pubkey();
+    e.svm.set_account(dest, Account { lamports: 1_000_000, data: vec![], owner: SYSTEM_PROGRAM_ID, executable: false, rent_epoch: 0 }).unwrap();
+    send_ok(&mut e.svm, ix_close_account(e.prog_id, r_lp1, lp_owner.pubkey(), dest), &e.payer, &[&e.payer, &lp_owner]);
+    assert_eq!(e.svm.get_account(&dest).unwrap().lamports, 11_000_000, "LP1 must reclaim 100% InsReceipt rent after tombstone!");
+
+    e.check("t16-final");
+}
+
+/// Runs all 16 boring everyday exchange + security regression LiteSVM tests as Suite 12.
 pub fn run_all_boring_tests(elf: &[u8], matcher_elf: &[u8]) {
     test_boring_deposit_withdraw_roundtrip(elf);
     test_boring_simple_long_short_profit_and_loss(elf);
@@ -1512,9 +1759,10 @@ pub fn run_all_boring_tests(elf: &[u8], matcher_elf: &[u8]) {
     test_boring_insurance_lp_deposit_fee_yield_withdraw(elf);
     test_boring_market_winddown_exit_orders_and_tombstone(elf);
     test_security_revival_and_dirty_init_regressions(elf);
-    println!("[PASS] Suite 12: 15 Boring Exchange & Mainnet Revival-Exploit Regression LiteSVM Tests (Deposits, Scale-In/Out,");
+    test_audited_security_regressions(elf, matcher_elf);
+    println!("[PASS] Suite 12: 16 Boring Exchange & Audited Security Regression LiteSVM Tests (Deposits, Scale-In/Out,");
     println!("       Flips, Spreads, Funding, 3 Exit-Order Permutations, Partial+Full Liq, HLP Takeover, Cross-Margin Reuse,");
-    println!("       AMM Matcher, LP Yield, WindDown, & Same-Tx Revival / Dirty-Init / Exact-Size / Share-Bound Regressions)");
+    println!("       AMM Matcher, LP Yield, WindDown, Revival/Dirty-Init, ForceHaircut, FreezeMint, SharePool & Self-Transfer!)");
 }
 
 #[cfg(test)]
@@ -1545,4 +1793,5 @@ mod tests {
     #[test] fn boring_13_insurance_lp_deposit_yield_withdraw() { let (e, _) = load_elfs(); test_boring_insurance_lp_deposit_fee_yield_withdraw(&e); }
     #[test] fn boring_14_market_winddown_exit_and_tombstone() { let (e, _) = load_elfs(); test_boring_market_winddown_exit_orders_and_tombstone(&e); }
     #[test] fn boring_15_security_revival_and_dirty_init_regressions() { let (e, _) = load_elfs(); test_security_revival_and_dirty_init_regressions(&e); }
+    #[test] fn boring_16_audited_security_regressions() { let (e, m) = load_elfs(); test_audited_security_regressions(&e, &m); }
 }

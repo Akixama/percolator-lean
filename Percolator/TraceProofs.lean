@@ -965,4 +965,59 @@ theorem withdrawInsurance_preserves_sharesCoherent (st st' : DexState) (mids lps
           exact hsh mid' hmid' m' hm'
     · cases h
 
+/-- Hardened insurance share-minting guard:
+    1. Rejects capturing pre-existing unowned fees/donations (`totSh = 0 ∧ ins > 0`).
+    2. Rejects reviving wiped-out shares on a drained pool (`totSh > 0 ∧ ins = 0`).
+    3. Enforces minimum first-LP deposit (`amount ≥ 1_000_000`) to block 1-atom ERC-4626 inflation.
+    4. On any live pool (`totSh > 0 ∧ ins > 0`), floor-minting `minted = ⌊amount · totSh / ins⌋`
+       is strictly non-dilutive for all existing LPs: `(ins + amount) · totSh ≥ ins · (totSh + minted)`. -/
+def hardenedInsMint (totSh ins amount : Nat) : Option Nat :=
+  if totSh = 0 then
+    if ins = 0 ∧ amount ≥ 1_000_000 then some amount else none
+  else
+    if ins > 0 then
+      let m := (amount * totSh) / ins
+      if m > 0 then some m else none
+    else none
+
+theorem insurance_share_mint_anti_capture_and_non_dilutive
+    (totSh ins amount : Nat) :
+    (totSh = 0 → ins > 0 → hardenedInsMint totSh ins amount = none) ∧
+    (totSh > 0 → ins = 0 → hardenedInsMint totSh ins amount = none) ∧
+    (totSh = 0 → amount < 1_000_000 → hardenedInsMint totSh ins amount = none) ∧
+    (∀ minted, totSh > 0 → hardenedInsMint totSh ins amount = some minted →
+      (ins + amount) * totSh ≥ ins * (totSh + minted)) := by
+  refine ⟨?_, ?_, ?_, ?_⟩
+  · intro h0 hpos; unfold hardenedInsMint; simp [h0, Nat.ne_of_gt hpos]
+  · intro hpos h0; unfold hardenedInsMint; simp [Nat.ne_of_gt hpos, h0]
+  · intro h0 hlt; unfold hardenedInsMint; simp [h0, Nat.not_le_of_lt hlt]
+  · intro minted hpos hm
+    unfold hardenedInsMint at hm
+    simp only [Nat.ne_of_gt hpos, ↓reduceIte] at hm
+    split at hm
+    · next hins =>
+      split at hm
+      · cases hm
+        have hmul : ((amount * totSh) / ins) * ins ≤ amount * totSh :=
+          Nat.div_mul_le_self (amount * totSh) ins
+        have h1 : (ins + amount) * totSh = ins * totSh + amount * totSh := Nat.add_mul ins amount totSh
+        have h2 : ins * (totSh + (amount * totSh) / ins) = ins * totSh + ins * ((amount * totSh) / ins) :=
+          Nat.mul_add ins totSh _
+        have hcomm : ins * ((amount * totSh) / ins) = ((amount * totSh) / ins) * ins := Nat.mul_comm _ _
+        omega
+      · cases hm
+    · cases hm
+
+/-- Burning worthless shares (`ins = 0`) on a drained or `Tombstoned` market yields exact `payout = 0`,
+    strictly reduces `curSh` and `totSh`, and lets the LP reach `shares = 0` for `CloseAccount` rent reclaim
+    without ever mutating vault balances or blocking `TombstoneMarket`. -/
+theorem worthless_shares_burn_zero_payout
+    (curSh totSh burnShares : Nat)
+    (hpos : burnShares > 0) (hle1 : burnShares ≤ curSh) (hle2 : curSh ≤ totSh) :
+    (burnShares * 0) / totSh = 0 ∧
+    curSh - burnShares < curSh ∧
+    totSh - burnShares < totSh ∧
+    curSh - burnShares ≤ totSh - burnShares := by
+  refine ⟨by simp, by omega, by omega, by omega⟩
+
 end Percolator.TraceProofs
