@@ -2022,6 +2022,8 @@ def handleTradeWithMatcher (input : Ptr) : SolanaM Unit := do
   let afterMkts ← prepMatcherOffersLoop mkt0 ctxBuf 0
   let reqLen := 32 + k * 48
   if n >= 7 + k then
+    -- Reject duplicate account markers (blocks stub-overread AND aliasing core/signer accounts as extraAcc!)
+    SolanaM.require ((← rawLoadU8 afterMkts) == ABI.nonDupMarker) PErr.aliasedAccounts
     cpiCallMatcher matcherProg matcherCtx afterMkts reqBuf ((reqLen <<< 8) ||| 2)
   else
     cpiCallMatcher matcherProg matcherCtx 0 reqBuf ((reqLen <<< 8) ||| 1)

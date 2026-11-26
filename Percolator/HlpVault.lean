@@ -244,6 +244,16 @@ def checkSplTokenProg (tokProg : AccountView) : SolanaM Unit := do
   let w3 ← loadU64 kp 24
   SolanaM.require (w0 == SPL_TOK_W0 && w1 == SPL_TOK_W1 && w2 == SPL_TOK_W2 && w3 == SPL_TOK_W3) PErr.invalidTokenProg
 
+def checkSplTokenOwnerPtr (ownerPtr : Ptr) : SolanaM Unit := do
+  let w0 ← loadU64 ownerPtr 0
+  let w1 ← loadU64 ownerPtr 8
+  let w2 ← loadU64 ownerPtr 16
+  let w3 ← loadU64 ownerPtr 24
+  SolanaM.require (w0 == SPL_TOK_W0 && w1 == SPL_TOK_W1 && w2 == SPL_TOK_W2 && w3 == SPL_TOK_W3) HErr.feeTokBad
+
+def requireNonDup (acc : AccountView) : SolanaM Unit := do
+  SolanaM.require ((← rawLoadU8 acc) == ABI.nonDupMarker) PErr.aliasedAccounts
+
 def checkHlpVault (vault : AccountView) (progId : Ptr) : SolanaM Unit := do
   SolanaM.require (← pubkeyEq (AccountView.ownerPtr vault) progId) Err.illegalOwner
   SolanaM.require ((← AccountView.dataLen vault) == HlpOff.size) Err.invalidAccountData
@@ -308,12 +318,14 @@ def loadFreshHlpNav (vData : Ptr) (hlpPfl percProg : AccountView) (curSlot : UIn
   let rc ← sysInvokeSignedC buf infos 3 signersArr 1
   SolanaM.require (rc == 0) rc
 
-@[noinline] def cpiDepositCollateral (percProg : AccountView) (accs7 : Ptr) (amount : UInt64)
+/-- Unified 7-account CPI into `percolator::DepositCollateral` (op=6) or `WithdrawCollateral` (op=7).
+    `usePdaSigner = 1` signs with PDA `["hlpv", vault, bump]`; `0` forwards depositor's top-level signature. -/
+@[noinline] def cpiVaultTransfer7 (percProg : AccountView) (accs7 : Ptr) (op : UInt8) (amount : UInt64)
     (vaultKeyPtr : Ptr) (bump : UInt8) (usePdaSigner : UInt8) : SolanaM Unit := do
   let dex      ← loadU64 accs7 0
   let hlpPfl   ← loadU64 accs7 8
   let owner    ← loadU64 accs7 16
-  let ownerTok ← loadU64 accs7 24
+  let tokAcc   ← loadU64 accs7 24
   let mint     ← loadU64 accs7 32
   let dexVault ← loadU64 accs7 40
   let tokProg  ← loadU64 accs7 48
@@ -322,19 +334,19 @@ def loadFreshHlpNav (vData : Ptr) (hlpPfl percProg : AccountView) (curSlot : UIn
   let infos := buf + 152
   let data  := buf + 544
   let sbuf  := buf + 560
-  storeU8  data 0 IxOp.depositCollateral
+  storeU8  data 0 op
   storeU64 data 1 amount
   writeMeta metas        dex      1 0
   writeMeta (metas + 16) hlpPfl   1 0
   writeMeta (metas + 32) owner    0 1
-  writeMeta (metas + 48) ownerTok 1 0
+  writeMeta (metas + 48) tokAcc   1 0
   writeMeta (metas + 64) mint     0 0
   writeMeta (metas + 80) dexVault 1 0
   writeMeta (metas + 96) tokProg  0 0
   writeAccountInfo infos         dex
   writeAccountInfo (infos + 56)  hlpPfl
   writeAccountInfo (infos + 112) owner
-  writeAccountInfo (infos + 168) ownerTok
+  writeAccountInfo (infos + 168) tokAcc
   writeAccountInfo (infos + 224) mint
   writeAccountInfo (infos + 280) dexVault
   writeAccountInfo (infos + 336) tokProg
@@ -344,41 +356,6 @@ def loadFreshHlpNav (vData : Ptr) (hlpPfl percProg : AccountView) (curSlot : UIn
       sysInvokeSignedC buf infos 7 signersArr 1
     else
       sysInvokeSignedC buf infos 7 0 0
-  SolanaM.require (rc == 0) rc
-
-@[noinline] def cpiWithdrawCollateralSigned (percProg : AccountView) (accs7 : Ptr) (amount : UInt64)
-    (vaultKeyPtr : Ptr) (bump : UInt8) : SolanaM Unit := do
-  let dex        ← loadU64 accs7 0
-  let hlpPfl     ← loadU64 accs7 8
-  let hlpAuthPda ← loadU64 accs7 16
-  let destTok    ← loadU64 accs7 24
-  let mint       ← loadU64 accs7 32
-  let dexVault   ← loadU64 accs7 40
-  let tokProg    ← loadU64 accs7 48
-  let buf ← stackAlloc 632
-  let metas := buf + 40
-  let infos := buf + 152
-  let data  := buf + 544
-  let sbuf  := buf + 560
-  storeU8  data 0 IxOp.withdrawCollateral
-  storeU64 data 1 amount
-  writeMeta metas        dex        1 0
-  writeMeta (metas + 16) hlpPfl     1 0
-  writeMeta (metas + 32) hlpAuthPda 0 1
-  writeMeta (metas + 48) destTok    1 0
-  writeMeta (metas + 64) mint       0 0
-  writeMeta (metas + 80) dexVault   1 0
-  writeMeta (metas + 96) tokProg    0 0
-  writeAccountInfo infos         dex
-  writeAccountInfo (infos + 56)  hlpPfl
-  writeAccountInfo (infos + 112) hlpAuthPda
-  writeAccountInfo (infos + 168) destTok
-  writeAccountInfo (infos + 224) mint
-  writeAccountInfo (infos + 280) dexVault
-  writeAccountInfo (infos + 336) tokProg
-  writeInstruction buf (AccountView.keyPtr percProg) metas 7 data 9
-  let signersArr ← writeHlpPdaSeeds sbuf vaultKeyPtr bump
-  let rc ← sysInvokeSignedC buf infos 7 signersArr 1
   SolanaM.require (rc == 0) rc
 
 @[noinline] def cpiTakeoverLiquidateSigned (percProg : AccountView) (accs9 : Ptr) (reqQty : UInt64)
@@ -438,17 +415,21 @@ def handleInitHlpVault (input : Ptr) : SolanaM Unit := do
   SolanaM.require ((← AccountView.dataLen vault) == HlpOff.size) Err.invalidAccountData
   SolanaM.require ((← loadU32 (AccountView.dataPtr vault) 0) == 0) Err.accountAlreadyInitialized
 
-  -- Validate `dex` belongs to `percProg` and `hlpFeeTok` is an initialized SPL Token account
-  -- matching `dex.quoteMint` owned by `hlpAuthPda`!
+  -- Validate non-duplicate accounts, genuine `dex` owned by `percProg`, and canonical SPL Token
+  -- `hlpFeeTok` (165B initialized, amount == 0, mint == dex.quoteMint, owner == hlpAuthPda, != dexVault)!
+  requireNonDup dex; requireNonDup hlpPfl; requireNonDup hlpAuthPda
+  requireNonDup hlpFeeTok; requireNonDup percProg
   SolanaM.require (← pubkeyEq (AccountView.ownerPtr dex) (AccountView.keyPtr percProg)) Err.illegalOwner
   SolanaM.require ((← AccountView.dataLen dex) == DexOff.size) Err.invalidAccountData
   let dData := AccountView.dataPtr dex
   SolanaM.require ((← loadU32 dData DexOff.magic) == MAGIC_DEX) PErr.invalidMagic
-  SolanaM.require ((← AccountView.dataLen hlpFeeTok) >= 165) HErr.feeTokBad
+  checkSplTokenOwnerPtr (AccountView.ownerPtr hlpFeeTok)
+  SolanaM.require ((← AccountView.dataLen hlpFeeTok) == 165) HErr.feeTokBad
   let ftData := AccountView.dataPtr hlpFeeTok
-  SolanaM.require ((← loadU8 ftData 108) == 1) HErr.feeTokBad
+  SolanaM.require ((← loadU8 ftData 108) == 1 && (← loadU64 ftData 64) == 0) HErr.feeTokBad
   SolanaM.require (← pubkeyEq ftData (dData + DexOff.quoteMint)) PErr.mintMismatch
   SolanaM.require (← pubkeyEq (ftData + 32) (AccountView.keyPtr hlpAuthPda)) HErr.feeTokBad
+  SolanaM.require (!(← pubkeyEq (AccountView.keyPtr hlpFeeTok) (dData + DexOff.vaultPda))) PErr.aliasedAccounts
 
   let pdaBump     ← loadU8  ix.ptr 1
   let lockupSlots ← loadU64 ix.ptr 4
@@ -485,6 +466,7 @@ def handleSetHlpMatcher (input : Ptr) : SolanaM Unit := do
   let hlpAuthPda ← AccountView.nextCursor hlpPfl
   let percProg   ← AccountView.nextCursor hlpAuthPda
 
+  requireNonDup hlpPfl; requireNonDup hlpAuthPda; requireNonDup percProg
   SolanaM.require (← AccountView.isSigner strategist) Err.missingRequiredSignature
   SolanaM.require (← AccountView.isWritable vault) Err.invalidAccountData
   checkHlpVault vault progId
@@ -537,6 +519,8 @@ def handleDepositHlp (input : Ptr) : SolanaM Unit := do
   let tokProg      ← AccountView.nextCursor dexVault
   let percProg     ← AccountView.nextCursor tokProg
 
+  requireNonDup receipt; requireNonDup dex; requireNonDup hlpPfl
+  requireNonDup tokProg; requireNonDup percProg
   SolanaM.require (← AccountView.isSigner depositor) Err.missingRequiredSignature
   SolanaM.require (← AccountView.isWritable vault) Err.invalidAccountData
   SolanaM.require (← AccountView.isWritable receipt) Err.invalidAccountData
@@ -596,7 +580,7 @@ def handleDepositHlp (input : Ptr) : SolanaM Unit := do
   storeU64 accs7 32 mint
   storeU64 accs7 40 dexVault
   storeU64 accs7 48 tokProg
-  cpiDepositCollateral percProg accs7 amount 0 0 0
+  cpiVaultTransfer7 percProg accs7 IxOp.depositCollateral amount 0 0 0
 
 /-- Op 3 (`WithdrawHlp`): 100% permissionless (NEVER pausable!) pro-rata withdrawal against
     conservative realized `hlpPfl.capital`. Auto-closes `HlpReceipt` (`MAGIC_CLOSED` + rent
@@ -619,6 +603,8 @@ def handleWithdrawHlp (input : Ptr) : SolanaM Unit := do
   let tokProg    ← AccountView.nextCursor dexVault
   let percProg   ← AccountView.nextCursor tokProg
 
+  requireNonDup receipt; requireNonDup owner; requireNonDup dex
+  requireNonDup hlpPfl; requireNonDup tokProg; requireNonDup percProg
   SolanaM.require (← AccountView.isSigner owner) Err.missingRequiredSignature
   SolanaM.require (← AccountView.isWritable vault) Err.invalidAccountData
   SolanaM.require (← AccountView.isWritable receipt) Err.invalidAccountData
@@ -672,7 +658,7 @@ def handleWithdrawHlp (input : Ptr) : SolanaM Unit := do
     storeU64 accs7 40 dexVault
     storeU64 accs7 48 tokProg
     let bump ← loadU8 vData HlpOff.pdaBump
-    cpiWithdrawCollateralSigned percProg accs7 payout (AccountView.keyPtr vault) bump
+    cpiVaultTransfer7 percProg accs7 IxOp.withdrawCollateral payout (AccountView.keyPtr vault) bump 1
 
 /-- Op 4 (`HlpTakeoverLiquidate`): Strategist-gated zero-ADL liquidation takeover
     (`percolator::Liquidate(mode=1)`). Routes 100% of keeper liquidation fees to `hlpFeeTok`
@@ -696,6 +682,9 @@ def handleHlpTakeoverLiquidate (input : Ptr) : SolanaM Unit := do
   let hlpAuthPda ← AccountView.nextCursor hlpPfl
   let percProg   ← AccountView.nextCursor hlpAuthPda
 
+  requireNonDup dex; requireNonDup mkt; requireNonDup victimPfl
+  requireNonDup hlpFeeTok; requireNonDup tokProg; requireNonDup hlpPfl
+  requireNonDup hlpAuthPda; requireNonDup percProg
   SolanaM.require (← AccountView.isSigner strategist) Err.missingRequiredSignature
   checkHlpVault vault progId
   let vData := AccountView.dataPtr vault
@@ -734,7 +723,7 @@ def handleHlpTakeoverLiquidate (input : Ptr) : SolanaM Unit := do
     storeU64 accs7 32 mint
     storeU64 accs7 40 dexVault
     storeU64 accs7 48 tokProg
-    cpiDepositCollateral percProg accs7 gained (AccountView.keyPtr vault) bump 1
+    cpiVaultTransfer7 percProg accs7 IxOp.depositCollateral gained (AccountView.keyPtr vault) bump 1
 
 def dispatch (input : Ptr) : SolanaM Unit := do
   let (_, _, ix, _) ← parseIxOnly input

@@ -68,7 +68,6 @@ namespace RErr
   def epochClosed    : UInt64 := 409
   def epochNotEnded  : UInt64 := 410
   def epochMismatch  : UInt64 := 411
-  def alreadyClaimed : UInt64 := 412
   def vaultMismatch  : UInt64 := 413
 end RErr
 
@@ -119,8 +118,7 @@ end EpochOff
 
 namespace BidOff
   def size     : UInt64 := 120
-  def magic    : UInt64 := 0   -- u32 ("BIDR")
-  def claimed  : UInt64 := 4   -- u8 (0 = open, 1 = claimed)
+  def magic    : UInt64 := 0   -- u32 ("BIDR"; permanently stamped "DEAD" on auto-closing ClaimQuote!)
   def cfg      : UInt64 := 8   -- Pubkey (32)
   def epochAcc : UInt64 := 40  -- Pubkey (32)
   def bidder   : UInt64 := 72  -- Pubkey (32)
@@ -564,6 +562,7 @@ def handleStartEpoch (input : Ptr) : SolanaM Unit := do
   let quoteTokProg ← AccountView.nextCursor quoteVault
   let percProg     ← AccountView.nextCursor quoteTokProg
 
+  SolanaM.require ((← rawLoadU8 epochAcc) == ABI.nonDupMarker) PErr.aliasedAccounts
   SolanaM.require (← AccountView.isWritable cfg) Err.invalidAccountData
   SolanaM.require (← AccountView.isWritable epochAcc) Err.invalidAccountData
   checkRewardCfg cfg progId
@@ -652,6 +651,8 @@ def handleSubmitBid (input : Ptr) : SolanaM Unit := do
   let targetMint      ← AccountView.nextCursor targetEscrow
   let targetTokProg   ← AccountView.nextCursor targetMint
 
+  SolanaM.require ((← rawLoadU8 epochAcc) == ABI.nonDupMarker &&
+                   (← rawLoadU8 bidReceipt) == ABI.nonDupMarker) PErr.aliasedAccounts
   SolanaM.require (← AccountView.isSigner bidder) Err.missingRequiredSignature
   SolanaM.require (← AccountView.isWritable epochAcc) Err.invalidAccountData
   SolanaM.require (← AccountView.isWritable bidReceipt) Err.invalidAccountData
@@ -684,14 +685,12 @@ def handleSubmitBid (input : Ptr) : SolanaM Unit := do
   if rMagic == 0 then
     zeroRewardWords rData 0 (BidOff.size >>> 3)
     storeU32 rData BidOff.magic MAGIC_BID
-    storeU8  rData BidOff.claimed 0
     pubkeyCopy (rData + BidOff.cfg) (AccountView.keyPtr cfg)
     pubkeyCopy (rData + BidOff.epochAcc) (AccountView.keyPtr epochAcc)
     pubkeyCopy (rData + BidOff.bidder) (AccountView.keyPtr bidder)
     storeU64 rData BidOff.epochId epId
   else
     SolanaM.require (rMagic == MAGIC_BID) PErr.invalidMagic
-    SolanaM.require ((← loadU8 rData BidOff.claimed) == 0) RErr.alreadyClaimed
     SolanaM.require (← pubkeyEq (rData + BidOff.cfg) (AccountView.keyPtr cfg)) RErr.epochMismatch
     SolanaM.require (← pubkeyEq (rData + BidOff.epochAcc) (AccountView.keyPtr epochAcc)) RErr.epochMismatch
     SolanaM.require (← pubkeyEq (rData + BidOff.bidder) (AccountView.keyPtr bidder)) PErr.unauthorized
@@ -737,6 +736,7 @@ def handleSettleEpoch (input : Ptr) : SolanaM Unit := do
   let targetMint    ← AccountView.nextCursor targetEscrow
   let targetTokProg ← AccountView.nextCursor targetMint
 
+  SolanaM.require ((← rawLoadU8 epochAcc) == ABI.nonDupMarker) PErr.aliasedAccounts
   SolanaM.require (← AccountView.isWritable cfg) Err.invalidAccountData
   SolanaM.require (← AccountView.isWritable epochAcc) Err.invalidAccountData
   checkRewardCfg cfg progId
@@ -824,7 +824,10 @@ def handleClaimQuote (input : Ptr) : SolanaM Unit := do
   let quoteMint      ← AccountView.nextCursor bidderQuoteTok
   let quoteTokProg   ← AccountView.nextCursor quoteMint
 
+  SolanaM.require ((← rawLoadU8 epochAcc) == ABI.nonDupMarker &&
+                   (← rawLoadU8 bidReceipt) == ABI.nonDupMarker) PErr.aliasedAccounts
   SolanaM.require (← AccountView.isSigner bidder) Err.missingRequiredSignature
+  SolanaM.require ((← rawLoadU8 epochAcc) == ABI.nonDupMarker) PErr.aliasedAccounts
   SolanaM.require (← AccountView.isWritable cfg) Err.invalidAccountData
   SolanaM.require (← AccountView.isWritable epochAcc) Err.invalidAccountData
   SolanaM.require (← AccountView.isWritable bidReceipt) Err.invalidAccountData
@@ -841,7 +844,6 @@ def handleClaimQuote (input : Ptr) : SolanaM Unit := do
   SolanaM.require (← pubkeyEq (AccountView.ownerPtr bidReceipt) progId) Err.illegalOwner
   SolanaM.require ((← AccountView.dataLen bidReceipt) == BidOff.size) Err.invalidAccountData
   SolanaM.require ((← loadU32 rData BidOff.magic) == MAGIC_BID) PErr.invalidMagic
-  SolanaM.require ((← loadU8 rData BidOff.claimed) == 0) RErr.alreadyClaimed
   SolanaM.require (← pubkeyEq (rData + BidOff.cfg) (AccountView.keyPtr cfg)) RErr.epochMismatch
   SolanaM.require (← pubkeyEq (rData + BidOff.epochAcc) (AccountView.keyPtr epochAcc)) RErr.epochMismatch
   SolanaM.require (← pubkeyEq (rData + BidOff.bidder) (AccountView.keyPtr bidder)) PErr.unauthorized

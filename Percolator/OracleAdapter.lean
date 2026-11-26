@@ -539,6 +539,9 @@ def handleInitAdapter (input : Ptr) : SolanaM Unit := do
   SolanaM.require ((← AccountView.dataLen adp) == AdpOff.size) Err.invalidAccountData
   SolanaM.require ((← loadU32 (AccountView.dataPtr adp) 0) == 0) Err.accountAlreadyInitialized
 
+  SolanaM.require ((← rawLoadU8 percProg) == ABI.nonDupMarker &&
+                   (← rawLoadU8 mkt) == ABI.nonDupMarker &&
+                   (← rawLoadU8 feed) == ABI.nonDupMarker) PErr.aliasedAccounts
   -- Pin adapter initialization strictly to the bound market's active `marketAdmin`
   -- (blocks unauthorized claim/hijack of an uninitialized adapter PDA bound to a market!).
   SolanaM.require (← pubkeyEq (AccountView.ownerPtr mkt) (AccountView.keyPtr percProg)) Err.illegalOwner
@@ -571,6 +574,7 @@ def handleInitAdapter (input : Ptr) : SolanaM Unit := do
   if n >= 6 then
     SolanaM.require (qFeedType <= FEED_SWITCHBOARD) OErr.badFeedFormat
     let qFeed ← AccountView.nextCursor feed
+    SolanaM.require ((← rawLoadU8 qFeed) == ABI.nonDupMarker) PErr.aliasedAccounts
     pubkeyCopy (aData + AdpOff.quoteFeed)      (AccountView.keyPtr qFeed)
     pubkeyCopy (aData + AdpOff.quoteFeedOwner) (AccountView.ownerPtr qFeed)
     flags := flags ||| FLAG_HAS_QUOTE
@@ -603,6 +607,9 @@ def handleCrank (input : Ptr) : SolanaM Unit := do
   let oracAuthPda ← AccountView.nextCursor feed
   let percProg    ← AccountView.nextCursor oracAuthPda
 
+  SolanaM.require ((← rawLoadU8 mkt) == ABI.nonDupMarker &&
+                   (← rawLoadU8 feed) == ABI.nonDupMarker &&
+                   (← rawLoadU8 percProg) == ABI.nonDupMarker) PErr.aliasedAccounts
   SolanaM.require (← pubkeyEq (AccountView.ownerPtr adp) progId) Err.illegalOwner
   SolanaM.require ((← AccountView.dataLen adp) == AdpOff.size) Err.invalidAccountData
   let aData := AccountView.dataPtr adp
@@ -650,6 +657,7 @@ def handleCrank (input : Ptr) : SolanaM Unit := do
   let feedPrice ← if (flags &&& FLAG_HAS_QUOTE) != 0 then do
       SolanaM.require (n >= 6) Err.notEnoughAccountKeys
       let qFeed ← AccountView.nextCursor percProg
+      SolanaM.require ((← rawLoadU8 qFeed) == ABI.nonDupMarker) PErr.aliasedAccounts
       let qType ← loadU8 aData AdpOff.quoteFeedType
       let (qP, qC) ← parseOracleFeed qFeed
         (aData + AdpOff.quoteFeed) (aData + AdpOff.quoteFeedOwner) (aData + AdpOff.quoteFeedId)

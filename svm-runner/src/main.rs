@@ -3777,6 +3777,13 @@ fn main() {
         &payer, &[&payer, &prop_taker_kp], 109, "Aliased duplicate market in batch rejected",
     );
 
+    // Duplicate core/signer account passed as `extraAcc` MUST be rejected (`Custom(109)`, blocks ABI dup-stub overread!)
+    send_err_custom(
+        &mut svm,
+        ix_trade_with_matcher(prog_id, r_dex, r_mkts[0], prop_taker_pfl, prop_taker_kp.pubkey(), prop_lp_pfl, matcher_prog, prop_ctx, Some(prop_taker_kp.pubkey()), 0, true, 2 * POS_SCALE, 101 * POS_SCALE),
+        &payer, &[&payer, &prop_taker_kp], 109, "Aliased takerOwner passed as extraAcc rejected",
+    );
+
     // 14.3 Single-market (k=1) CPI-Out Open Long (maxQty=8 > maxFill=5 -> partial-fill 5.0 at standalone ask = $100.70!)
     //      Also passes an optional readonly extra account to verify forwarding!
     let dummy_oracle_acc = create_prog_acc(&mut svm, &matcher_prog, 64);
@@ -4072,6 +4079,20 @@ fn main() {
     let hlp_fee_tok = create_tok_acc(&mut svm, &mint, &hlp_pda, 0);
     let hlp_prop_ctx = create_prog_acc(&mut svm, &matcher_prog, PROP_AMM_SIZE);
     send_ok(&mut svm, ix_init_prop_amm(matcher_prog, hlp_prop_ctx, h_strat.pubkey(), 0, 20, 10, 10 * POS_SCALE), &payer, &[&payer, &h_strat]);
+
+    // Fake non-SPL `hlpFeeTok` rejected (`Custom(505)`)!
+    let fake_fee_tok = create_prog_acc(&mut svm, &hlp_prog, 165);
+    {
+        let mut a = svm.get_account(&fake_fee_tok).unwrap();
+        a.data[0..32].copy_from_slice(mint.as_ref());
+        a.data[32..64].copy_from_slice(hlp_pda.as_ref());
+        a.data[108] = 1;
+        svm.set_account(fake_fee_tok, a).unwrap();
+    }
+    send_err_custom(&mut svm, ix_init_hlp_vault(
+        hlp_prog, hlp_vault, h_strat.pubkey(), h_dex, hlp_pfl, hlp_pda, fake_fee_tok, prog_id,
+        hlp_bump, 10, 0, POS_SCALE,
+    ), &payer, &[&payer, &h_strat], 505, "InitHlpVault rejects fake non-SPL hlpFeeTok");
 
     let cu_hlp_init = send_ok(&mut svm, ix_init_hlp_vault(
         hlp_prog, hlp_vault, h_strat.pubkey(), h_dex, hlp_pfl, hlp_pda, hlp_fee_tok, prog_id,
