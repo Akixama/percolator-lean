@@ -1652,21 +1652,51 @@ pub fn test_audited_security_regressions(elf: &[u8], matcher_elf: &[u8]) {
         &[&e.payer, &lp_owner],
         "First insurance LP deposit < MIN_FIRST_INS_DEPOSIT must fail",
     );
-    //     2. Donate $10 into ETH (`totSh == 0, ins == $10`), then attempt donate=0 capture -> MUST fail!
+    //     2. Donate $10 into ETH (`totSh == 0, ins == $10`), then LP deposits $5 (`>= MIN_FIRST_INS_DEPOSIT`):
+    //        - Deposit MUST succeed (proves 1-atom permissionless donation CANNOT DoS future LPs!)
+    //        - $10 donation is locked behind 10M unowned dead shares (`totSh = 15M`, `lpShares = 5M`)
+    //        - Immediate full withdraw of all 5M shares pays EXACTLY $5 (0 donated funds captured!),
+    //          leaving the $10 donation intact in ETH insurance!
     send_ok(
         &mut e.svm,
         ix_deposit_insurance_ext(e.prog_id, e.dex, eth, eth, lp_owner.pubkey(), lp_tok, e.mint, e.dex_vault, TOKEN_PROGRAM_ID, 10 * POS_SCALE, true),
         &e.payer,
         &[&e.payer, &lp_owner],
     );
-    send_err_custom(
+    let lp_tok_before_dep = token_amount(&e.svm, &lp_tok);
+    send_ok(
         &mut e.svm,
         ix_deposit_insurance(e.prog_id, e.dex, eth, r_dust, lp_owner.pubkey(), lp_tok, e.mint, e.dex_vault, TOKEN_PROGRAM_ID, 5 * POS_SCALE),
         &e.payer,
         &[&e.payer, &lp_owner],
-        119,
-        "DepositInsurance(donate=0) must reject capturing pre-existing unowned insurance (totSh=0, ins>0)",
     );
+    assert_eq!(read_u64(&e.svm, &r_dust, 80), 5 * POS_SCALE, "LP must receive exactly 5M shares");
+    assert_eq!(read_u64(&e.svm, &eth, 248), 15 * POS_SCALE, "totSh must lock 10M donated dead shares + 5M LP shares");
+    send_ok(
+        &mut e.svm,
+        ix_withdraw_insurance(e.prog_id, e.dex, eth, r_dust, lp_owner.pubkey(), lp_tok, e.mint, e.dex_vault, TOKEN_PROGRAM_ID, 5 * POS_SCALE),
+        &e.payer,
+        &[&e.payer, &lp_owner],
+    );
+    assert_eq!(token_amount(&e.svm, &lp_tok), lp_tok_before_dep, "LP withdrawing all shares must recover ONLY its $5 deposit (0 stolen donation!)");
+    assert_eq!(read_u64(&e.svm, &eth, 224), 10 * POS_SCALE, "$10 donated insurance must remain 100% locked in market!");
+    assert_eq!(read_u64(&e.svm, &eth, 248), 10 * POS_SCALE, "10M dead shares remain locking the $10 donation");
+    //     3. Positive test: a second LP deposits $10 after the first LP exits -> mints exact 10M shares & recovers exact $10!
+    send_ok(
+        &mut e.svm,
+        ix_deposit_insurance(e.prog_id, e.dex, eth, r_dust, lp_owner.pubkey(), lp_tok, e.mint, e.dex_vault, TOKEN_PROGRAM_ID, 10 * POS_SCALE),
+        &e.payer,
+        &[&e.payer, &lp_owner],
+    );
+    assert_eq!(read_u64(&e.svm, &r_dust, 80), 10 * POS_SCALE, "2nd LP must receive exact 10M shares");
+    send_ok(
+        &mut e.svm,
+        ix_withdraw_insurance(e.prog_id, e.dex, eth, r_dust, lp_owner.pubkey(), lp_tok, e.mint, e.dex_vault, TOKEN_PROGRAM_ID, 10 * POS_SCALE),
+        &e.payer,
+        &[&e.payer, &lp_owner],
+    );
+    assert_eq!(token_amount(&e.svm, &lp_tok), lp_tok_before_dep, "2nd LP recovers exact $10 principal");
+    assert_eq!(read_u64(&e.svm, &eth, 224), 10 * POS_SCALE, "$10 donation still intact after 2nd LP round-trip");
 
     // (e) SPL self-transfer (`destTok == vaultPda`, `ownerTok == vaultPda`) MUST FAIL!
     send_err_custom(

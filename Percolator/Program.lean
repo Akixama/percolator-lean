@@ -729,13 +729,13 @@ def handleDepositInsurance (input : Ptr) : SolanaM Unit := do
     let totSh ← loadU64 mData MktOff.totalInsShares
     let ins   ← loadU64 mData MktOff.insurance
     -- Share-pool pricing hardening:
-    -- 1. If `totSh == 0`, forbid capturing pre-existing unowned fees/donations (`ins == 0`)
-    --    and enforce `amount >= MIN_FIRST_INS_DEPOSIT` (blocks 1-atom ERC-4626 inflation!).
+    -- 1. If `totSh == 0`, enforce `amount >= MIN_FIRST_INS_DEPOSIT` (blocks 1-atom ERC-4626 inflation!)
+    --    and if pre-existing unowned insurance exists (`ins > 0`), lock it behind `ins` unowned dead shares
+    --    so the first LP depositor captures 0 donated funds AND 1-atom donations can NEVER DoS future LPs!
     -- 2. If `totSh > 0`, forbid depositing into a wiped-out pool (`ins == 0`) where old
     --    worthless shares would steal the new LP's deposit (old LPs must burn shares first!).
     let minted ←
       if totSh == 0 then do
-        SolanaM.require (ins == 0) PErr.nonzeroState
         SolanaM.require (amount >= MIN_FIRST_INS_DEPOSIT) PErr.invalidParams
         pure amount
       else do
@@ -748,6 +748,8 @@ def handleDepositInsurance (input : Ptr) : SolanaM Unit := do
     addU64At dData DexOff.vaultBalance   amount
     addU64At dData DexOff.totalInsurance amount
     addU64At mData MktOff.insurance      amount
+    if totSh == 0 && ins > 0 then
+      addU64At mData MktOff.totalInsShares ins
     addU64At mData MktOff.totalInsShares minted
     addU64At rData InsOff.shares         minted
 

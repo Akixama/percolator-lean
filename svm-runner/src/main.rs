@@ -1626,6 +1626,61 @@ fn main() {
     init_adp_data[4..12].copy_from_slice(&10u64.to_le_bytes());
     init_adp_data[12..20].copy_from_slice(&100u64.to_le_bytes());
     init_adp_data[20..28].copy_from_slice(&10u64.to_le_bytes());
+    // Security regression 1: an unrelated attacker MUST NOT be able to claim/hijack an uninitialized
+    // OracleAdapter bound to `comp_mkt2` (only `comp_mkt2.marketAdmin == lp` may initialize it)!
+    let rogue_admin = Keypair::new();
+    svm.airdrop(&rogue_admin.pubkey(), 1_000_000_000).unwrap();
+    send_err_custom(
+        &mut svm,
+        Instruction {
+            program_id: adapter_prog,
+            accounts: vec![
+                AccountMeta::new(adp_acc, false),
+                AccountMeta::new_readonly(rogue_admin.pubkey(), true),
+                AccountMeta::new_readonly(prog_id, false),
+                AccountMeta::new_readonly(comp_mkt2, false),
+                AccountMeta::new_readonly(feed_acc, false),
+            ],
+            data: init_adp_data.clone(),
+        },
+        &payer,
+        &[&payer, &rogue_admin],
+        102, // PErr.unauthorized
+        "InitAdapter must reject unrelated signer trying to hijack uninitialized market adapter",
+    );
+    // Security regression 2: a forged market account (not owned by `prog_id`, even with matching
+    // magic + size + `rogue_admin` written at `MktOff.marketAdmin`) MUST be rejected!
+    let fake_mkt = Address::new_unique();
+    let mut fake_mkt_data = svm.get_account(&comp_mkt2).unwrap().data.clone();
+    fake_mkt_data[56..88].copy_from_slice(rogue_admin.pubkey().as_ref());
+    svm.set_account(fake_mkt, Account {
+        lamports: 10_000_000,
+        data: fake_mkt_data,
+        owner: SYSTEM_PROGRAM_ID,
+        ..Default::default()
+    }).unwrap();
+    {
+        svm.expire_blockhash();
+        let bh = svm.latest_blockhash();
+        let ix = Instruction {
+            program_id: adapter_prog,
+            accounts: vec![
+                AccountMeta::new(adp_acc, false),
+                AccountMeta::new_readonly(rogue_admin.pubkey(), true),
+                AccountMeta::new_readonly(prog_id, false),
+                AccountMeta::new_readonly(fake_mkt, false),
+                AccountMeta::new_readonly(feed_acc, false),
+            ],
+            data: init_adp_data.clone(),
+        };
+        let tx = Transaction::new(&[&payer, &rogue_admin], Message::new(&[ix], Some(&payer.pubkey())), bh);
+        let err = svm.send_transaction(tx).expect_err("InitAdapter must reject forged market account not owned by percProg");
+        assert!(
+            format!("{:?}", err).contains("IllegalOwner"),
+            "Expected IllegalOwner for forged market account, got: {:?}",
+            err
+        );
+    }
     send_ok(
         &mut svm,
         Instruction {

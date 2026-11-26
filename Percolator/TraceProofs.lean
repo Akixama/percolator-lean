@@ -965,33 +965,51 @@ theorem withdrawInsurance_preserves_sharesCoherent (st st' : DexState) (mids lps
           exact hsh mid' hmid' m' hm'
     · cases h
 
-/-- Hardened insurance share-minting guard:
-    1. Rejects capturing pre-existing unowned fees/donations (`totSh = 0 ∧ ins > 0`).
-    2. Rejects reviving wiped-out shares on a drained pool (`totSh > 0 ∧ ins = 0`).
-    3. Enforces minimum first-LP deposit (`amount ≥ 1_000_000`) to block 1-atom ERC-4626 inflation.
+/-- Hardened insurance share-minting guard (returns `(userSharesMinted, totalSharesAdded)`):
+    1. Enforces minimum first-LP deposit (`amount ≥ 1_000_000`) to block 1-atom ERC-4626 inflation.
+    2. When `totSh = 0` and pre-existing shareless insurance `ins > 0` exists (from donations/fees),
+       locks `ins` behind `ins` unowned dead shares (`totalSharesAdded = ins + amount`,
+       `userSharesMinted = amount`): blocks BOTH donation capture AND permissionless 1-atom DoS!
+    3. Rejects reviving wiped-out shares on a drained pool (`totSh > 0 ∧ ins = 0`).
     4. On any live pool (`totSh > 0 ∧ ins > 0`), floor-minting `minted = ⌊amount · totSh / ins⌋`
        is strictly non-dilutive for all existing LPs: `(ins + amount) · totSh ≥ ins · (totSh + minted)`. -/
-def hardenedInsMint (totSh ins amount : Nat) : Option Nat :=
+def hardenedInsMint (totSh ins amount : Nat) : Option (Nat × Nat) :=
   if totSh = 0 then
-    if ins = 0 ∧ amount ≥ 1_000_000 then some amount else none
+    if amount ≥ 1_000_000 then some (amount, ins + amount) else none
   else
     if ins > 0 then
       let m := (amount * totSh) / ins
-      if m > 0 then some m else none
+      if m > 0 then some (m, m) else none
     else none
 
 theorem insurance_share_mint_anti_capture_and_non_dilutive
     (totSh ins amount : Nat) :
-    (totSh = 0 → ins > 0 → hardenedInsMint totSh ins amount = none) ∧
-    (totSh > 0 → ins = 0 → hardenedInsMint totSh ins amount = none) ∧
+    -- 1. Dust first deposit blocked
     (totSh = 0 → amount < 1_000_000 → hardenedInsMint totSh ins amount = none) ∧
-    (∀ minted, totSh > 0 → hardenedInsMint totSh ins amount = some minted →
-      (ins + amount) * totSh ≥ ins * (totSh + minted)) := by
+    -- 2. First LP deposit after ANY permissionless donation succeeds (anti-DoS) and captures 0 donated funds!
+    (totSh = 0 → amount ≥ 1_000_000 →
+      ∃ uSh addTot, hardenedInsMint totSh ins amount = some (uSh, addTot) ∧
+        (uSh * (ins + amount)) / (totSh + addTot) = amount ∧
+        (ins + amount) - (uSh * (ins + amount)) / (totSh + addTot) = ins) ∧
+    -- 3. Drained pool revival blocked
+    (totSh > 0 → ins = 0 → hardenedInsMint totSh ins amount = none) ∧
+    -- 4. Subsequent LP minting is strictly non-dilutive
+    (∀ uSh addTot, totSh > 0 → hardenedInsMint totSh ins amount = some (uSh, addTot) →
+      uSh = addTot ∧ (ins + amount) * totSh ≥ ins * (totSh + addTot)) := by
   refine ⟨?_, ?_, ?_, ?_⟩
-  · intro h0 hpos; unfold hardenedInsMint; simp [h0, Nat.ne_of_gt hpos]
-  · intro hpos h0; unfold hardenedInsMint; simp [Nat.ne_of_gt hpos, h0]
   · intro h0 hlt; unfold hardenedInsMint; simp [h0, Nat.not_le_of_lt hlt]
-  · intro minted hpos hm
+  · intro h0 hge
+    refine ⟨amount, ins + amount, by unfold hardenedInsMint; simp [h0, hge], ?_, ?_⟩
+    · have hpos : 0 < ins + amount := by omega
+      have hdiv : (amount * (ins + amount)) / (0 + (ins + amount)) = amount := by
+        rw [Nat.zero_add]; exact Nat.mul_div_cancel amount hpos
+      simpa [h0] using hdiv
+    · have hpos : 0 < ins + amount := by omega
+      have hdiv : (amount * (ins + amount)) / (0 + (ins + amount)) = amount := by
+        rw [Nat.zero_add]; exact Nat.mul_div_cancel amount hpos
+      rw [h0, hdiv]; omega
+  · intro hpos h0; unfold hardenedInsMint; simp [Nat.ne_of_gt hpos, h0]
+  · intro uSh addTot hpos hm
     unfold hardenedInsMint at hm
     simp only [Nat.ne_of_gt hpos, ↓reduceIte] at hm
     split at hm
@@ -1004,9 +1022,36 @@ theorem insurance_share_mint_anti_capture_and_non_dilutive
         have h2 : ins * (totSh + (amount * totSh) / ins) = ins * totSh + ins * ((amount * totSh) / ins) :=
           Nat.mul_add ins totSh _
         have hcomm : ins * ((amount * totSh) / ins) = ((amount * totSh) / ins) * ins := Nat.mul_comm _ _
-        omega
+        exact ⟨rfl, by omega⟩
       · cases hm
     · cases hm
+
+/-- Authorization predicate mirroring `OracleAdapter.handleInitAdapter`:
+    requires exact market owner (`percProg`), exact size (`MktOff.size`), `MAGIC_MARKET`,
+    non-tombstoned status, nonzero `marketAdmin`, and `signer == marketAdmin`. -/
+def initAdapterAuthorized (mktOwner percProg : Nat) (mktLen mktSize : Nat)
+    (mktMagic expectedMagic : Nat) (isTombstoned : Bool)
+    (mktAdmin zeroKey signer : Nat) : Bool :=
+  (mktOwner == percProg) &&
+  (mktLen == mktSize) &&
+  (mktMagic == expectedMagic) &&
+  (!isTombstoned) &&
+  (mktAdmin != zeroKey) &&
+  (signer == mktAdmin)
+
+/-- **THEOREM (Anti-OracleAdapter-Hijack)**:
+    `initAdapterAuthorized = true` iff EVERY market binding check passes and `signer = mktAdmin`
+    (with `mktAdmin ≠ zeroKey`); any unrelated caller, spoofed/wrong-size/wrong-magic/tombstoned
+    market, or burned-admin market is unconditionally rejected! -/
+theorem initAdapter_requires_active_market_admin
+    (mktOwner percProg mktLen mktSize mktMagic expectedMagic mktAdmin zeroKey signer : Nat)
+    (isTombstoned : Bool) :
+    initAdapterAuthorized mktOwner percProg mktLen mktSize mktMagic expectedMagic isTombstoned
+      mktAdmin zeroKey signer = true ↔
+    (mktOwner = percProg ∧ mktLen = mktSize ∧ mktMagic = expectedMagic ∧
+     isTombstoned = false ∧ mktAdmin ≠ zeroKey ∧ signer = mktAdmin) := by
+  unfold initAdapterAuthorized
+  simp only [Bool.and_eq_true, beq_iff_eq, Bool.not_eq_true', bne_iff_ne, and_assoc]
 
 /-- Burning worthless shares (`ins = 0`) on a drained or `Tombstoned` market yields exact `payout = 0`,
     strictly reduces `curSh` and `totSh`, and lets the LP reach `shares = 0` for `CloseAccount` rent reclaim

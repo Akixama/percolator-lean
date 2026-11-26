@@ -528,6 +528,20 @@ def handleInitAdapter (input : Ptr) : SolanaM Unit := do
   SolanaM.require ((← AccountView.dataLen adp) == AdpOff.size) Err.invalidAccountData
   SolanaM.require ((← loadU32 (AccountView.dataPtr adp) 0) == 0) Err.accountAlreadyInitialized
 
+  -- Pin adapter initialization strictly to the bound market's active `marketAdmin`
+  -- (blocks unauthorized claim/hijack of an uninitialized adapter PDA bound to a market!).
+  SolanaM.require (← pubkeyEq (AccountView.ownerPtr mkt) (AccountView.keyPtr percProg)) Err.illegalOwner
+  SolanaM.require ((← AccountView.dataLen mkt) == MktOff.size) Err.invalidAccountData
+  let mData := AccountView.dataPtr mkt
+  SolanaM.require ((← loadU32 mData MktOff.magic) == MAGIC_MARKET) PErr.invalidMagic
+  SolanaM.require ((← loadU8 mData MktOff.status) != STATUS_TOMBSTONED) PErr.invalidStatus
+  let ma0 ← loadU64 mData (MktOff.marketAdmin + 0)
+  let ma1 ← loadU64 mData (MktOff.marketAdmin + 8)
+  let ma2 ← loadU64 mData (MktOff.marketAdmin + 16)
+  let ma3 ← loadU64 mData (MktOff.marketAdmin + 24)
+  SolanaM.require ((ma0 ||| ma1 ||| ma2 ||| ma3) != 0) PErr.unauthorized
+  SolanaM.require (← pubkeyEq (AccountView.keyPtr admin) (mData + MktOff.marketAdmin)) PErr.unauthorized
+
   let pdaBump     ← loadU8  ix.ptr 1
   let feedType    ← loadU8  ix.ptr 2
   let qFeedType   ← loadU8  ix.ptr 3
