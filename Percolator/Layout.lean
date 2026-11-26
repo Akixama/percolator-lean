@@ -94,10 +94,10 @@ namespace PErr
   def execPriceClamp       : UInt64 := 130
 end PErr
 
-/-! ### Exact Byte Offsets: `Dex` (200 bytes) -/
+/-! ### Exact Byte Offsets: `Dex` (208 bytes) -/
 
 namespace DexOff
-  def size            : UInt64 := 200
+  def size            : UInt64 := 208
   def magic           : UInt64 := 0   -- u32 ("PDEX")
   def version         : UInt64 := 4   -- u8  (2)
   def vaultBump       : UInt64 := 5   -- u8
@@ -115,12 +115,13 @@ namespace DexOff
   def totalInsurance  : UInt64 := 176 -- u64 (I_tot)
   def totalResidual   : UInt64 := 184 -- u64 (R_tot)
   def totalSurplus    : UInt64 := 192 -- u64 (S_tot)
+  def totalRewards    : UInt64 := 200 -- u64 (F_tot = Σ m.rewardAccrued; disjoint from C, I, R, S!)
 end DexOff
 
-/-! ### Exact Byte Offsets: `Market` (344 bytes — Per-Market Isolated Risk Domain) -/
+/-! ### Exact Byte Offsets: `Market` (400 bytes — Per-Market Isolated Risk & Reward Domain) -/
 
 namespace MktOff
-  def size           : UInt64 := 352
+  def size            : UInt64 := 400
   def magic          : UInt64 := 0   -- u32 ("MKTP")
   def status         : UInt64 := 4   -- u8
   -- byte 5: reserved zero padding (all markets are permissionless & cross-margin equal!)
@@ -157,8 +158,11 @@ namespace MktOff
   def kShort         : UInt64 := 312 -- u64 (biased by K_ZERO)
   def resolvedNum    : UInt64 := 320 -- u64
   def resolvedDen    : UInt64 := 328 -- u64
-  def activeLegs     : UInt64 := 336 -- u64
-  def minMm          : UInt64 := 344 -- u64 (minimum nonzero MM floor; prevents dust griefing)
+  def activeLegs      : UInt64 := 336 -- u64
+  def minMm           : UInt64 := 344 -- u64 (minimum nonzero MM floor; prevents dust griefing)
+  def rewardBps       : UInt64 := 352 -- u64 (0..10000 bps of tradeFee routed to this market's reward module; immutable!)
+  def rewardAccrued   : UInt64 := 360 -- u64 (F_m: accrued quote collateral claimable ONLY by rewardRecipient!)
+  def rewardRecipient : UInt64 := 368 -- Pubkey (32B immutable reward-module authority PDA; non-zero iff rewardBps > 0)
 end MktOff
 
 /-! ### Exact Byte Offsets: `Portfolio` (952 bytes = 120B header + 8 × 104B `Leg` slots) -/
@@ -205,6 +209,17 @@ namespace InsOff
   def shares    : UInt64 := 80  -- u64
 end InsOff
 
+/-! ### Compile-Time Layout Bounds Proofs (prevents off-by-N truncation & readonly AccountDataTooSmall) -/
+
+theorem layout_sizes_valid :
+    DexOff.totalRewards + 8 ≤ DexOff.size ∧ DexOff.size % 8 == 0 ∧
+    MktOff.rewardRecipient + 32 ≤ MktOff.size ∧ MktOff.size % 8 == 0 ∧
+    PflOff.totalReservedMm + 8 ≤ PflOff.headerSize ∧
+    LegOff.reservedMm + 8 ≤ PflOff.legStride ∧
+    PflOff.headerSize + MAX_LEGS * PflOff.legStride == PflOff.size ∧ PflOff.size % 8 == 0 ∧
+    InsOff.shares + 8 ≤ InsOff.size ∧ InsOff.size % 8 == 0 := by
+  decide
+
 /-! ### Instruction Opcodes (20 minimal unified instructions) -/
 
 namespace IxOp
@@ -229,6 +244,7 @@ namespace IxOp
   def tombstoneMarket    : UInt8 := 18
   def closeAccount       : UInt8 := 19
   def sweepSurplus       : UInt8 := 20
+  def claimReward        : UInt8 := 21
 end IxOp
 
 /-! ### Structured `sol_log_64_` Event Tags (0 heap, 0 `.rodata`, ~100 CU)
@@ -240,7 +256,8 @@ end IxOp
     - `5` (`withdraw`)     : `(5, portfolioId, amount, newCapital, 0)`
     - `6` (`forceClose`)   : `(6, marketId, closedQty, remainingOi, slot)`
     - `7` (`resolve`)      : `(7, marketId, resolvedNum, resolvedDen, 0)`
-    - `8` (`sweepSurplus`) : `(8, sweepAmt, remainingSurplus, 0, 0)` -/
+    - `8` (`sweepSurplus`) : `(8, sweepAmt, remainingSurplus, 0, 0)`
+    - `9` (`claimReward`)  : `(9, marketId, claimAmt, remainingReward, 0)` -/
 
 namespace EvtTag
   def oracle       : UInt64 := 1
@@ -251,6 +268,7 @@ namespace EvtTag
   def forceClose   : UInt64 := 6
   def resolve      : UInt64 := 7
   def sweepSurplus : UInt64 := 8
+  def claimReward  : UInt64 := 9
 end EvtTag
 
 end Percolator

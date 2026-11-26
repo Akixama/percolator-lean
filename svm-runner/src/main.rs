@@ -12,15 +12,22 @@ use solana_transaction::Transaction;
 
 const TOKEN_PROGRAM_ID: Address =
     Address::from_str_const("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
+const TOKEN_2022_PROGRAM_ID: Address =
+    Address::from_str_const("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb");
+const WSOL_MINT: Address =
+    Address::from_str_const("So11111111111111111111111111111111111111112");
 const SYSTEM_PROGRAM_ID: Address =
     Address::from_str_const("11111111111111111111111111111111");
 const SPL_TOKEN_RENT_MIN: u64 = 2_039_280;
 
-// Exact v2 layout constants matching Percolator/Layout.lean
-const DEX_SIZE: usize = 200;
-const MKT_SIZE: usize = 352;
+// Exact v2 layout constants matching Percolator/Layout.lean & Percolator/RewardModule.lean
+const DEX_SIZE: usize = 208;
+const MKT_SIZE: usize = 400;
 const PFL_SIZE: usize = 952;
 const INS_SIZE: usize = 88;
+const REW_SIZE: usize = 400;
+const EPOCH_SIZE: usize = 104;
+const BID_SIZE: usize = 120;
 const MAX_LEGS: usize = 8;
 const LEG_HEADER: usize = 120;
 const LEG_STRIDE: usize = 104;
@@ -207,13 +214,37 @@ fn create_prog_acc(svm: &mut LiteSVM, prog_id: &Address, size: usize) -> Address
     addr
 }
 
-fn create_tok_acc(svm: &mut LiteSVM, mint: &Address, owner: &Address, amount: u64) -> Address {
+fn create_tok_acc_prog(svm: &mut LiteSVM, tok_prog: Address, mint: &Address, owner: &Address, amount: u64) -> Address {
     let addr = Keypair::new().pubkey();
     svm.set_account(
         addr,
         Account {
             lamports: 10_000_000,
             data: make_spl_token_account(mint, owner, amount),
+            owner: tok_prog,
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
+    addr
+}
+
+fn create_tok_acc(svm: &mut LiteSVM, mint: &Address, owner: &Address, amount: u64) -> Address {
+    create_tok_acc_prog(svm, TOKEN_PROGRAM_ID, mint, owner, amount)
+}
+
+fn create_wsol_acc(svm: &mut LiteSVM, owner: &Address, amount: u64) -> Address {
+    let addr = Keypair::new().pubkey();
+    let mut data = make_spl_token_account(&WSOL_MINT, owner, amount);
+    // SPL Token Account layout: is_native = COption::Some(SPL_TOKEN_RENT_MIN) at bytes 109..121
+    data[109..113].copy_from_slice(&1u32.to_le_bytes());
+    data[113..121].copy_from_slice(&SPL_TOKEN_RENT_MIN.to_le_bytes());
+    svm.set_account(
+        addr,
+        Account {
+            lamports: SPL_TOKEN_RENT_MIN + amount,
+            data,
             owner: TOKEN_PROGRAM_ID,
             executable: false,
             rent_epoch: 0,
@@ -221,6 +252,14 @@ fn create_tok_acc(svm: &mut LiteSVM, mint: &Address, owner: &Address, amount: u6
     )
     .unwrap();
     addr
+}
+
+fn mint_supply(svm: &LiteSVM, mint: &Address) -> u64 {
+    read_u64(svm, mint, 36)
+}
+
+fn derive_rew_auth(rew_prog: &Address, cfg: &Address) -> (Address, u8) {
+    Address::find_program_address(&[b"rewm", cfg.as_ref()], rew_prog)
 }
 
 /// Pure PDA derivation ONLY — does NOT mock or create the account!
@@ -243,21 +282,24 @@ fn assert_dex_invariants(
     let i_tot = read_u64(svm, dex, 176);
     let r_tot = read_u64(svm, dex, 184);
     let s_tot = read_u64(svm, dex, 192);
+    let f_tot = read_u64(svm, dex, 200);
     let spl = token_amount(svm, dex_vault);
 
     assert_eq!(v, spl, "[{}] Dex.vaultBalance ({}) != SPL balance ({})", label, v, spl);
     assert_eq!(
-        c_tot as u128 + i_tot as u128 + r_tot as u128 + s_tot as u128,
+        c_tot as u128 + i_tot as u128 + r_tot as u128 + s_tot as u128 + f_tot as u128,
         v as u128,
-        "[{}] EXACT stock equality violated: C({}) + I({}) + R({}) + S({}) != V({})",
-        label, c_tot, i_tot, r_tot, s_tot, v
+        "[{}] EXACT 5-bucket stock equality violated: C({}) + I({}) + R({}) + S({}) + F({}) != V({})",
+        label, c_tot, i_tot, r_tot, s_tot, f_tot, v
     );
 
     let mut sum_i: u64 = 0;
     let mut sum_r: u64 = 0;
+    let mut sum_f: u64 = 0;
     for m in markets {
         let r_m = read_u64(svm, m, 216);
         let i_m = read_u64(svm, m, 224);
+        let f_m = read_u64(svm, m, 360);
         let oi_l = read_u64(svm, m, 256);
         let oi_s = read_u64(svm, m, 264);
         let raw_l = read_u64(svm, m, 272);
@@ -274,9 +316,11 @@ fn assert_dex_invariants(
         assert!(adl_s <= ADL_ONE, "[{}] adlShort {} > ADL_ONE", label, adl_s);
         sum_i += i_m;
         sum_r += r_m;
+        sum_f += f_m;
     }
     assert_eq!(sum_i, i_tot, "[{}] Σ m.insurance ({}) != Dex.totalInsurance ({})", label, sum_i, i_tot);
     assert_eq!(sum_r, r_tot, "[{}] Σ m.realizedPool ({}) != Dex.totalResidual ({})", label, sum_r, r_tot);
+    assert_eq!(sum_f, f_tot, "[{}] Σ m.rewardAccrued ({}) != Dex.totalRewards ({})", label, sum_f, f_tot);
     let _ = s_tot;
 
     let mut sum_c: u64 = 0;
@@ -425,6 +469,177 @@ fn ix_create_market(
     ix_create_market_ext(prog, dex, mkt, mint, oracle_auth, creator, creator_tok, fee_vault,
         init_price, exit_window, max_staleness, warmup_slots, im_bps, mm_bps, liq_fee_bps,
         trade_fee_bps, max_move_bps, max_ins_draw_bps, max_oi, 0)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ix_create_market_with_reward(
+    prog: Address, dex: Address, mkt: Address, mint: Address, oracle_auth: Address,
+    creator: Address, creator_tok: Address, fee_vault: Address,
+    init_price: u64, exit_window: u64, max_staleness: u64, warmup_slots: u64,
+    im_bps: u64, mm_bps: u64, liq_fee_bps: u64, trade_fee_bps: u64,
+    max_move_bps: u64, max_ins_draw_bps: u64, max_oi: u64, min_mm: u64,
+    reward_bps: u64, reward_recipient: Address,
+) -> Instruction {
+    let mut ix = ix_create_market_ext(
+        prog, dex, mkt, mint, oracle_auth, creator, creator_tok, fee_vault,
+        init_price, exit_window, max_staleness, warmup_slots,
+        im_bps, mm_bps, liq_fee_bps, trade_fee_bps,
+        max_move_bps, max_ins_draw_bps, max_oi, min_mm,
+    );
+    ix.data.resize(140, 0);
+    ix.data[100..108].copy_from_slice(&reward_bps.to_le_bytes());
+    ix.data[108..140].copy_from_slice(reward_recipient.as_ref());
+    ix
+}
+
+fn ix_claim_reward(
+    prog: Address, dex: Address, mkt: Address, rew_auth: Address,
+    mint: Address, vault_pda: Address, dest_tok: Address, tok_prog: Address, req_amt: u64,
+) -> Instruction {
+    let mut data = vec![0u8; 9];
+    data[0] = 21;
+    data[1..9].copy_from_slice(&req_amt.to_le_bytes());
+    Instruction {
+        program_id: prog,
+        accounts: vec![
+            AccountMeta::new(dex, false),
+            AccountMeta::new(mkt, false),
+            AccountMeta::new_readonly(rew_auth, true),
+            AccountMeta::new_readonly(mint, false),
+            AccountMeta::new(vault_pda, false),
+            AccountMeta::new(dest_tok, false),
+            AccountMeta::new_readonly(tok_prog, false),
+        ],
+        data,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ix_init_reward(
+    rew_prog: Address, cfg: Address, mkt_admin: Address, perc_prog: Address,
+    dex: Address, mkt: Address, rew_auth_pda: Address,
+    quote_mint: Address, quote_vault: Address, quote_tok_prog: Address,
+    target_mint: Address, target_escrow: Address, target_tok_prog: Address,
+    burn_sink_tok: Option<Address>,
+    bump: u8, burn_mode: u8, epoch_slots: u64, min_batch_quote: u64, init_reserve_rate_e6: u64,
+) -> Instruction {
+    let mut data = vec![0u8; 28];
+    data[0] = 0;
+    data[1] = bump;
+    data[2] = burn_mode;
+    data[4..12].copy_from_slice(&epoch_slots.to_le_bytes());
+    data[12..20].copy_from_slice(&min_batch_quote.to_le_bytes());
+    data[20..28].copy_from_slice(&init_reserve_rate_e6.to_le_bytes());
+    let mut accounts = vec![
+        AccountMeta::new(cfg, false),
+        AccountMeta::new_readonly(mkt_admin, true),
+        AccountMeta::new_readonly(perc_prog, false),
+        AccountMeta::new_readonly(dex, false),
+        AccountMeta::new_readonly(mkt, false),
+        AccountMeta::new_readonly(rew_auth_pda, false),
+        AccountMeta::new_readonly(quote_mint, false),
+        AccountMeta::new_readonly(quote_vault, false),
+        AccountMeta::new_readonly(quote_tok_prog, false),
+        AccountMeta::new_readonly(target_mint, false),
+        AccountMeta::new_readonly(target_escrow, false),
+        AccountMeta::new_readonly(target_tok_prog, false),
+    ];
+    if let Some(sink) = burn_sink_tok {
+        accounts.push(AccountMeta::new_readonly(sink, false));
+    }
+    Instruction { program_id: rew_prog, accounts, data }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ix_start_epoch(
+    rew_prog: Address, cfg: Address, epoch_acc: Address, dex: Address, mkt: Address,
+    rew_auth_pda: Address, quote_mint: Address, dex_vault: Address, quote_vault: Address,
+    quote_tok_prog: Address, perc_prog: Address,
+) -> Instruction {
+    Instruction {
+        program_id: rew_prog,
+        accounts: vec![
+            AccountMeta::new(cfg, false),
+            AccountMeta::new(epoch_acc, false),
+            AccountMeta::new(dex, false),
+            AccountMeta::new(mkt, false),
+            AccountMeta::new_readonly(rew_auth_pda, false),
+            AccountMeta::new_readonly(quote_mint, false),
+            AccountMeta::new(dex_vault, false),
+            AccountMeta::new(quote_vault, false),
+            AccountMeta::new_readonly(quote_tok_prog, false),
+            AccountMeta::new_readonly(perc_prog, false),
+        ],
+        data: vec![1],
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ix_submit_bid(
+    rew_prog: Address, cfg: Address, epoch_acc: Address, bid_receipt: Address,
+    bidder: Address, bidder_target_tok: Address, target_escrow: Address,
+    target_mint: Address, target_tok_prog: Address, amount: u64,
+) -> Instruction {
+    let mut data = vec![0u8; 9];
+    data[0] = 2;
+    data[1..9].copy_from_slice(&amount.to_le_bytes());
+    Instruction {
+        program_id: rew_prog,
+        accounts: vec![
+            AccountMeta::new_readonly(cfg, false),
+            AccountMeta::new(epoch_acc, false),
+            AccountMeta::new(bid_receipt, false),
+            AccountMeta::new_readonly(bidder, true),
+            AccountMeta::new(bidder_target_tok, false),
+            AccountMeta::new(target_escrow, false),
+            AccountMeta::new_readonly(target_mint, false),
+            AccountMeta::new_readonly(target_tok_prog, false),
+        ],
+        data,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ix_settle_epoch(
+    rew_prog: Address, cfg: Address, epoch_acc: Address, rew_auth_pda: Address,
+    target_escrow: Address, target_mint: Address, target_tok_prog: Address,
+    burn_sink_tok: Option<Address>,
+) -> Instruction {
+    let mut accounts = vec![
+        AccountMeta::new(cfg, false),
+        AccountMeta::new(epoch_acc, false),
+        AccountMeta::new_readonly(rew_auth_pda, false),
+        AccountMeta::new(target_escrow, false),
+        AccountMeta::new(target_mint, false),
+        AccountMeta::new_readonly(target_tok_prog, false),
+    ];
+    if let Some(sink) = burn_sink_tok {
+        accounts.push(AccountMeta::new(sink, false));
+    }
+    Instruction { program_id: rew_prog, accounts, data: vec![3] }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ix_claim_quote(
+    rew_prog: Address, cfg: Address, epoch_acc: Address, bid_receipt: Address,
+    bidder: Address, rew_auth_pda: Address, quote_vault: Address,
+    bidder_quote_tok: Address, quote_mint: Address, quote_tok_prog: Address,
+) -> Instruction {
+    Instruction {
+        program_id: rew_prog,
+        accounts: vec![
+            AccountMeta::new(cfg, false),
+            AccountMeta::new(epoch_acc, false),
+            AccountMeta::new(bid_receipt, false),
+            AccountMeta::new_readonly(bidder, true),
+            AccountMeta::new_readonly(rew_auth_pda, false),
+            AccountMeta::new(quote_vault, false),
+            AccountMeta::new(bidder_quote_tok, false),
+            AccountMeta::new_readonly(quote_mint, false),
+            AccountMeta::new_readonly(quote_tok_prog, false),
+        ],
+        data: vec![4],
+    }
 }
 
 fn ix_burn_market_admin(prog: Address, mkt: Address, admin: Address) -> Instruction {
@@ -2778,7 +2993,447 @@ fn main() {
     // =========================================================================
     boring_tests::run_all_boring_tests(&elf, &matcher_elf);
 
+    // =========================================================================
+    // SUITE 13: Gavel-Style `xy = k` Virtual-Reserve X-Minute Uniform-Price Batch
+    //   Buy-and-Burn Reward Modules (8-Leg Cross-Margin User x 8 Unique Modules:
+    //   6x SPL Token + Token-2022 + wSOL + Full Mainnet R1-R6 Attack Suite!)
+    // =========================================================================
+    let reward_so_path = std::env::args()
+        .nth(4)
+        .unwrap_or_else(|| "build/reward_module.so".to_string());
+    let reward_elf = std::fs::read(&reward_so_path)
+        .unwrap_or_else(|e| panic!("Failed to read {}: {}", reward_so_path, e));
+    let rew_prog = Keypair::new().pubkey();
+    svm.add_program(rew_prog, &reward_elf).expect("RewardModule ELF load failed");
+
+    let r_dex = create_prog_acc(&mut svm, &prog_id, DEX_SIZE);
+    let (r_vault, r_bump) = derive_dex_vault(&prog_id, &r_dex);
+    send_ok(
+        &mut svm,
+        ix_init_dex(prog_id, r_dex, dex_admin.pubkey(), mint, r_vault, fee_vault, TOKEN_PROGRAM_ID, SYSTEM_PROGRAM_ID, r_bump, 6, 0, SPL_TOKEN_RENT_MIN),
+        &payer,
+        &[&payer, &dex_admin],
+    );
+
+    if svm.get_account(&WSOL_MINT).is_none() {
+        let mut wsol_mint_data = vec![0u8; 82];
+        wsol_mint_data[44] = 9;
+        wsol_mint_data[45] = 1;
+        svm.set_account(
+            WSOL_MINT,
+            Account {
+                lamports: 10_000_000,
+                data: wsol_mint_data,
+                owner: TOKEN_PROGRAM_ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+    }
+
+    let r_trader = Keypair::new();
+    let r_mm = Keypair::new();
+    let r_bidder_a = Keypair::new();
+    let r_bidder_b = Keypair::new();
+    let r_spammer = Keypair::new();
+    let r_orc = Keypair::new();
+    for kp in [&r_trader, &r_mm, &r_bidder_a, &r_bidder_b, &r_spammer, &r_orc] {
+        svm.airdrop(&kp.pubkey(), 10_000_000_000).unwrap();
+    }
+    let r_trader_tok = create_tok_acc(&mut svm, &mint, &r_trader.pubkey(), 50_000 * POS_SCALE);
+    let r_mm_tok = create_tok_acc(&mut svm, &mint, &r_mm.pubkey(), 50_000 * POS_SCALE);
+    let r_bidder_a_q = create_tok_acc(&mut svm, &mint, &r_bidder_a.pubkey(), 0);
+    let r_bidder_b_q = create_tok_acc(&mut svm, &mint, &r_bidder_b.pubkey(), 0);
+    let r_spammer_q = create_tok_acc(&mut svm, &mint, &r_spammer.pubkey(), 0);
+    let r_trader_pfl = create_prog_acc(&mut svm, &prog_id, PFL_SIZE);
+    let r_mm_pfl = create_prog_acc(&mut svm, &prog_id, PFL_SIZE);
+    send_ok(&mut svm, ix_init_portfolio(prog_id, r_dex, r_trader_pfl, r_trader.pubkey()), &payer, &[&payer, &r_trader]);
+    send_ok(&mut svm, ix_init_portfolio(prog_id, r_dex, r_mm_pfl, r_mm.pubkey()), &payer, &[&payer, &r_mm]);
+    send_ok(&mut svm, ix_deposit_collateral(prog_id, r_dex, r_trader_pfl, r_trader.pubkey(), r_trader_tok, mint, r_vault, TOKEN_PROGRAM_ID, 20_000 * POS_SCALE), &payer, &[&payer, &r_trader]);
+    send_ok(&mut svm, ix_deposit_collateral(prog_id, r_dex, r_mm_pfl, r_mm.pubkey(), r_mm_tok, mint, r_vault, TOKEN_PROGRAM_ID, 20_000 * POS_SCALE), &payer, &[&payer, &r_mm]);
+
+    // 13.1 Negative config checks on CreateMarket reward fields
+    let r_bad_mkt = create_prog_acc(&mut svm, &prog_id, MKT_SIZE);
+    let r_zero_addr = Address::from([0u8; 32]);
+    send_err_custom(
+        &mut svm,
+        ix_create_market_with_reward(prog_id, r_dex, r_bad_mkt, mint, r_orc.pubkey(), r_trader.pubkey(), r_trader_tok, fee_vault,
+            100 * POS_SCALE, 10, 500, 0, 1000, 500, 100, 100, 95, 2500, 1_000_000 * POS_SCALE, 0,
+            10_001, Keypair::new().pubkey()),
+        &payer,
+        &[&payer, &r_trader],
+        103,
+        "CreateMarket rejects rewardBps > 10000",
+    );
+    send_err_custom(
+        &mut svm,
+        ix_create_market_with_reward(prog_id, r_dex, r_bad_mkt, mint, r_orc.pubkey(), r_trader.pubkey(), r_trader_tok, fee_vault,
+            100 * POS_SCALE, 10, 500, 0, 1000, 500, 100, 100, 95, 2500, 1_000_000 * POS_SCALE, 0,
+            5000, r_zero_addr),
+        &payer,
+        &[&payer, &r_trader],
+        103,
+        "CreateMarket rejects rewardBps > 0 with zero rewardRecipient",
+    );
+
+    // 13.2 Create 8 permissionless markets under ONE DEX, each with its own UNIQUE Gavel `xy=k` Batch RewardModule:
+    //   - Markets 0..6: 6 distinct SPL Token mints (burnMode = 0, real SPL Burn reducing supply!)
+    //   - Market  6   : Token-2022 mint (burnMode = 0, real Token-2022 Burn reducing supply!)
+    //   - Market  7   : wSOL NativeMint (burnMode = 1, permanent dead-sink PDA owned by rewAuthPda!)
+    let reward_bps_cfg: [u64; 8] = [5000, 6000, 7000, 8000, 9000, 10000, 7500, 5000];
+    let mut r_mkts: Vec<Address> = Vec::with_capacity(8);
+    let mut r_cfgs: Vec<Address> = Vec::with_capacity(8);
+    let mut r_pdas: Vec<Address> = Vec::with_capacity(8);
+    let mut r_q_vaults: Vec<Address> = Vec::with_capacity(8);
+    let mut r_t_mints: Vec<Address> = Vec::with_capacity(8);
+    let mut r_t_escrows: Vec<Address> = Vec::with_capacity(8);
+    let mut r_t_progs: Vec<Address> = Vec::with_capacity(8);
+    let mut r_bida_t: Vec<Address> = Vec::with_capacity(8);
+    let mut r_bidb_t: Vec<Address> = Vec::with_capacity(8);
+    let mut r_spam_t: Vec<Address> = Vec::with_capacity(8);
+    let mut r_sinks: Vec<Option<Address>> = Vec::with_capacity(8);
+
+    let r_slot_start = get_slot(&svm) + 10;
+    set_slot(&mut svm, r_slot_start);
+    let epoch_slots = 150u64; // ~1 min (>= MIN_EPOCH_SLOTS = 32 >> K = 4 leader window!)
+    let min_batch_quote = 1_000_000u64; // $1 minimum batch
+    let init_reserve_rate_e6 = 500_000u64; // 0.5 target-atoms per 1 quote-atom virtual reserve
+
+    for i in 0..MAX_LEGS {
+        let creator = Keypair::new();
+        svm.airdrop(&creator.pubkey(), 1_000_000_000).unwrap();
+        let creator_tok = create_tok_acc(&mut svm, &mint, &creator.pubkey(), 0);
+
+        let mkt = create_prog_acc(&mut svm, &prog_id, MKT_SIZE);
+        let cfg = create_prog_acc(&mut svm, &rew_prog, REW_SIZE);
+        let (rew_pda, pda_bump) = derive_rew_auth(&rew_prog, &cfg);
+        let q_vault = create_tok_acc(&mut svm, &mint, &rew_pda, 0);
+
+        send_ok(
+            &mut svm,
+            ix_create_market_with_reward(
+                prog_id, r_dex, mkt, mint, r_orc.pubkey(), creator.pubkey(), creator_tok, fee_vault,
+                100 * POS_SCALE, 10, 2000, 0, 1000, 500, 100, 100, 95, 2500, 1_000_000 * POS_SCALE, 0,
+                reward_bps_cfg[i], rew_pda,
+            ),
+            &payer,
+            &[&payer, &creator],
+        );
+
+        let (t_mint, t_prog, burn_mode, t_escrow, sink_opt, ba_tok, bb_tok, sp_tok) = if i < 6 {
+            let tm = Keypair::new().pubkey();
+            svm.set_account(
+                tm,
+                Account {
+                    lamports: 10_000_000,
+                    data: make_spl_mint(6, 1_000_000_000_000, &dex_admin.pubkey()),
+                    owner: TOKEN_PROGRAM_ID,
+                    executable: false,
+                    rent_epoch: 0,
+                },
+            )
+            .unwrap();
+            let esc = create_tok_acc_prog(&mut svm, TOKEN_PROGRAM_ID, &tm, &rew_pda, 0);
+            let ba = create_tok_acc_prog(&mut svm, TOKEN_PROGRAM_ID, &tm, &r_bidder_a.pubkey(), 50_000 * POS_SCALE);
+            let bb = create_tok_acc_prog(&mut svm, TOKEN_PROGRAM_ID, &tm, &r_bidder_b.pubkey(), 50_000 * POS_SCALE);
+            let sp = create_tok_acc_prog(&mut svm, TOKEN_PROGRAM_ID, &tm, &r_spammer.pubkey(), 50_000 * POS_SCALE);
+            (tm, TOKEN_PROGRAM_ID, 0u8, esc, None, ba, bb, sp)
+        } else if i == 6 {
+            let tm = Keypair::new().pubkey();
+            svm.set_account(
+                tm,
+                Account {
+                    lamports: 10_000_000,
+                    data: make_spl_mint(6, 1_000_000_000_000, &dex_admin.pubkey()),
+                    owner: TOKEN_2022_PROGRAM_ID,
+                    executable: false,
+                    rent_epoch: 0,
+                },
+            )
+            .unwrap();
+            let esc = create_tok_acc_prog(&mut svm, TOKEN_2022_PROGRAM_ID, &tm, &rew_pda, 0);
+            let ba = create_tok_acc_prog(&mut svm, TOKEN_2022_PROGRAM_ID, &tm, &r_bidder_a.pubkey(), 50_000 * POS_SCALE);
+            let bb = create_tok_acc_prog(&mut svm, TOKEN_2022_PROGRAM_ID, &tm, &r_bidder_b.pubkey(), 50_000 * POS_SCALE);
+            let sp = create_tok_acc_prog(&mut svm, TOKEN_2022_PROGRAM_ID, &tm, &r_spammer.pubkey(), 50_000 * POS_SCALE);
+            (tm, TOKEN_2022_PROGRAM_ID, 0u8, esc, None, ba, bb, sp)
+        } else {
+            let esc = create_wsol_acc(&mut svm, &rew_pda, 0);
+            let sink = create_wsol_acc(&mut svm, &rew_pda, 0);
+            let ba = create_wsol_acc(&mut svm, &r_bidder_a.pubkey(), 50_000 * POS_SCALE);
+            let bb = create_wsol_acc(&mut svm, &r_bidder_b.pubkey(), 50_000 * POS_SCALE);
+            let sp = create_wsol_acc(&mut svm, &r_spammer.pubkey(), 50_000 * POS_SCALE);
+            (WSOL_MINT, TOKEN_PROGRAM_ID, 1u8, esc, Some(sink), ba, bb, sp)
+        };
+
+        // Security regressions on Market 0 before valid InitReward:
+        if i == 0 {
+            send_err_custom(
+                &mut svm,
+                ix_init_reward(rew_prog, cfg, attacker.pubkey(), prog_id, r_dex, mkt, rew_pda,
+                    mint, q_vault, TOKEN_PROGRAM_ID, t_mint, t_escrow, t_prog, sink_opt,
+                    pda_bump, burn_mode, epoch_slots, min_batch_quote, init_reserve_rate_e6),
+                &payer, &[&payer, &attacker], 102, "InitReward rejects non-marketAdmin hijack",
+            );
+            send_err(
+                &mut svm,
+                ix_init_reward(rew_prog, cfg, creator.pubkey(), prog_id, r_dex, mkt, rew_pda,
+                    mint, q_vault, TOKEN_PROGRAM_ID, t_mint, t_escrow, fake_tok_prog, sink_opt,
+                    pda_bump, burn_mode, epoch_slots, min_batch_quote, init_reserve_rate_e6),
+                &payer, &[&payer, &creator], "InitReward rejects spoofed noop.so targetTokProg",
+            );
+            send_err_custom(
+                &mut svm,
+                ix_init_reward(rew_prog, cfg, creator.pubkey(), prog_id, r_dex, mkt, Keypair::new().pubkey(),
+                    mint, q_vault, TOKEN_PROGRAM_ID, t_mint, t_escrow, t_prog, sink_opt,
+                    pda_bump, burn_mode, epoch_slots, min_batch_quote, init_reserve_rate_e6),
+                &payer, &[&payer, &creator], 407, "InitReward rejects mismatched rewAuthPda",
+            );
+            send_err_custom(
+                &mut svm,
+                ix_init_reward(rew_prog, cfg, creator.pubkey(), prog_id, r_dex, mkt, rew_pda,
+                    mint, q_vault, TOKEN_PROGRAM_ID, t_mint, t_escrow, t_prog, sink_opt,
+                    pda_bump, burn_mode, 4, min_batch_quote, init_reserve_rate_e6), // 4 < MIN_EPOCH_SLOTS (32)!
+                &payer, &[&payer, &creator], 103, "InitReward rejects epochSlots < MIN_EPOCH_SLOTS",
+            );
+        }
+
+        send_ok(
+            &mut svm,
+            ix_init_reward(rew_prog, cfg, creator.pubkey(), prog_id, r_dex, mkt, rew_pda,
+                mint, q_vault, TOKEN_PROGRAM_ID, t_mint, t_escrow, t_prog, sink_opt,
+                pda_bump, burn_mode, epoch_slots, min_batch_quote, init_reserve_rate_e6),
+            &payer,
+            &[&payer, &creator],
+        );
+
+        r_mkts.push(mkt);
+        r_cfgs.push(cfg);
+        r_pdas.push(rew_pda);
+        r_q_vaults.push(q_vault);
+        r_t_mints.push(t_mint);
+        r_t_escrows.push(t_escrow);
+        r_t_progs.push(t_prog);
+        r_bida_t.push(ba_tok);
+        r_bidb_t.push(bb_tok);
+        r_spam_t.push(sp_tok);
+        r_sinks.push(sink_opt);
+    }
+
+    // 13.3 Single user opens ALL 8 CROSS-MARGIN LEGS across ALL 8 markets with 8 unique reward modules!
+    let mut expected_rew: [u64; 8] = [0; 8];
+    let mut expected_ins: [u64; 8] = [0; 8];
+    let mut total_expected_rew = 0u64;
+    for i in 0..MAX_LEGS {
+        let trade_ix = if i % 2 == 0 {
+            ix_trade(prog_id, r_dex, r_mkts[i], r_trader_pfl, r_trader.pubkey(), r_mm_pfl, r_mm.pubkey(), 0, 10 * POS_SCALE)
+        } else {
+            ix_trade(prog_id, r_dex, r_mkts[i], r_mm_pfl, r_mm.pubkey(), r_trader_pfl, r_trader.pubkey(), 0, 10 * POS_SCALE)
+        };
+        send_ok(&mut svm, trade_ix, &payer, &[&payer, &r_trader, &r_mm]);
+        let fee2 = 20 * POS_SCALE;
+        let rew_fee = (fee2 * reward_bps_cfg[i]) / 10_000;
+        let ins_fee = fee2 - rew_fee;
+        expected_rew[i] = rew_fee;
+        expected_ins[i] = ins_fee;
+        total_expected_rew += rew_fee;
+        assert_eq!(read_u64(&svm, &r_mkts[i], 360), rew_fee, "Market {} rewardAccrued mismatch", i);
+        assert_eq!(read_u64(&svm, &r_mkts[i], 224), ins_fee, "Market {} insurance split mismatch", i);
+    }
+    assert_eq!(read_u8(&svm, &r_trader_pfl, 4), 8, "Single user holds ALL 8 cross-margin legs!");
+    assert_eq!(read_u64(&svm, &r_dex, 200), total_expected_rew, "Dex.totalRewards mismatch!");
+    assert_dex_invariants(&svm, &r_dex, &r_vault, &r_mkts, &[r_trader_pfl, r_mm_pfl], "suite13-post-8leg-open");
+
+    // 13.4 Core isolation checks: dexAdmin SweepSurplus cannot touch totalRewards; unauthorized ClaimReward rejected!
+    send_err_custom(
+        &mut svm,
+        ix_sweep_surplus(prog_id, r_dex, dex_admin.pubkey(), mint, r_vault, fee_vault, TOKEN_PROGRAM_ID, 0),
+        &payer, &[&payer, &dex_admin], 103, "dexAdmin SweepSurplus must NEVER steal totalRewards!",
+    );
+    send_err_custom(
+        &mut svm,
+        ix_claim_reward(prog_id, r_dex, r_mkts[0], attacker.pubkey(), mint, r_vault, attacker_tok, TOKEN_PROGRAM_ID, 0),
+        &payer, &[&payer, &attacker], 102, "ClaimReward rejects unauthorized signer!",
+    );
+
+    // 13.5 Start Epoch 1 on ALL 8 markets (pulls m.rewardAccrued -> quoteVault, computes B_virt = Q * 0.5)
+    let mut r_ep1: Vec<Address> = Vec::with_capacity(8);
+    let trader_cap_pre = read_u64(&svm, &r_trader_pfl, 88);
+    let mm_cap_pre = read_u64(&svm, &r_mm_pfl, 88);
+    for i in 0..MAX_LEGS {
+        let ep1 = create_prog_acc(&mut svm, &rew_prog, EPOCH_SIZE);
+        send_ok(
+            &mut svm,
+            ix_start_epoch(rew_prog, r_cfgs[i], ep1, r_dex, r_mkts[i], r_pdas[i], mint, r_vault, r_q_vaults[i], TOKEN_PROGRAM_ID, prog_id),
+            &payer, &[&payer],
+        );
+        assert_eq!(read_u64(&svm, &r_mkts[i], 360), 0, "Mkt {} rewardAccrued pulled into Epoch 1", i);
+        assert_eq!(token_amount(&svm, &r_q_vaults[i]), expected_rew[i], "Mkt {} quoteVault funded", i);
+        assert_eq!(read_u64(&svm, &ep1, 48), expected_rew[i], "Epoch 1 quotePot");
+        assert_eq!(read_u64(&svm, &ep1, 56), expected_rew[i] / 2, "Epoch 1 virtBids = Q * 0.5");
+        r_ep1.push(ep1);
+    }
+    assert_eq!(read_u64(&svm, &r_dex, 200), 0, "All 8 markets' rewards pulled cleanly!");
+    assert_dex_invariants(&svm, &r_dex, &r_vault, &r_mkts, &[r_trader_pfl, r_mm_pfl], "suite13-post-start-ep1");
+
+    // 13.6 Unlimited AMM-Style Bidding + R1/R4 Spam Bid Attack + R5 Quiet-Epoch 1-Atom Snipe!
+    //   - Market 0 (SPL): bidder_a bids 4*POS_SCALE + 6*POS_SCALE across TWO calls (same receipt!),
+    //     bidder_b bids 30*POS_SCALE, AND spammer drops FIVE 1-atom dust bids across 5 separate receipts!
+    //   - Market 1 (SPL): QUIET / CENSORED EPOCH TEST (R5/R3): ONLY spammer drops a 1-atom bid!
+    //   - Markets 2..5 (SPL), Market 6 (Token-2022), Market 7 (wSOL): bidder_a + bidder_b both bid!
+    let mut rec_a: Vec<Option<Address>> = vec![None; 8];
+    let mut rec_b: Vec<Option<Address>> = vec![None; 8];
+    let mut spam_recs_m0: Vec<Address> = Vec::new();
+    let mut spam_rec_m1 = Address::default();
+
+    for i in 0..MAX_LEGS {
+        if i == 1 {
+            // Quiet/censored epoch: ONLY 1-atom attacker bid!
+            spam_rec_m1 = create_prog_acc(&mut svm, &rew_prog, BID_SIZE);
+            send_ok(
+                &mut svm,
+                ix_submit_bid(rew_prog, r_cfgs[1], r_ep1[1], spam_rec_m1, r_spammer.pubkey(), r_spam_t[1], r_t_escrows[1], r_t_mints[1], r_t_progs[1], 1),
+                &payer, &[&payer, &r_spammer],
+            );
+        } else {
+            let ra = create_prog_acc(&mut svm, &rew_prog, BID_SIZE);
+            let rb = create_prog_acc(&mut svm, &rew_prog, BID_SIZE);
+            if i == 0 {
+                // Multi-bid accumulation into the same receipt (4 + 6 = 10)
+                send_ok(&mut svm, ix_submit_bid(rew_prog, r_cfgs[0], r_ep1[0], ra, r_bidder_a.pubkey(), r_bida_t[0], r_t_escrows[0], r_t_mints[0], r_t_progs[0], 4 * POS_SCALE), &payer, &[&payer, &r_bidder_a]);
+                send_ok(&mut svm, ix_submit_bid(rew_prog, r_cfgs[0], r_ep1[0], ra, r_bidder_a.pubkey(), r_bida_t[0], r_t_escrows[0], r_t_mints[0], r_t_progs[0], 6 * POS_SCALE), &payer, &[&payer, &r_bidder_a]);
+                send_ok(&mut svm, ix_submit_bid(rew_prog, r_cfgs[0], r_ep1[0], rb, r_bidder_b.pubkey(), r_bidb_t[0], r_t_escrows[0], r_t_mints[0], r_t_progs[0], 30 * POS_SCALE), &payer, &[&payer, &r_bidder_b]);
+                // 5 dust 1-atom spam bids across 5 separate receipts (R1/R4 spam test!)
+                for _ in 0..5 {
+                    let sr = create_prog_acc(&mut svm, &rew_prog, BID_SIZE);
+                    send_ok(&mut svm, ix_submit_bid(rew_prog, r_cfgs[0], r_ep1[0], sr, r_spammer.pubkey(), r_spam_t[0], r_t_escrows[0], r_t_mints[0], r_t_progs[0], 1), &payer, &[&payer, &r_spammer]);
+                    spam_recs_m0.push(sr);
+                }
+            } else {
+                send_ok(&mut svm, ix_submit_bid(rew_prog, r_cfgs[i], r_ep1[i], ra, r_bidder_a.pubkey(), r_bida_t[i], r_t_escrows[i], r_t_mints[i], r_t_progs[i], 10 * POS_SCALE), &payer, &[&payer, &r_bidder_a]);
+                send_ok(&mut svm, ix_submit_bid(rew_prog, r_cfgs[i], r_ep1[i], rb, r_bidder_b.pubkey(), r_bidb_t[i], r_t_escrows[i], r_t_mints[i], r_t_progs[i], 30 * POS_SCALE), &payer, &[&payer, &r_bidder_b]);
+            }
+            rec_a[i] = Some(ra);
+            rec_b[i] = Some(rb);
+        }
+    }
+
+    // Cannot settle BEFORE endSlot!
+    send_err_custom(
+        &mut svm,
+        ix_settle_epoch(rew_prog, r_cfgs[0], r_ep1[0], r_pdas[0], r_t_escrows[0], r_t_mints[0], r_t_progs[0], r_sinks[0]),
+        &payer, &[&payer], 410, "SettleEpoch rejects before endSlot",
+    );
+
+    // 13.7 Advance to X-minute mark (`r_slot_start + epoch_slots`)!
+    set_slot(&mut svm, r_slot_start + epoch_slots);
+    // Late bid after endSlot MUST be rejected!
+    let late_rec = create_prog_acc(&mut svm, &rew_prog, BID_SIZE);
+    send_err_custom(
+        &mut svm,
+        ix_submit_bid(rew_prog, r_cfgs[0], r_ep1[0], late_rec, r_bidder_a.pubkey(), r_bida_t[0], r_t_escrows[0], r_t_mints[0], r_t_progs[0], POS_SCALE),
+        &payer, &[&payer, &r_bidder_a], 409, "SubmitBid rejects after endSlot",
+    );
+
+    // O(1) SettleEpoch on ALL 8 unique reward modules (6x SPL Burn, 1x Token-2022 Burn, 1x wSOL Dead-Sink)!
+    let mut max_settle_cu = 0u64;
+    let mut max_claim_cu = 0u64;
+    for i in 0..MAX_LEGS {
+        let supply_pre = if i < 7 { mint_supply(&svm, &r_t_mints[i]) } else { 0 };
+        let sink_pre = r_sinks[i].map(|s| token_amount(&svm, &s)).unwrap_or(0);
+        let q_pot = read_u64(&svm, &r_ep1[i], 48);
+        let b_virt = read_u64(&svm, &r_ep1[i], 56);
+        let tot_b = read_u64(&svm, &r_ep1[i], 64);
+
+        let cu_s = send_ok(
+            &mut svm,
+            ix_settle_epoch(rew_prog, r_cfgs[i], r_ep1[i], r_pdas[i], r_t_escrows[i], r_t_mints[i], r_t_progs[i], r_sinks[i]),
+            &payer, &[&payer],
+        );
+        max_settle_cu = max_settle_cu.max(cu_s);
+
+        let expected_q_paid = ((q_pot as u128 * tot_b as u128) / (tot_b as u128 + b_virt as u128)) as u64;
+        let expected_roll = q_pot - expected_q_paid;
+        assert_eq!(read_u64(&svm, &r_ep1[i], 72), expected_q_paid, "Mkt {} quotePaid exact xy=k mismatch", i);
+        assert_eq!(read_u64(&svm, &r_cfgs[i], 368), expected_roll, "Mkt {} rolloverQuote mismatch", i);
+        assert_eq!(read_u64(&svm, &r_cfgs[i], 392), tot_b, "Mkt {} totalTargetBurned mismatch", i);
+        assert_eq!(token_amount(&svm, &r_t_escrows[i]), 0, "Mkt {} targetEscrow completely burned/drained!", i);
+
+        if i < 7 {
+            assert_eq!(supply_pre - mint_supply(&svm, &r_t_mints[i]), tot_b, "Mkt {} SPL/Token-2022 mint.supply decreased by exact tot_b!", i);
+        } else {
+            assert_eq!(token_amount(&svm, &r_sinks[i].unwrap()) - sink_pre, tot_b, "Mkt 7 wSOL dead-sink received exact tot_b!");
+        }
+
+        if i == 1 {
+            // R5 QUIET/CENSORED EPOCH VERIFICATION (Theorem 4: `payout * B_virt <= Q * b`):
+            //   With `reserveRateE6 = 0.5`, 1 target-atom buys at most `floor(Q / (1 + Q/2)) = 1`
+            //   quote atom (0.00002% of pot!), >99.9999% rolls over intact, AND `reserveRateE6` halves (500k -> 250k)!
+            assert!((expected_q_paid as u128) * (b_virt as u128) <= (q_pot as u128), "R5: quiet_epoch_price_cap violated!");
+            assert!(expected_q_paid <= 2, "R5: 1-atom bidder in quiet epoch extracted {} > 2 atoms!", expected_q_paid);
+            assert_eq!(read_u64(&svm, &r_cfgs[1], 368), expected_roll, "R5: quiet epoch pot rolled over intact!");
+            assert_eq!(read_u64(&svm, &r_cfgs[1], 344), init_reserve_rate_e6 / 2, "R3: under-filled epoch halved reserveRateE6!");
+
+            // Claiming the 1-atom spam receipt yields at most `expected_q_paid` (1 micro-USDC); Epoch 2 starts IMMEDIATELY!
+            let sp_pre = token_amount(&svm, &r_spammer_q);
+            send_ok(&mut svm, ix_claim_quote(rew_prog, r_cfgs[1], r_ep1[1], spam_rec_m1, r_spammer.pubkey(), r_pdas[1], r_q_vaults[1], r_spammer_q, mint, TOKEN_PROGRAM_ID), &payer, &[&payer, &r_spammer]);
+            assert_eq!(token_amount(&svm, &r_spammer_q) - sp_pre, expected_q_paid, "R5: 1-atom attacker payout exact!");
+
+            // Overlapping Epoch 2 starts IMMEDIATELY from rolloverQuote with halved reserveRateE6!
+            let ep2 = create_prog_acc(&mut svm, &rew_prog, EPOCH_SIZE);
+            send_ok(&mut svm, ix_start_epoch(rew_prog, r_cfgs[1], ep2, r_dex, r_mkts[1], r_pdas[1], mint, r_vault, r_q_vaults[1], TOKEN_PROGRAM_ID, prog_id), &payer, &[&payer]);
+            assert_eq!(read_u64(&svm, &ep2, 48), expected_roll, "Epoch 2 carries 100% of rolled-over quote!");
+            assert_eq!(read_u64(&svm, &ep2, 56), expected_roll / 4, "Epoch 2 virtBids reflects halved reserveRateE6 (0.25)!");
+        } else {
+            // Healthy epoch: bidder_a (10) & bidder_b (30) claim at EXACT uniform xy=k price!
+            let qa_pre = token_amount(&svm, &r_bidder_a_q);
+            let qb_pre = token_amount(&svm, &r_bidder_b_q);
+            let cu_ca = send_ok(&mut svm, ix_claim_quote(rew_prog, r_cfgs[i], r_ep1[i], rec_a[i].unwrap(), r_bidder_a.pubkey(), r_pdas[i], r_q_vaults[i], r_bidder_a_q, mint, TOKEN_PROGRAM_ID), &payer, &[&payer, &r_bidder_a]);
+            let cu_cb = send_ok(&mut svm, ix_claim_quote(rew_prog, r_cfgs[i], r_ep1[i], rec_b[i].unwrap(), r_bidder_b.pubkey(), r_pdas[i], r_q_vaults[i], r_bidder_b_q, mint, TOKEN_PROGRAM_ID), &payer, &[&payer, &r_bidder_b]);
+            max_claim_cu = max_claim_cu.max(cu_ca).max(cu_cb);
+            let got_a = token_amount(&svm, &r_bidder_a_q) - qa_pre;
+            let got_b = token_amount(&svm, &r_bidder_b_q) - qb_pre;
+            let exp_a = ((q_pot as u128 * (10 * POS_SCALE) as u128) / (tot_b as u128 + b_virt as u128)) as u64;
+            let exp_b = ((q_pot as u128 * (30 * POS_SCALE) as u128) / (tot_b as u128 + b_virt as u128)) as u64;
+            assert_eq!(got_a, exp_a, "Mkt {} bidder_a uniform xy=k payout mismatch", i);
+            assert_eq!(got_b, exp_b, "Mkt {} bidder_b uniform xy=k payout mismatch", i);
+            // Uniform clearing price check: bidder_b bid 3x bidder_a -> receives exact 3x payout (within 1 atom floor)!
+            assert!(got_b.abs_diff(3 * got_a) <= 3, "Uniform clearing price violated: got_a={}, got_b={}", got_a, got_b);
+
+            if i == 0 {
+                // Double-claim rejected!
+                send_err_custom(
+                    &mut svm,
+                    ix_claim_quote(rew_prog, r_cfgs[0], r_ep1[0], rec_a[0].unwrap(), r_bidder_a.pubkey(), r_pdas[0], r_q_vaults[0], r_bidder_a_q, mint, TOKEN_PROGRAM_ID),
+                    &payer, &[&payer, &r_bidder_a], 412, "Double ClaimQuote rejected",
+                );
+                // All 5 1-atom spam receipts receive 0 USDC!
+                let sp_pre = token_amount(&svm, &r_spammer_q);
+                for sr in &spam_recs_m0 {
+                    send_ok(&mut svm, ix_claim_quote(rew_prog, r_cfgs[0], r_ep1[0], *sr, r_spammer.pubkey(), r_pdas[0], r_q_vaults[0], r_spammer_q, mint, TOKEN_PROGRAM_ID), &payer, &[&payer, &r_spammer]);
+                }
+                assert_eq!(token_amount(&svm, &r_spammer_q), sp_pre, "R1/R4: 5x 1-atom spam bids received 0 USDC & donated to burn!");
+            }
+        }
+
+        // Verify 3-bucket escrow conservation on RewardCfg: quoteVault >= active + rollover + pending!
+        let qv_bal = token_amount(&svm, &r_q_vaults[i]);
+        let act_q = read_u64(&svm, &r_cfgs[i], 360);
+        let rol_q = read_u64(&svm, &r_cfgs[i], 368);
+        let pnd_q = read_u64(&svm, &r_cfgs[i], 376);
+        assert!(qv_bal >= act_q + rol_q + pnd_q, "Mkt {} RewardCfg escrow insolvent: {} < {}+{}+{}", i, qv_bal, act_q, rol_q, pnd_q);
+
+        // Cross-market isolation: EVERY market's insurance pool untouched!
+        for j in 0..MAX_LEGS {
+            assert_eq!(read_u64(&svm, &r_mkts[j], 224), expected_ins[j], "Settle/Claim({}) modified Market {} insurance!", i, j);
+        }
+    }
+    assert_eq!(read_u64(&svm, &r_trader_pfl, 88), trader_cap_pre, "User capital untouched!");
+    assert_eq!(read_u64(&svm, &r_mm_pfl, 88), mm_cap_pre, "MM capital untouched!");
+    assert_dex_invariants(&svm, &r_dex, &r_vault, &r_mkts, &[r_trader_pfl, r_mm_pfl], "suite13-final");
+    println!("[PASS] Suite 13: Gavel xy=k X-Min Uniform-Price Batch Reward Modules (8-Leg User x 8 Unique Modules: 6x SPL + Token-2022 + wSOL, R1-R6 Verified, settle max={} CU, claim max={} CU)", max_settle_cu, max_claim_cu);
+
     println!("==================================================================================");
-    println!("  ALL 12 PERCOLATOR-LEAN VERIFICATION + BORING EXCHANGE + 8-LEG STRESS + FUZZ SUITES PASSED 100%!");
+    println!("  ALL 13 PERCOLATOR-LEAN VERIFICATION + BORING EXCHANGE + 8-LEG + REWARD MODULE SUITES PASSED 100%!");
     println!("==================================================================================");
 }

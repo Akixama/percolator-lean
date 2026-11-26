@@ -19,6 +19,7 @@ import Percolator.ThreatModel
 import Percolator.Program
 import Percolator.Matcher
 import Percolator.OracleAdapter
+import Percolator.RewardModule
 
 namespace Percolator.Refinement
 
@@ -42,12 +43,13 @@ def regionValid (base len : UInt64) : Prop :=
 def regionDisjoint (b₁ l₁ b₂ l₂ : UInt64) : Prop :=
   b₁.toNat + l₁.toNat ≤ b₂.toNat ∨ b₂.toNat + l₂.toNat ≤ b₁.toNat
 
-/-- Exact Global Stock Equality (`C_tot + I_tot + R_tot + S_tot = V`) directly on `SvmState.mem`! -/
+/-- Exact Global 5-Bucket Stock Equality (`C_tot + I_tot + R_tot + S_tot + F_tot = V`) directly on `SvmState.mem`! -/
 def dexStockExact (s : SvmState) (dData : Ptr) : Prop :=
   (s.readU64 (dData + DexOff.totalCapital)).toNat +
   (s.readU64 (dData + DexOff.totalInsurance)).toNat +
   (s.readU64 (dData + DexOff.totalResidual)).toNat +
-  (s.readU64 (dData + DexOff.totalSurplus)).toNat =
+  (s.readU64 (dData + DexOff.totalSurplus)).toNat +
+  (s.readU64 (dData + DexOff.totalRewards)).toNat =
   (s.readU64 (dData + DexOff.vaultBalance)).toNat
 
 private theorem u64_add_toNat_of_lt (a b : UInt64) (h : a.toNat + b.toNat < 2 ^ 64) :
@@ -717,7 +719,7 @@ theorem applyExecSpread_conserves_capital (mData fLData fSData : Ptr) (qty execP
                     rw [hcL, hScap2]
                     have := UInt64.le_iff_toNat_le.mp hgeL; rw [hcL] at this; omega
                   · intro off hoff
-                    have hoffLt : off.toNat < 352 := UInt64.lt_iff_toNat_lt.mp hoff
+                    have hoffLt : off.toNat < 400 := UInt64.lt_iff_toNat_lt.mp hoff
                     have hmAdd : (mData + off).toNat = mData.toNat + off.toNat :=
                       u64_add_toNat_of_lt _ _ (by unfold regionValid at hmV; simp [MktOff.size] at *; omega)
                     have hMSd : (mData + off).toNat < (fSData + PflOff.capital).toNat ∨ (fSData + PflOff.capital).toNat + 8 ≤ (mData + off).toNat := by
@@ -750,7 +752,7 @@ theorem applyExecSpread_conserves_capital (mData fLData fSData : Ptr) (qty execP
                     rw [hcS, hLcap2]
                     have := UInt64.le_iff_toNat_le.mp hgeS; rw [hcS] at this; omega
                   · intro off hoff
-                    have hoffLt : off.toNat < 352 := UInt64.lt_iff_toNat_lt.mp hoff
+                    have hoffLt : off.toNat < 400 := UInt64.lt_iff_toNat_lt.mp hoff
                     have hmAdd : (mData + off).toNat = mData.toNat + off.toNat :=
                       u64_add_toNat_of_lt _ _ (by unfold regionValid at hmV; simp [MktOff.size] at *; omega)
                     have hMSd : (mData + off).toNat < (fSData + PflOff.capital).toNat ∨ (fSData + PflOff.capital).toNat + 8 ≤ (mData + off).toNat := by
@@ -775,7 +777,8 @@ private theorem dexStockExact_writeU64_outside {s : SvmState} {dData addr v : UI
     (s.writeU64 addr v).readU64 (dData + DexOff.totalCapital) = s.readU64 (dData + DexOff.totalCapital) ∧
     (s.writeU64 addr v).readU64 (dData + DexOff.totalInsurance) = s.readU64 (dData + DexOff.totalInsurance) ∧
     (s.writeU64 addr v).readU64 (dData + DexOff.totalResidual) = s.readU64 (dData + DexOff.totalResidual) ∧
-    (s.writeU64 addr v).readU64 (dData + DexOff.totalSurplus) = s.readU64 (dData + DexOff.totalSurplus) := by
+    (s.writeU64 addr v).readU64 (dData + DexOff.totalSurplus) = s.readU64 (dData + DexOff.totalSurplus) ∧
+    (s.writeU64 addr v).readU64 (dData + DexOff.totalRewards) = s.readU64 (dData + DexOff.totalRewards) := by
   have hdo : ∀ off : UInt64, off.toNat + 8 ≤ DexOff.size.toNat →
       (s.writeU64 addr v).readU64 (dData + off) = s.readU64 (dData + off) := by
     intro off hoff
@@ -787,7 +790,8 @@ private theorem dexStockExact_writeU64_outside {s : SvmState} {dData addr v : UI
          hdo DexOff.totalCapital (by decide),
          hdo DexOff.totalInsurance (by decide),
          hdo DexOff.totalResidual (by decide),
-         hdo DexOff.totalSurplus (by decide)⟩
+         hdo DexOff.totalSurplus (by decide),
+         hdo DexOff.totalRewards (by decide)⟩
 
 /-- Helper: transferring `delta` between two distinct Dex stock buckets preserves `dexStockExact`
     and `vaultBalance` directly on `SvmState.mem`! -/
@@ -824,18 +828,22 @@ private theorem dexStockExact_sub_add_bucket {s s1 s2 : SvmState} {dData offSub 
         hrd DexOff.totalResidual DexOff.totalCapital (by decide) (by decide) (by decide),
         hrd DexOff.totalResidual DexOff.totalInsurance (by decide) (by decide) (by decide),
         hrd DexOff.totalResidual DexOff.totalSurplus (by decide) (by decide) (by decide),
+        hrd DexOff.totalResidual DexOff.totalRewards (by decide) (by decide) (by decide),
         hrd DexOff.totalInsurance DexOff.vaultBalance (by decide) (by decide) (by decide),
         hrd DexOff.totalInsurance DexOff.totalCapital (by decide) (by decide) (by decide),
         hrd DexOff.totalInsurance DexOff.totalResidual (by decide) (by decide) (by decide),
         hrd DexOff.totalInsurance DexOff.totalSurplus (by decide) (by decide) (by decide),
+        hrd DexOff.totalInsurance DexOff.totalRewards (by decide) (by decide) (by decide),
         hrd DexOff.totalSurplus DexOff.vaultBalance (by decide) (by decide) (by decide),
         hrd DexOff.totalSurplus DexOff.totalCapital (by decide) (by decide) (by decide),
         hrd DexOff.totalSurplus DexOff.totalInsurance (by decide) (by decide) (by decide),
         hrd DexOff.totalSurplus DexOff.totalResidual (by decide) (by decide) (by decide),
+        hrd DexOff.totalSurplus DexOff.totalRewards (by decide) (by decide) (by decide),
         hrd DexOff.totalCapital DexOff.vaultBalance (by decide) (by decide) (by decide),
         hrd DexOff.totalCapital DexOff.totalInsurance (by decide) (by decide) (by decide),
         hrd DexOff.totalCapital DexOff.totalResidual (by decide) (by decide) (by decide),
-        hrd DexOff.totalCapital DexOff.totalSurplus (by decide) (by decide) (by decide)] at hlt ⊢
+        hrd DexOff.totalCapital DexOff.totalSurplus (by decide) (by decide) (by decide),
+        hrd DexOff.totalCapital DexOff.totalRewards (by decide) (by decide) (by decide)] at hlt ⊢
       rw [u64_sub_toNat_of_le _ _ hle, u64_add_toNat_of_lt _ _ hlt]
       omega
     · simp only [
@@ -862,16 +870,16 @@ private theorem dexStockExact_sub_ext_add_bucket (dData offSub offAdd extAddr ex
              (offSub = DexOff.totalResidual  ∧ offAdd = DexOff.totalCapital)) :
     dexStockExact s2 dData ∧
     s2.readU64 (dData + DexOff.vaultBalance) = s.readU64 (dData + DexOff.vaultBalance) := by
-  have hd200 : dData.toNat + 200 < 2 ^ 64 := hdV
-  have hds : DexOff.size.toNat = 200 := rfl
+  have hd208 : dData.toNat + 208 < 2 ^ 64 := hdV
+  have hds : DexOff.size.toNat = 208 := rfl
   have ⟨haddLt, hs2⟩ := addU64At_ok_spec dData offAdd d (s1.writeU64 extAddr extVal) s2 hadd
   subst hs2
-  have hoffAddBound : offAdd.toNat + 8 ≤ 200 := by
+  have hoffAddBound : offAdd.toNat + 8 ≤ 208 := by
     rcases hPair with ⟨_, rfl⟩ | ⟨_, rfl⟩ | ⟨_, rfl⟩ | ⟨_, rfl⟩ | ⟨_, rfl⟩ <;> decide
   have hAddNat : (dData + offAdd).toNat = dData.toNat + offAdd.toNat :=
     u64_add_toNat_of_lt _ _ (by omega)
   have hAddLt : (dData + offAdd).toNat + 8 < 2 ^ 64 := by omega
-  have hExtRead : ∀ off : UInt64, off.toNat + 8 ≤ 200 →
+  have hExtRead : ∀ off : UInt64, off.toNat + 8 ≤ 208 →
       (s1.writeU64 extAddr extVal).readU64 (dData + off) = s1.readU64 (dData + off) := by
     intro off hoff
     have hO := u64_add_toNat_of_lt dData off (by omega)
@@ -887,7 +895,7 @@ private theorem dexStockExact_sub_ext_add_bucket (dData offSub offAdd extAddr ex
       apply UInt64.le_iff_toNat_le.mpr; rw [u64_add_toNat_of_lt _ _ haddLt]; omega
     rw [ite_eq_left_of_eq_true _ _ (eq_true hge)]; rfl
   have ⟨hStD, hVD⟩ := dexStockExact_sub_add_bucket hdV hSt hsub haddDirect hPair
-  have hEq : ∀ off : UInt64, off.toNat + 8 ≤ 200 →
+  have hEq : ∀ off : UInt64, off.toNat + 8 ≤ 208 →
       (off = offAdd ∨ off.toNat + 8 ≤ offAdd.toNat ∨ offAdd.toNat + 8 ≤ off.toNat) →
       ((s1.writeU64 extAddr extVal).writeU64 (dData + offAdd)
         ((s1.writeU64 extAddr extVal).readU64 (dData + offAdd) + d)).readU64 (dData + off) =
@@ -903,23 +911,24 @@ private theorem dexStockExact_sub_ext_add_bucket (dData offSub offAdd extAddr ex
       rw [readU64_writeU64_of_disjNat _ _ _ _ hAddLt hOlt hdj,
           readU64_writeU64_of_disjNat _ _ _ _ hAddLt hOlt hdj]
       exact hExtRead off hoff
-  have h5case : ∀ off : UInt64,
+  have h6case : ∀ off : UInt64,
       (off = DexOff.vaultBalance ∨ off = DexOff.totalCapital ∨ off = DexOff.totalInsurance ∨
-       off = DexOff.totalResidual ∨ off = DexOff.totalSurplus) →
+       off = DexOff.totalResidual ∨ off = DexOff.totalSurplus ∨ off = DexOff.totalRewards) →
       (off = offAdd ∨ off.toNat + 8 ≤ offAdd.toNat ∨ offAdd.toNat + 8 ≤ off.toNat) := by
     intro off hof
     rcases hPair with ⟨_, rfl⟩ | ⟨_, rfl⟩ | ⟨_, rfl⟩ | ⟨_, rfl⟩ | ⟨_, rfl⟩ <;>
-    rcases hof with rfl | rfl | rfl | rfl | rfl <;>
+    rcases hof with rfl | rfl | rfl | rfl | rfl | rfl <;>
     first | exact Or.inl rfl | exact Or.inr (by decide)
   constructor
   · unfold dexStockExact at hStD ⊢
-    rw [hEq DexOff.totalCapital (by decide) (h5case _ (Or.inr (Or.inl rfl))),
-        hEq DexOff.totalInsurance (by decide) (h5case _ (Or.inr (Or.inr (Or.inl rfl)))),
-        hEq DexOff.totalResidual (by decide) (h5case _ (Or.inr (Or.inr (Or.inr (Or.inl rfl))))),
-        hEq DexOff.totalSurplus (by decide) (h5case _ (Or.inr (Or.inr (Or.inr (Or.inr rfl))))),
-        hEq DexOff.vaultBalance (by decide) (h5case _ (Or.inl rfl))]
+    rw [hEq DexOff.totalCapital (by decide) (h6case _ (Or.inr (Or.inl rfl))),
+        hEq DexOff.totalInsurance (by decide) (h6case _ (Or.inr (Or.inr (Or.inl rfl)))),
+        hEq DexOff.totalResidual (by decide) (h6case _ (Or.inr (Or.inr (Or.inr (Or.inl rfl))))),
+        hEq DexOff.totalSurplus (by decide) (h6case _ (Or.inr (Or.inr (Or.inr (Or.inr (Or.inl rfl)))))),
+        hEq DexOff.totalRewards (by decide) (h6case _ (Or.inr (Or.inr (Or.inr (Or.inr (Or.inr rfl)))))),
+        hEq DexOff.vaultBalance (by decide) (h6case _ (Or.inl rfl))]
     exact hStD
-  · rw [hEq DexOff.vaultBalance (by decide) (h5case _ (Or.inl rfl))]
+  · rw [hEq DexOff.vaultBalance (by decide) (h6case _ (Or.inl rfl))]
     exact hVD
 
 /-- **Refinement #10 (`sweepResolvedDust` Exact Global Stock Preservation)**:
@@ -941,8 +950,8 @@ theorem sweepResolvedDust_preserves_dex_stock (dData mData : Ptr) (s s' : SvmSta
     have hadd : (mData + off).toNat = mData.toNat + off.toNat := u64_add_toNat_of_lt _ _ (by unfold regionValid at hmV; omega)
     have hdj : (mData + off).toNat + 8 ≤ dData.toNat ∨ dData.toNat + DexOff.size.toNat ≤ (mData + off).toNat := by
       rw [hadd]; unfold regionDisjoint at hDM; omega
-    have ⟨eV, eC, eI, eR, eS⟩ := dexStockExact_writeU64_outside (s := st) (v := v) hdV (by rw [hadd]; unfold regionValid at hmV; omega) hdj
-    exact ⟨fun hs => by unfold dexStockExact at hs ⊢; rw [eC, eI, eR, eS, eV]; exact hs, eV⟩
+    have ⟨eV, eC, eI, eR, eS, eF⟩ := dexStockExact_writeU64_outside (s := st) (v := v) hdV (by rw [hadd]; unfold regionValid at hmV; omega) hdj
+    exact ⟨fun hs => by unfold dexStockExact at hs ⊢; rw [eC, eI, eR, eS, eF, eV]; exact hs, eV⟩
   have hStep2 : ∀ st st',
       dexStockExact st dData →
       (do
@@ -1260,7 +1269,7 @@ theorem syncLegMargins_zeroes_reserved_and_preserves_frame (mData fData : Ptr) (
             rw [hfEq PflOff.capital (by decide)] at hFinCap
             refine ⟨hFinRes, hFinTotRes, hFinCap, ?_, ?_⟩
             · intro off hoff
-              have hoffLt : off.toNat < 352 := UInt64.lt_iff_toNat_lt.mp hoff
+              have hoffLt : off.toNat < 400 := UInt64.lt_iff_toNat_lt.mp hoff
               have hma : (mData + off).toNat = mData.toNat + off.toNat :=
                 u64_add_toNat_of_lt _ _ (by unfold regionValid at hmV; simp [MktOff.size] at *; omega)
               have he1 := hOut7 (mData + off)
@@ -1300,7 +1309,7 @@ private theorem syncLegMargins_preserves_dex (dData mData fData : Ptr) (slotIdx 
     (hdSt : sW.stackSp ≤ dData)
     (hDF : regionDisjoint dData DexOff.size fData PflOff.size)
     (hsy : syncLegMargins mData fData slotIdx curSlot sW = .ok () s') :
-    ∀ off : UInt64, off.toNat + 8 ≤ 200 → s'.readU64 (dData + off) = sW.readU64 (dData + off) := by
+    ∀ off : UInt64, off.toNat + 8 ≤ 208 → s'.readU64 (dData + off) = sW.readU64 (dData + off) := by
   have hslotLt : slotIdx.toNat < 8 := UInt64.lt_iff_toNat_lt.mp hslot
   let lp := legPtrAt fData slotIdx
   have hlpNat : lp.toNat = fData.toNat + 120 + slotIdx.toNat * 104 := by
@@ -1396,35 +1405,37 @@ theorem creditMarketFromLoser_stock_and_frame
     s'.readU64 (dData + DexOff.vaultBalance) = s.readU64 (dData + DexOff.vaultBalance) ∧
     s'.readU64 (dData + DexOff.totalCapital) = s.readU64 (dData + DexOff.totalCapital) ∧
     s'.readU64 (dData + DexOff.totalSurplus) = s.readU64 (dData + DexOff.totalSurplus) ∧
+    s'.readU64 (dData + DexOff.totalRewards) = s.readU64 (dData + DexOff.totalRewards) ∧
     (s'.readU64 (dData + DexOff.totalInsurance)).toNat + (s'.readU64 (dData + DexOff.totalResidual)).toNat =
       (s.readU64 (dData + DexOff.totalInsurance)).toNat + (s.readU64 (dData + DexOff.totalResidual)).toNat + capDeb.toNat ∧
     (∀ off : UInt64, off.toNat + 8 ≤ PflOff.size.toNat →
       s'.readU64 (fData + off) = s.readU64 (fData + off)) := by
-  have hd200 : dData.toNat + 200 < 2 ^ 64 := hdV
-  have hm352 : mData.toNat + 352 < 2 ^ 64 := hmV
+  have hd208 : dData.toNat + 208 < 2 ^ 64 := hdV
+  have hm400 : mData.toNat + 400 < 2 ^ 64 := hmV
   have hf952 : fData.toNat + 952 < 2 ^ 64 := hfV
-  have hDM' : dData.toNat + 200 ≤ mData.toNat ∨ mData.toNat + 352 ≤ dData.toNat := hDM
-  have hDF' : dData.toNat + 200 ≤ fData.toNat ∨ fData.toNat + 952 ≤ dData.toNat := hDF
-  have hMF' : mData.toNat + 352 ≤ fData.toNat ∨ fData.toNat + 952 ≤ mData.toNat := hMF
-  have hMout : ∀ (st : SvmState) (off v : UInt64), off.toNat + 8 ≤ 352 →
+  have hDM' : dData.toNat + 208 ≤ mData.toNat ∨ mData.toNat + 400 ≤ dData.toNat := hDM
+  have hDF' : dData.toNat + 208 ≤ fData.toNat ∨ fData.toNat + 952 ≤ dData.toNat := hDF
+  have hMF' : mData.toNat + 400 ≤ fData.toNat ∨ fData.toNat + 952 ≤ mData.toNat := hMF
+  have hMout : ∀ (st : SvmState) (off v : UInt64), off.toNat + 8 ≤ 400 →
       (st.writeU64 (mData + off) v).readU64 (dData + DexOff.vaultBalance) = st.readU64 (dData + DexOff.vaultBalance) ∧
       (st.writeU64 (mData + off) v).readU64 (dData + DexOff.totalCapital) = st.readU64 (dData + DexOff.totalCapital) ∧
       (st.writeU64 (mData + off) v).readU64 (dData + DexOff.totalInsurance) = st.readU64 (dData + DexOff.totalInsurance) ∧
       (st.writeU64 (mData + off) v).readU64 (dData + DexOff.totalResidual) = st.readU64 (dData + DexOff.totalResidual) ∧
       (st.writeU64 (mData + off) v).readU64 (dData + DexOff.totalSurplus) = st.readU64 (dData + DexOff.totalSurplus) ∧
+      (st.writeU64 (mData + off) v).readU64 (dData + DexOff.totalRewards) = st.readU64 (dData + DexOff.totalRewards) ∧
       (∀ foff : UInt64, foff.toNat + 8 ≤ 952 → (st.writeU64 (mData + off) v).readU64 (fData + foff) = st.readU64 (fData + foff)) := by
     intro st off v hoff
     have ha : (mData + off).toNat = mData.toNat + off.toNat := u64_add_toNat_of_lt _ _ (by omega)
     have halt : (mData + off).toNat + 8 < 2 ^ 64 := by rw [ha]; omega
     have hdjD : (mData + off).toNat + 8 ≤ dData.toNat ∨ dData.toNat + DexOff.size.toNat ≤ (mData + off).toNat := by
-      have : DexOff.size.toNat = 200 := rfl; rw [ha]; omega
-    have ⟨eV, eC, eI, eR, eS⟩ := dexStockExact_writeU64_outside (s := st) (v := v) hdV halt hdjD
-    refine ⟨eV, eC, eI, eR, eS, fun foff hfoff => ?_⟩
+      have : DexOff.size.toNat = 208 := rfl; rw [ha]; omega
+    have ⟨eV, eC, eI, eR, eS, eF⟩ := dexStockExact_writeU64_outside (s := st) (v := v) hdV halt hdjD
+    refine ⟨eV, eC, eI, eR, eS, eF, fun foff hfoff => ?_⟩
     have hfa : (fData + foff).toNat = fData.toNat + foff.toNat := u64_add_toNat_of_lt _ _ (by omega)
     exact readU64_writeU64_of_disjNat st (mData + off) (fData + foff) v halt (by rw [hfa]; omega) (by rw [ha, hfa]; omega)
-  have hDread : ∀ (st : SvmState) (doff v : UInt64), doff.toNat + 8 ≤ 200 →
+  have hDread : ∀ (st : SvmState) (doff v : UInt64), doff.toNat + 8 ≤ 208 →
       (∀ foff : UInt64, foff.toNat + 8 ≤ 952 → (st.writeU64 (dData + doff) v).readU64 (fData + foff) = st.readU64 (fData + foff)) ∧
-      (∀ o : UInt64, o.toNat + 8 ≤ 200 → (o.toNat + 8 ≤ doff.toNat ∨ doff.toNat + 8 ≤ o.toNat) →
+      (∀ o : UInt64, o.toNat + 8 ≤ 208 → (o.toNat + 8 ≤ doff.toNat ∨ doff.toNat + 8 ≤ o.toNat) →
         (st.writeU64 (dData + doff) v).readU64 (dData + o) = st.readU64 (dData + o)) := by
     intro st doff v hdoff
     have ha : (dData + doff).toNat = dData.toNat + doff.toNat := u64_add_toNat_of_lt _ _ (by omega)
@@ -1452,6 +1463,7 @@ theorem creditMarketFromLoser_stock_and_frame
       s1.readU64 (dData + DexOff.vaultBalance) = s.readU64 (dData + DexOff.vaultBalance) →
       s1.readU64 (dData + DexOff.totalCapital) = s.readU64 (dData + DexOff.totalCapital) →
       s1.readU64 (dData + DexOff.totalSurplus) = s.readU64 (dData + DexOff.totalSurplus) →
+      s1.readU64 (dData + DexOff.totalRewards) = s.readU64 (dData + DexOff.totalRewards) →
       (s1.readU64 (dData + DexOff.totalInsurance)).toNat + (s1.readU64 (dData + DexOff.totalResidual)).toNat =
         (s.readU64 (dData + DexOff.totalInsurance)).toNat + (s.readU64 (dData + DexOff.totalResidual)).toNat + repay.toNat →
       (∀ off : UInt64, off.toNat + 8 ≤ PflOff.size.toNat → s1.readU64 (fData + off) = s.readU64 (fData + off)) →
@@ -1462,10 +1474,11 @@ theorem creditMarketFromLoser_stock_and_frame
       s'.readU64 (dData + DexOff.vaultBalance) = s.readU64 (dData + DexOff.vaultBalance) ∧
       s'.readU64 (dData + DexOff.totalCapital) = s.readU64 (dData + DexOff.totalCapital) ∧
       s'.readU64 (dData + DexOff.totalSurplus) = s.readU64 (dData + DexOff.totalSurplus) ∧
+      s'.readU64 (dData + DexOff.totalRewards) = s.readU64 (dData + DexOff.totalRewards) ∧
       (s'.readU64 (dData + DexOff.totalInsurance)).toNat + (s'.readU64 (dData + DexOff.totalResidual)).toNat =
         (s.readU64 (dData + DexOff.totalInsurance)).toNat + (s.readU64 (dData + DexOff.totalResidual)).toNat + capDeb.toNat ∧
       (∀ off : UInt64, off.toNat + 8 ≤ PflOff.size.toNat → s'.readU64 (fData + off) = s.readU64 (fData + off)) := by
-    intro s1 hsp1 hV1 hC1 hS1 hIR1 hF1 h2
+    intro s1 hsp1 hV1 hC1 hS1 hRw1 hIR1 hF1 h2
     by_cases htr : toR > 0
     · rw [ite_eq_left_of_eq_true _ _ (eq_true htr)] at h2
       unfold SolanaM.bind at h2
@@ -1475,13 +1488,14 @@ theorem creditMarketFromLoser_stock_and_frame
         rw [hmR] at h2; dsimp only at h2
         have ⟨_, hs2⟩ := addU64At_ok_spec _ _ _ _ _ hmR; subst hs2
         have ⟨haddLt, hs'⟩ := addU64At_ok_spec _ _ _ _ _ h2; subst hs'
-        have ⟨eV1, eC1, eI1, eR1, eS1, eF1⟩ := hMout s1 MktOff.realizedPool (s1.readU64 (mData + MktOff.realizedPool) + toR) (by decide)
+        have ⟨eV1, eC1, eI1, eR1, eS1, eRw1, eF1⟩ := hMout s1 MktOff.realizedPool (s1.readU64 (mData + MktOff.realizedPool) + toR) (by decide)
         have ⟨eF2, eD2⟩ := hDread (s1.writeU64 (mData + MktOff.realizedPool) (s1.readU64 (mData + MktOff.realizedPool) + toR))
           DexOff.totalResidual ((s1.writeU64 (mData + MktOff.realizedPool) (s1.readU64 (mData + MktOff.realizedPool) + toR)).readU64 (dData + DexOff.totalResidual) + toR) (by decide)
         refine ⟨by rw [writeU64_stackSp, writeU64_stackSp, hsp1],
                 by rw [eD2 _ (by decide) (by decide), eV1, hV1],
                 by rw [eD2 _ (by decide) (by decide), eC1, hC1],
-                by rw [eD2 _ (by decide) (by decide), eS1, hS1], ?_,
+                by rw [eD2 _ (by decide) (by decide), eS1, hS1],
+                by rw [eD2 _ (by decide) (by decide), eRw1, hRw1], ?_,
                 fun off hoff => by rw [eF2 off hoff, eF1 off hoff, hF1 off hoff]⟩
         rw [eD2 _ (by decide) (by decide), eI1, SvmState.readU64_writeU64_same, u64_add_toNat_of_lt _ _ haddLt, eR1]
         omega
@@ -1490,7 +1504,7 @@ theorem creditMarketFromLoser_stock_and_frame
       have hto0 : toR.toNat = 0 := by
         have : ¬ (0 < toR.toNat) := fun hp => htr (UInt64.lt_iff_toNat_lt.mpr hp)
         omega
-      exact ⟨hsp1, hV1, hC1, hS1, by omega, hF1⟩
+      exact ⟨hsp1, hV1, hC1, hS1, hRw1, by omega, hF1⟩
   by_cases hrep : repay > 0
   · rw [ite_eq_left_of_eq_true _ _ (eq_true hrep)] at h
     unfold SolanaM.bind at h
@@ -1511,13 +1525,14 @@ theorem creditMarketFromLoser_stock_and_frame
           have ⟨haddLt, hs1⟩ := addU64At_ok_spec _ _ _ _ _ haddDI; subst hs1
           let stA := s.writeU64 (mData + MktOff.insFronted) (s.readU64 (mData + MktOff.insFronted) - repay)
           let stB := stA.writeU64 (mData + MktOff.insurance) (stA.readU64 (mData + MktOff.insurance) + repay)
-          have ⟨eV0, eC0, eI0, eR0, eS0, eF0⟩ := hMout s MktOff.insFronted (s.readU64 (mData + MktOff.insFronted) - repay) (by decide)
-          have ⟨eV1, eC1, eI1, eR1, eS1, eF1⟩ := hMout stA MktOff.insurance (stA.readU64 (mData + MktOff.insurance) + repay) (by decide)
+          have ⟨eV0, eC0, eI0, eR0, eS0, eRw0, eF0⟩ := hMout s MktOff.insFronted (s.readU64 (mData + MktOff.insFronted) - repay) (by decide)
+          have ⟨eV1, eC1, eI1, eR1, eS1, eRw1, eF1⟩ := hMout stA MktOff.insurance (stA.readU64 (mData + MktOff.insurance) + repay) (by decide)
           have ⟨eF2, eD2⟩ := hDread stB DexOff.totalInsurance (stB.readU64 (dData + DexOff.totalInsurance) + repay) (by decide)
           apply hStep2 _ (by rw [writeU64_stackSp, writeU64_stackSp, writeU64_stackSp])
             (by rw [eD2 _ (by decide) (by decide), eV1, eV0])
             (by rw [eD2 _ (by decide) (by decide), eC1, eC0])
             (by rw [eD2 _ (by decide) (by decide), eS1, eS0])
+            (by rw [eD2 _ (by decide) (by decide), eRw1, eRw0])
             (by rw [SvmState.readU64_writeU64_same, u64_add_toNat_of_lt _ _ haddLt,
                     eD2 _ (by decide) (by decide), eI1, eI0, eR1, eR0]; omega)
             (fun off hoff => by rw [eF2 off hoff, eF1 off hoff, eF0 off hoff])
@@ -1526,7 +1541,7 @@ theorem creditMarketFromLoser_stock_and_frame
     have hrep0 : repay.toNat = 0 := by
       have : ¬ (0 < repay.toNat) := fun hp => hrep (UInt64.lt_iff_toNat_lt.mpr hp)
       omega
-    exact hStep2 s rfl rfl rfl rfl (by omega) (fun _ _ => rfl) h
+    exact hStep2 s rfl rfl rfl rfl rfl (by omega) (fun _ _ => rfl) h
 
 /-- **Refinement #11c (`realizeWinnerPnl` End-to-End Stock Equality + `I_m`-Fronting Containment)**:
     Directly on `SvmState.mem`, across ALL branches of `Program.realizeWinnerPnl` (0 PnL, warmup,
@@ -1556,12 +1571,12 @@ theorem realizeWinnerPnl_stock_and_frame
     s'.readU64 (legPtrAt fData slotIdx + LegOff.reservedMm) = s.readU64 (legPtrAt fData slotIdx + LegOff.reservedMm) ∧
     (posPnl = 0 → s' = s) := by
   have hslotLt : slotIdx.toNat < 8 := UInt64.lt_iff_toNat_lt.mp hslot
-  have hd200 : dData.toNat + 200 < 2 ^ 64 := hdV
-  have hm352 : mData.toNat + 352 < 2 ^ 64 := hmV
+  have hd208 : dData.toNat + 208 < 2 ^ 64 := hdV
+  have hm400 : mData.toNat + 400 < 2 ^ 64 := hmV
   have hf952 : fData.toNat + 952 < 2 ^ 64 := hfV
-  have hDM' : dData.toNat + 200 ≤ mData.toNat ∨ mData.toNat + 352 ≤ dData.toNat := hDM
-  have hDF' : dData.toNat + 200 ≤ fData.toNat ∨ fData.toNat + 952 ≤ dData.toNat := hDF
-  have hMF' : mData.toNat + 352 ≤ fData.toNat ∨ fData.toNat + 952 ≤ mData.toNat := hMF
+  have hDM' : dData.toNat + 208 ≤ mData.toNat ∨ mData.toNat + 400 ≤ dData.toNat := hDM
+  have hDF' : dData.toNat + 208 ≤ fData.toNat ∨ fData.toNat + 952 ≤ dData.toNat := hDF
+  have hMF' : mData.toNat + 400 ≤ fData.toNat ∨ fData.toNat + 952 ≤ mData.toNat := hMF
   let lp := legPtrAt fData slotIdx
   have hlpNat : lp.toNat = fData.toNat + 120 + slotIdx.toNat * 104 := by
     show (legPtrAt fData slotIdx).toNat = _
@@ -1578,12 +1593,13 @@ theorem realizeWinnerPnl_stock_and_frame
     have : PflOff.totalReservedMm.toNat = 112 := rfl; rw [u64_add_toNat_of_lt _ _ (by omega), this]
   have hlpRaddr : (lp + LegOff.reservedMm).toNat = fData.toNat + 120 + slotIdx.toNat * 104 + 96 := by
     have : LegOff.reservedMm.toNat = 96 := rfl; rw [u64_add_toNat_of_lt _ _ (by rw [hlpNat]; omega), hlpNat, this]
-  have hMout : ∀ (st : SvmState) (off v : UInt64), off.toNat + 8 ≤ 352 →
+  have hMout : ∀ (st : SvmState) (off v : UInt64), off.toNat + 8 ≤ 400 →
       (st.writeU64 (mData + off) v).readU64 (dData + DexOff.vaultBalance) = st.readU64 (dData + DexOff.vaultBalance) ∧
       (st.writeU64 (mData + off) v).readU64 (dData + DexOff.totalCapital) = st.readU64 (dData + DexOff.totalCapital) ∧
       (st.writeU64 (mData + off) v).readU64 (dData + DexOff.totalInsurance) = st.readU64 (dData + DexOff.totalInsurance) ∧
       (st.writeU64 (mData + off) v).readU64 (dData + DexOff.totalResidual) = st.readU64 (dData + DexOff.totalResidual) ∧
       (st.writeU64 (mData + off) v).readU64 (dData + DexOff.totalSurplus) = st.readU64 (dData + DexOff.totalSurplus) ∧
+      (st.writeU64 (mData + off) v).readU64 (dData + DexOff.totalRewards) = st.readU64 (dData + DexOff.totalRewards) ∧
       (st.writeU64 (mData + off) v).readU64 (fData + PflOff.capital) = st.readU64 (fData + PflOff.capital) ∧
       (st.writeU64 (mData + off) v).readU64 (fData + PflOff.totalReservedMm) = st.readU64 (fData + PflOff.totalReservedMm) ∧
       (st.writeU64 (mData + off) v).readU64 (lp + LegOff.reservedMm) = st.readU64 (lp + LegOff.reservedMm) := by
@@ -1591,17 +1607,17 @@ theorem realizeWinnerPnl_stock_and_frame
     have ha : (mData + off).toNat = mData.toNat + off.toNat := u64_add_toNat_of_lt _ _ (by omega)
     have halt : (mData + off).toNat + 8 < 2 ^ 64 := by rw [ha]; omega
     have hdjD : (mData + off).toNat + 8 ≤ dData.toNat ∨ dData.toNat + DexOff.size.toNat ≤ (mData + off).toNat := by
-      have : DexOff.size.toNat = 200 := rfl; rw [ha]; omega
-    have ⟨eV, eC, eI, eR, eS⟩ := dexStockExact_writeU64_outside (s := st) (v := v) hdV halt hdjD
-    refine ⟨eV, eC, eI, eR, eS,
+      have : DexOff.size.toNat = 208 := rfl; rw [ha]; omega
+    have ⟨eV, eC, eI, eR, eS, eRw⟩ := dexStockExact_writeU64_outside (s := st) (v := v) hdV halt hdjD
+    refine ⟨eV, eC, eI, eR, eS, eRw,
       readU64_writeU64_of_disjNat _ _ _ _ halt (by rw [hfCaddr]; omega) (by rw [ha, hfCaddr]; omega),
       readU64_writeU64_of_disjNat _ _ _ _ halt (by rw [hfTaddr]; omega) (by rw [ha, hfTaddr]; omega),
       readU64_writeU64_of_disjNat _ _ _ _ halt (by rw [hlpRaddr]; omega) (by rw [ha, hlpRaddr]; omega)⟩
-  have hDwrite : ∀ (st : SvmState) (doff v : UInt64), doff.toNat + 8 ≤ 200 →
+  have hDwrite : ∀ (st : SvmState) (doff v : UInt64), doff.toNat + 8 ≤ 208 →
       (st.writeU64 (dData + doff) v).readU64 (fData + PflOff.capital) = st.readU64 (fData + PflOff.capital) ∧
       (st.writeU64 (dData + doff) v).readU64 (fData + PflOff.totalReservedMm) = st.readU64 (fData + PflOff.totalReservedMm) ∧
       (st.writeU64 (dData + doff) v).readU64 (lp + LegOff.reservedMm) = st.readU64 (lp + LegOff.reservedMm) ∧
-      (∀ o : UInt64, o.toNat + 8 ≤ 200 → (o.toNat + 8 ≤ doff.toNat ∨ doff.toNat + 8 ≤ o.toNat) →
+      (∀ o : UInt64, o.toNat + 8 ≤ 208 → (o.toNat + 8 ≤ doff.toNat ∨ doff.toNat + 8 ≤ o.toNat) →
         (st.writeU64 (dData + doff) v).readU64 (dData + o) = st.readU64 (dData + o)) := by
     intro st doff v hdoff
     have ha : (dData + doff).toNat = dData.toNat + doff.toNat := u64_add_toNat_of_lt _ _ (by omega)
@@ -1619,14 +1635,15 @@ theorem realizeWinnerPnl_stock_and_frame
       (st.writeU64 (fData + PflOff.capital) v).readU64 (dData + DexOff.totalInsurance) = st.readU64 (dData + DexOff.totalInsurance) ∧
       (st.writeU64 (fData + PflOff.capital) v).readU64 (dData + DexOff.totalResidual) = st.readU64 (dData + DexOff.totalResidual) ∧
       (st.writeU64 (fData + PflOff.capital) v).readU64 (dData + DexOff.totalSurplus) = st.readU64 (dData + DexOff.totalSurplus) ∧
+      (st.writeU64 (fData + PflOff.capital) v).readU64 (dData + DexOff.totalRewards) = st.readU64 (dData + DexOff.totalRewards) ∧
       (st.writeU64 (fData + PflOff.capital) v).readU64 (fData + PflOff.totalReservedMm) = st.readU64 (fData + PflOff.totalReservedMm) ∧
       (st.writeU64 (fData + PflOff.capital) v).readU64 (lp + LegOff.reservedMm) = st.readU64 (lp + LegOff.reservedMm) := by
     intro st v
     have halt : (fData + PflOff.capital).toNat + 8 < 2 ^ 64 := by rw [hfCaddr]; omega
     have hdjD : (fData + PflOff.capital).toNat + 8 ≤ dData.toNat ∨ dData.toNat + DexOff.size.toNat ≤ (fData + PflOff.capital).toNat := by
-      have : DexOff.size.toNat = 200 := rfl; rw [hfCaddr]; omega
-    have ⟨eV, eC, eI, eR, eS⟩ := dexStockExact_writeU64_outside (s := st) (v := v) hdV halt hdjD
-    exact ⟨eV, eC, eI, eR, eS,
+      have : DexOff.size.toNat = 208 := rfl; rw [hfCaddr]; omega
+    have ⟨eV, eC, eI, eR, eS, eRw⟩ := dexStockExact_writeU64_outside (s := st) (v := v) hdV halt hdjD
+    exact ⟨eV, eC, eI, eR, eS, eRw,
       readU64_writeU64_of_disjNat _ _ _ _ halt (by rw [hfTaddr]; omega) (by rw [hfCaddr, hfTaddr]; omega),
       readU64_writeU64_of_disjNat _ _ _ _ halt (by rw [hlpRaddr]; omega) (by rw [hfCaddr, hlpRaddr]; omega)⟩
   have hMemEqPres : ∀ (s1 : SvmState), memEqAbove s1 s s.stackSp →
@@ -1636,11 +1653,12 @@ theorem realizeWinnerPnl_stock_and_frame
       s1.readU64 (dData + DexOff.totalInsurance) = s.readU64 (dData + DexOff.totalInsurance) ∧
       s1.readU64 (dData + DexOff.totalResidual) = s.readU64 (dData + DexOff.totalResidual) ∧
       s1.readU64 (dData + DexOff.totalSurplus) = s.readU64 (dData + DexOff.totalSurplus) ∧
+      s1.readU64 (dData + DexOff.totalRewards) = s.readU64 (dData + DexOff.totalRewards) ∧
       s1.readU64 (fData + PflOff.capital) = s.readU64 (fData + PflOff.capital) ∧
       s1.readU64 (fData + PflOff.totalReservedMm) = s.readU64 (fData + PflOff.totalReservedMm) ∧
       s1.readU64 (lp + LegOff.reservedMm) = s.readU64 (lp + LegOff.reservedMm) := by
     intro s1 hm
-    have hD : ∀ off : UInt64, off.toNat + 8 ≤ 200 → s1.readU64 (dData + off) = s.readU64 (dData + off) := by
+    have hD : ∀ off : UInt64, off.toNat + 8 ≤ 208 → s1.readU64 (dData + off) = s.readU64 (dData + off) := by
       intro off hoff
       have hadd := u64_add_toNat_of_lt dData off (by omega)
       exact readU64_of_memEqAbove hm
@@ -1659,8 +1677,9 @@ theorem realizeWinnerPnl_stock_and_frame
     have eI := hD DexOff.totalInsurance (by decide)
     have eR := hD DexOff.totalResidual (by decide)
     have eS := hD DexOff.totalSurplus (by decide)
-    exact ⟨by unfold dexStockExact at hStock ⊢; rw [eC, eI, eR, eS, eV]; exact hStock,
-           eV, eC, eI, eR, eS, hF PflOff.capital (by decide), hF PflOff.totalReservedMm (by decide), hL⟩
+    have eRw := hD DexOff.totalRewards (by decide)
+    exact ⟨by unfold dexStockExact at hStock ⊢; rw [eC, eI, eR, eS, eRw, eV]; exact hStock,
+           eV, eC, eI, eR, eS, eRw, hF PflOff.capital (by decide), hF PflOff.totalReservedMm (by decide), hL⟩
   unfold realizeWinnerPnl at h
   by_cases hp0 : (posPnl == 0) = true
   · rw [ite_eq_left_of_eq_true _ _ (eq_true hp0)] at h
@@ -1679,7 +1698,7 @@ theorem realizeWinnerPnl_stock_and_frame
       | ok pay s1 =>
         rw [hpay] at h; dsimp only at h
         have ⟨_, hsp1Le, hsp1Lo, hmem1⟩ := haircutPayoutU64_refines_spec _ _ _ _ _ _ (by omega) hpay
-        have ⟨hSt1, hV1, hC1, hI1, hR1, hS1, hFC1, hFT1, hLR1⟩ := hMemEqPres s1 hmem1
+        have ⟨hSt1, hV1, hC1, hI1, hR1, hS1, hRw1, hFC1, hFT1, hLR1⟩ := hMemEqPres s1 hmem1
         have hFinish : ∀ (s2 : SvmState),
             dexStockExact s2 dData →
             s2.readU64 (dData + DexOff.vaultBalance) = s.readU64 (dData + DexOff.vaultBalance) →
@@ -1702,9 +1721,9 @@ theorem realizeWinnerPnl_stock_and_frame
           | ok u s3 =>
             rw [hsubP] at hf; dsimp only [Pure.pure, SolanaM.pure] at hf; cases hf
             have ⟨_, hs3⟩ := subU64At_ok_spec _ _ _ _ _ hsubP; subst hs3
-            have ⟨eV, eC, eI, eR, eS, eFC, eFT, eLR⟩ :=
+            have ⟨eV, eC, eI, eR, eS, eRw, eFC, eFT, eLR⟩ :=
               hMout s2 MktOff.totalPosPnl (s2.readU64 (mData + MktOff.totalPosPnl) - posPnl) (by decide)
-            exact ⟨by unfold dexStockExact at hSt2 ⊢; rw [eC, eI, eR, eS, eV]; exact hSt2,
+            exact ⟨by unfold dexStockExact at hSt2 ⊢; rw [eC, eI, eR, eS, eRw, eV]; exact hSt2,
                    by rw [eV, hV2], by rw [writeU64_stackSp, hsp2]; exact hsp1Le,
                    by rw [writeU64_stackSp, hsp2]; omega,
                    by rw [eFC]; exact hCap2, by rw [eFT, hT2], by rw [eLR, hL2],
@@ -1731,11 +1750,11 @@ theorem realizeWinnerPnl_stock_and_frame
                   have ⟨hsubRLt, hs1b⟩ := subU64At_ok_spec _ _ _ _ _ h2
                   have ⟨haddFLt, hs1c⟩ := addU64At_ok_spec _ _ _ _ _ h3
                   have ⟨haddCLt, hs2⟩ := addU64At_ok_spec _ _ _ _ _ h4
-                  have ⟨eV1, eC1, eI1, eR1, eS1, eFC1, eFT1, eLR1⟩ :=
+                  have ⟨eV1, eC1, eI1, eR1, eS1, eRw1, eFC1, eFT1, eLR1⟩ :=
                     hMout s1 MktOff.realizedPool (s1.readU64 (mData + MktOff.realizedPool) - pay) (by decide)
                   have ⟨eFC2, eFT2, eLR2, eD2⟩ :=
                     hDwrite s1a DexOff.totalResidual (s1a.readU64 (dData + DexOff.totalResidual) - pay) (by decide)
-                  have ⟨eV3, eC3, eI3, eR3, eS3, eFT3, eLR3⟩ :=
+                  have ⟨eV3, eC3, eI3, eR3, eS3, eRw3, eFT3, eLR3⟩ :=
                     hFcapWrite s1b (s1b.readU64 (fData + PflOff.capital) + pay)
                   have ⟨eFC4, eFT4, eLR4, eD4⟩ :=
                     hDwrite s1c DexOff.totalCapital (s1c.readU64 (dData + DexOff.totalCapital) + pay) (by decide)
@@ -1749,11 +1768,13 @@ theorem realizeWinnerPnl_stock_and_frame
                     rw [SvmState.readU64_writeU64_same, u64_add_toNat_of_lt _ _ haddCLt,
                         eD4 _ (by decide) (by decide), eD4 _ (by decide) (by decide),
                         eD4 _ (by decide) (by decide), eD4 _ (by decide) (by decide),
-                        eC3, eI3, eR3, eS3, eV3,
+                        eD4 _ (by decide) (by decide),
+                        eC3, eI3, eR3, eS3, eRw3, eV3,
                         SvmState.readU64_writeU64_same, u64_sub_toNat_of_le _ _ (UInt64.le_iff_toNat_le.mp hsubRLt),
                         eD2 _ (by decide) (by decide), eD2 _ (by decide) (by decide),
                         eD2 _ (by decide) (by decide), eD2 _ (by decide) (by decide),
-                        eC1, eI1, eR1, eS1, eV1]
+                        eD2 _ (by decide) (by decide),
+                        eC1, eI1, eR1, eS1, eRw1, eV1]
                     have hleR : pay.toNat ≤ (s1.readU64 (dData + DexOff.totalResidual)).toNat := by
                       rw [← eR1]; exact UInt64.le_iff_toNat_le.mp hsubRLt
                     omega
@@ -1781,7 +1802,7 @@ theorem realizeWinnerPnl_stock_and_frame
           intro availIns s1 hsp1Le hsp1Lo hmem1 h2
           unfold realizeFrontedPnl at h2
           simp only [Bind.bind, SolanaM.bind] at h2
-          have ⟨hSt1, hV1, hC1, hI1, hR1, hS1, hFC1, hFT1, hLR1⟩ := hMemEqPres s1 hmem1
+          have ⟨hSt1, hV1, hC1, hI1, hR1, hS1, hRw1, hFC1, hFT1, hLR1⟩ := hMemEqPres s1 hmem1
           cases haddT : checkedAdd64 rPool availIns s1 with
           | err c st => rw [haddT] at h2; cases h2
           | ok totAvail s1a =>
@@ -1803,6 +1824,7 @@ theorem realizeWinnerPnl_stock_and_frame
                   s3.readU64 (dData + DexOff.vaultBalance) = s.readU64 (dData + DexOff.vaultBalance) →
                   s3.readU64 (dData + DexOff.totalCapital) = s1.readU64 (dData + DexOff.totalCapital) →
                   s3.readU64 (dData + DexOff.totalSurplus) = s1.readU64 (dData + DexOff.totalSurplus) →
+                  s3.readU64 (dData + DexOff.totalRewards) = s1.readU64 (dData + DexOff.totalRewards) →
                   (s3.readU64 (dData + DexOff.totalInsurance)).toNat + (s3.readU64 (dData + DexOff.totalResidual)).toNat + posPnl.toNat =
                     (s1.readU64 (dData + DexOff.totalInsurance)).toNat + (s1.readU64 (dData + DexOff.totalResidual)).toNat →
                   s3.readU64 (fData + PflOff.capital) = s.readU64 (fData + PflOff.capital) →
@@ -1819,7 +1841,7 @@ theorem realizeWinnerPnl_stock_and_frame
                   s'.readU64 (fData + PflOff.totalReservedMm) = s.readU64 (fData + PflOff.totalReservedMm) ∧
                   s'.readU64 (lp + LegOff.reservedMm) = s.readU64 (lp + LegOff.reservedMm) ∧
                   (posPnl = 0 → s' = s) := by
-                intro s3 hsp3 hV3 hC3 hS3 hIR3 hFC3 hFT3 hLR3 ha
+                intro s3 hsp3 hV3 hC3 hS3 hRw3 hIR3 hFC3 hFT3 hLR3 ha
                 unfold SolanaM.bind at ha
                 cases hfc : addU64At fData PflOff.capital posPnl s3 with
                 | err c st => rw [hfc] at ha; cases ha
@@ -1836,11 +1858,11 @@ theorem realizeWinnerPnl_stock_and_frame
                       have ⟨hfcLt, hs3a⟩ := addU64At_ok_spec _ _ _ _ _ hfc
                       have ⟨hdcLt, hs3b⟩ := addU64At_ok_spec _ _ _ _ _ hdc
                       have ⟨_, hs4⟩ := subU64At_ok_spec _ _ _ _ _ hmp
-                      have ⟨eV1, eC1, eI1, eR1, eS1, eFT1, eLR1⟩ :=
+                      have ⟨eV1, eC1, eI1, eR1, eS1, eRw1, eFT1, eLR1⟩ :=
                         hFcapWrite s3 (s3.readU64 (fData + PflOff.capital) + posPnl)
                       have ⟨eFC2, eFT2, eLR2, eD2⟩ :=
                         hDwrite s3a DexOff.totalCapital (s3a.readU64 (dData + DexOff.totalCapital) + posPnl) (by decide)
-                      have ⟨eV3, eC3, eI3, eR3, eS3, eFC3, eFT3, eLR3⟩ :=
+                      have ⟨eV3, eC3, eI3, eR3, eS3, eRw3, eFC3, eFT3, eLR3⟩ :=
                         hMout s3b MktOff.totalPosPnl (s3b.readU64 (mData + MktOff.totalPosPnl) - posPnl) (by decide)
                       subst hs3a; subst hs3b; subst hs4
                       refine ⟨?_, by rw [eV3, eD2 _ (by decide) (by decide), eV1, hV3],
@@ -1851,17 +1873,19 @@ theorem realizeWinnerPnl_stock_and_frame
                               by rw [eLR3, eLR2, eLR1, hLR3],
                               fun hz => absurd hz hPosNe0⟩
                       unfold dexStockExact at hSt1 ⊢
-                      rw [eC3, eI3, eR3, eS3, eV3,
+                      rw [eC3, eI3, eR3, eS3, eRw3, eV3,
                           SvmState.readU64_writeU64_same, u64_add_toNat_of_lt _ _ hdcLt,
                           eD2 _ (by decide) (by decide), eD2 _ (by decide) (by decide),
                           eD2 _ (by decide) (by decide), eD2 _ (by decide) (by decide),
-                          eC1, eI1, eR1, eS1, eV1, hC3, hS3, hV3, ← hV1]
+                          eD2 _ (by decide) (by decide),
+                          eC1, eI1, eR1, eS1, eRw1, eV1, hC3, hS3, hRw3, hV3, ← hV1]
                       omega
               have hStepIns : ∀ (s2 : SvmState),
                   s2.stackSp = s1.stackSp →
                   s2.readU64 (dData + DexOff.vaultBalance) = s.readU64 (dData + DexOff.vaultBalance) →
                   s2.readU64 (dData + DexOff.totalCapital) = s1.readU64 (dData + DexOff.totalCapital) →
                   s2.readU64 (dData + DexOff.totalSurplus) = s1.readU64 (dData + DexOff.totalSurplus) →
+                  s2.readU64 (dData + DexOff.totalRewards) = s1.readU64 (dData + DexOff.totalRewards) →
                   (s2.readU64 (dData + DexOff.totalInsurance)).toNat + (s2.readU64 (dData + DexOff.totalResidual)).toNat + fromR.toNat =
                     (s1.readU64 (dData + DexOff.totalInsurance)).toNat + (s1.readU64 (dData + DexOff.totalResidual)).toNat →
                   s2.readU64 (fData + PflOff.capital) = s.readU64 (fData + PflOff.capital) →
@@ -1887,7 +1911,7 @@ theorem realizeWinnerPnl_stock_and_frame
                   s'.readU64 (fData + PflOff.totalReservedMm) = s.readU64 (fData + PflOff.totalReservedMm) ∧
                   s'.readU64 (lp + LegOff.reservedMm) = s.readU64 (lp + LegOff.reservedMm) ∧
                   (posPnl = 0 → s' = s) := by
-                intro s2 hsp2 hV2 hC2 hS2 hIR2 hFC2 hFT2 hLR2 hi
+                intro s2 hsp2 hV2 hC2 hS2 hRw2 hIR2 hFC2 hFT2 hLR2 hi
                 by_cases hfi : fromIns > 0
                 · rw [ite_eq_left_of_eq_true _ _ (eq_true hfi)] at hi
                   unfold SolanaM.bind at hi
@@ -1906,11 +1930,11 @@ theorem realizeWinnerPnl_stock_and_frame
                         have ⟨_, hs2a⟩ := subU64At_ok_spec _ _ _ _ _ hmi
                         have ⟨hdiLe, hs2b⟩ := subU64At_ok_spec _ _ _ _ _ hdi
                         have ⟨_, hs3⟩ := addU64At_ok_spec _ _ _ _ _ hmf
-                        have ⟨eV1, eC1, eI1, eR1, eS1, eFC1, eFT1, eLR1⟩ :=
+                        have ⟨eV1, eC1, eI1, eR1, eS1, eRw1, eFC1, eFT1, eLR1⟩ :=
                           hMout s2 MktOff.insurance (s2.readU64 (mData + MktOff.insurance) - fromIns) (by decide)
                         have ⟨eFC2, eFT2, eLR2, eD2⟩ :=
                           hDwrite s2a DexOff.totalInsurance (s2a.readU64 (dData + DexOff.totalInsurance) - fromIns) (by decide)
-                        have ⟨eV3, eC3, eI3, eR3, eS3, eFC3, eFT3, eLR3⟩ :=
+                        have ⟨eV3, eC3, eI3, eR3, eS3, eRw3, eFC3, eFT3, eLR3⟩ :=
                           hMout s2b MktOff.insFronted (s2b.readU64 (mData + MktOff.insFronted) + fromIns) (by decide)
                         subst hs2a; subst hs2b; subst hs3
                         have hleI : fromIns.toNat ≤ (s2.readU64 (dData + DexOff.totalInsurance)).toNat := by
@@ -1919,6 +1943,7 @@ theorem realizeWinnerPnl_stock_and_frame
                           (by rw [eV3, eD2 _ (by decide) (by decide), eV1, hV2])
                           (by rw [eC3, eD2 _ (by decide) (by decide), eC1, hC2])
                           (by rw [eS3, eD2 _ (by decide) (by decide), eS1, hS2])
+                          (by rw [eRw3, eD2 _ (by decide) (by decide), eRw1, hRw2])
                           (by rw [eI3, eR3, SvmState.readU64_writeU64_same, u64_sub_toNat_of_le _ _ (UInt64.le_iff_toNat_le.mp hdiLe),
                                   eD2 _ (by decide) (by decide), eI1, eR1]; omega)
                           (by rw [eFC3, eFC2, eFC1, hFC2])
@@ -1929,7 +1954,7 @@ theorem realizeWinnerPnl_stock_and_frame
                   have hfi0 : fromIns.toNat = 0 := by
                     have : ¬ (0 < fromIns.toNat) := fun hp => hfi (UInt64.lt_iff_toNat_lt.mpr hp)
                     omega
-                  exact hAfterDebits s2 hsp2 hV2 hC2 hS2 (by omega) hFC2 hFT2 hLR2 hi
+                  exact hAfterDebits s2 hsp2 hV2 hC2 hS2 hRw2 (by omega) hFC2 hFT2 hLR2 hi
               by_cases hfrR : fromR > 0
               · rw [ite_eq_left_of_eq_true _ _ (eq_true hfrR)] at h2
                 unfold SolanaM.bind at h2
@@ -1943,7 +1968,7 @@ theorem realizeWinnerPnl_stock_and_frame
                     rw [hdr] at h2; dsimp only at h2
                     have ⟨_, hs1a⟩ := subU64At_ok_spec _ _ _ _ _ hmr
                     have ⟨hdrLe, hs2⟩ := subU64At_ok_spec _ _ _ _ _ hdr
-                    have ⟨eV1, eC1, eI1, eR1, eS1, eFC1, eFT1, eLR1⟩ :=
+                    have ⟨eV1, eC1, eI1, eR1, eS1, eRw1, eFC1, eFT1, eLR1⟩ :=
                       hMout s1 MktOff.realizedPool (s1.readU64 (mData + MktOff.realizedPool) - fromR) (by decide)
                     have ⟨eFC2, eFT2, eLR2, eD2⟩ :=
                       hDwrite s1a DexOff.totalResidual (s1a.readU64 (dData + DexOff.totalResidual) - fromR) (by decide)
@@ -1954,6 +1979,7 @@ theorem realizeWinnerPnl_stock_and_frame
                       (by rw [eD2 _ (by decide) (by decide), eV1, hV1])
                       (by rw [eD2 _ (by decide) (by decide), eC1])
                       (by rw [eD2 _ (by decide) (by decide), eS1])
+                      (by rw [eD2 _ (by decide) (by decide), eRw1])
                       (by rw [eD2 _ (by decide) (by decide), eI1,
                               SvmState.readU64_writeU64_same, u64_sub_toNat_of_le _ _ (UInt64.le_iff_toNat_le.mp hdrLe), eR1]; omega)
                       (by rw [eFC2, eFC1, hFC1])
@@ -1964,7 +1990,7 @@ theorem realizeWinnerPnl_stock_and_frame
                 have hfrR0 : fromR.toNat = 0 := by
                   have : ¬ (0 < fromR.toNat) := fun hp => hfrR (UInt64.lt_iff_toNat_lt.mpr hp)
                   omega
-                exact hStepIns s1 rfl hV1 rfl rfl (by omega) hFC1 hFT1 hLR1 h2
+                exact hStepIns s1 rfl hV1 rfl rfl rfl (by omega) hFC1 hFT1 hLR1 h2
             · rw [ite_eq_right_of_eq_false _ _ (eq_false hcov)] at h2
               dsimp only [Pure.pure, SolanaM.pure, SolanaM.bind] at h2; cases h2
               exact ⟨hSt1, hV1, hsp1Le, hsp1Lo, by rw [hFC1]; exact Nat.le_refl _, hFT1, hLR1,
@@ -2036,8 +2062,8 @@ theorem settleAndRefreshLeg_preserves_stock_and_no_shielding
       (dexStockExact st dData → dexStockExact (st.writeU64 a v) dData) ∧
       (st.writeU64 a v).readU64 (dData + DexOff.vaultBalance) = st.readU64 (dData + DexOff.vaultBalance) := by
     intro st a v ha hdj
-    have ⟨eV, eC, eI, eR, eS⟩ := dexStockExact_writeU64_outside (s := st) (v := v) hdV ha hdj
-    exact ⟨fun hs => by unfold dexStockExact at hs ⊢; rw [eC, eI, eR, eS, eV]; exact hs, eV⟩
+    have ⟨eV, eC, eI, eR, eS, eRw⟩ := dexStockExact_writeU64_outside (s := st) (v := v) hdV ha hdj
+    exact ⟨fun hs => by unfold dexStockExact at hs ⊢; rw [eC, eI, eR, eS, eRw, eV]; exact hs, eV⟩
   have hFread_of_write_out : ∀ (st : SvmState) (a v off : UInt64),
       a.toNat + 8 < 2 ^ 64 → off.toNat + 8 ≤ 952 →
       (a.toNat + 8 ≤ fData.toNat ∨ fData.toNat + 952 ≤ a.toNat) →
@@ -2055,7 +2081,7 @@ theorem settleAndRefreshLeg_preserves_stock_and_no_shielding
     intro s1 s2 hsp1 hm
     have hd1 : s1.stackSp ≤ dData := UInt64.le_trans hsp1 hdSt
     have hf1 : s1.stackSp ≤ fData := UInt64.le_trans hsp1 hfSt
-    have hD : ∀ off : UInt64, off.toNat + 8 ≤ 200 → s2.readU64 (dData + off) = s1.readU64 (dData + off) := by
+    have hD : ∀ off : UInt64, off.toNat + 8 ≤ 208 → s2.readU64 (dData + off) = s1.readU64 (dData + off) := by
       intro off hoff
       have hadd := u64_add_toNat_of_lt dData off (by unfold regionValid at hdV; simp [DexOff.size] at *; omega)
       exact readU64_of_memEqAbove hm
@@ -2067,7 +2093,7 @@ theorem settleAndRefreshLeg_preserves_stock_and_no_shielding
       exact readU64_of_memEqAbove hm
         (u64_le_of_add_lt _ _ _ (UInt64.le_iff_toNat_le.mp hf1) (by unfold regionValid at hfV; simp [PflOff.size] at *; omega))
         (by rw [hadd]; unfold regionValid at hfV; simp [PflOff.size] at *; omega)
-    refine ⟨fun hs => by unfold dexStockExact at hs ⊢; rw [hD _ (by decide), hD _ (by decide), hD _ (by decide), hD _ (by decide), hD _ (by decide)]; exact hs,
+    refine ⟨fun hs => by unfold dexStockExact at hs ⊢; rw [hD _ (by decide), hD _ (by decide), hD _ (by decide), hD _ (by decide), hD _ (by decide), hD _ (by decide)]; exact hs,
             hD _ (by decide), hF _ (by decide)⟩
   -- Phase 3 (`storeU64 lp posPnl` + `syncLegMargins` + `return sf`)
   have hPhase3 : ∀ (posPnlMid sf : UInt64) (sMid : SvmState),
@@ -2109,7 +2135,7 @@ theorem settleAndRefreshLeg_preserves_stock_and_no_shielding
       have hSt' : dexStockExact s' dData := by
         have hStW' := hStW hStM
         unfold dexStockExact at hStW' ⊢
-        rw [hDpres _ (by decide), hDpres _ (by decide), hDpres _ (by decide), hDpres _ (by decide), hDpres _ (by decide)]
+        rw [hDpres _ (by decide), hDpres _ (by decide), hDpres _ (by decide), hDpres _ (by decide), hDpres _ (by decide), hDpres _ (by decide)]
         exact hStW'
       have hV' : s'.readU64 (dData + DexOff.vaultBalance) = s.readU64 (dData + DexOff.vaultBalance) := by
         rw [hDpres _ (by decide), hVW, hVM]
@@ -2172,10 +2198,10 @@ theorem settleAndRefreshLeg_preserves_stock_and_no_shielding
           | ok u s2 =>
             rw [haddM] at h; dsimp only [storeU64, rawStoreU64, Pure.pure, SolanaM.pure] at h
             have ⟨_, hs2⟩ := addU64At_ok_spec _ _ _ _ _ haddM; subst hs2
-            have hm352 : mData.toNat + 352 < 2 ^ 64 := hmV
+            have hm400 : mData.toNat + 400 < 2 ^ 64 := hmV
             have hf952 : fData.toNat + 952 < 2 ^ 64 := hfV
-            have hDM' : dData.toNat + 200 ≤ mData.toNat ∨ mData.toNat + 352 ≤ dData.toNat := hDM
-            have hDF' : dData.toNat + 200 ≤ fData.toNat ∨ fData.toNat + 952 ≤ dData.toNat := hDF
+            have hDM' : dData.toNat + 208 ≤ mData.toNat ∨ mData.toNat + 400 ≤ dData.toNat := hDM
+            have hDF' : dData.toNat + 208 ≤ fData.toNat ∨ fData.toNat + 952 ≤ dData.toNat := hDF
             have hmPaddr : (mData + MktOff.totalPosPnl).toNat = mData.toNat + 240 := by
               have h240 : MktOff.totalPosPnl.toNat = 240 := rfl; rw [u64_add_toNat_of_lt _ _ (by omega), h240]
             have hmPlt : (mData + MktOff.totalPosPnl).toNat + 8 < 2 ^ 64 := by rw [hmPaddr]; omega
@@ -2184,9 +2210,9 @@ theorem settleAndRefreshLeg_preserves_stock_and_no_shielding
             have hEKlt : (lp + LegOff.entryK).toNat + 8 < 2 ^ 64 := by rw [hEKaddr]; omega
             let vGain := s1.readU64 (mData + MktOff.totalPosPnl) + gain
             have ⟨hSt2a, hV2a⟩ := hDwriteOut s1 (mData + MktOff.totalPosPnl) vGain hmPlt
-              (by have : DexOff.size.toNat = 200 := rfl; rw [hmPaddr]; omega)
+              (by have : DexOff.size.toNat = 208 := rfl; rw [hmPaddr]; omega)
             have ⟨hSt2b, hV2b⟩ := hDwriteOut (s1.writeU64 (mData + MktOff.totalPosPnl) vGain) (lp + LegOff.entryK) kSide hEKlt
-              (by have : DexOff.size.toNat = 200 := rfl; rw [hEKaddr]; omega)
+              (by have : DexOff.size.toNat = 208 := rfl; rw [hEKaddr]; omega)
             exact hPhase2 posPnl1 0 _ (by rw [writeU64_stackSp, writeU64_stackSp]; omega)
               (by rw [writeU64_stackSp, writeU64_stackSp]; exact hsp1Le)
               (hSt2b (hSt2a (hSt1f hStock))) (hV2b.trans (hV2a.trans hV1f))
@@ -2284,7 +2310,7 @@ theorem settleAndRefreshLeg_preserves_stock_and_no_shielding
               have hCaddr : (fData + PflOff.capital).toNat = fData.toNat + 88 := by
                 have h88 : PflOff.capital.toNat = 88 := rfl; rw [u64_add_toNat_of_lt _ _ (by omega), h88]
               have ⟨hSt4e, hV4e⟩ := hDwriteOut s4 (lp + LegOff.entryK) kSide hEKlt
-                (by rw [hEKaddr]; have hDF' : dData.toNat + 200 ≤ fData.toNat ∨ fData.toNat + 952 ≤ dData.toNat := hDF; have : DexOff.size.toNat = 200 := rfl; omega)
+                (by rw [hEKaddr]; have hDF' : dData.toNat + 208 ≤ fData.toNat ∨ fData.toNat + 952 ≤ dData.toNat := hDF; have : DexOff.size.toNat = 208 := rfl; omega)
               exact hPhase2 posPnl1 sfOut _ (by rw [writeU64_stackSp, hsp4]; omega)
                 (by rw [writeU64_stackSp, hsp4]; exact hsp1Le)
                 (hSt4e hSt4) (hV4e.trans hV4)
@@ -2334,15 +2360,15 @@ theorem settleAndRefreshLeg_preserves_stock_and_no_shielding
                   | ok u s4 =>
                     rw [hsubF] at had; dsimp only [Pure.pure, SolanaM.pure] at had
                     have ⟨_, hs4⟩ := subU64At_ok_spec _ _ _ _ _ hsubF; subst hs4
-                    have hm352 : mData.toNat + 352 < 2 ^ 64 := hmV
-                    have hDM' : dData.toNat + 200 ≤ mData.toNat ∨ mData.toNat + 352 ≤ dData.toNat := hDM
-                    have hMF' : mData.toNat + 352 ≤ fData.toNat ∨ fData.toNat + 952 ≤ mData.toNat := hMF
+                    have hm400 : mData.toNat + 400 < 2 ^ 64 := hmV
+                    have hDM' : dData.toNat + 208 ≤ mData.toNat ∨ mData.toNat + 400 ≤ dData.toNat := hDM
+                    have hMF' : mData.toNat + 400 ≤ fData.toNat ∨ fData.toNat + 952 ≤ mData.toNat := hMF
                     have hmFaddr : (mData + MktOff.insFronted).toNat = mData.toNat + 232 := by
                       have : MktOff.insFronted.toNat = 232 := rfl; rw [u64_add_toNat_of_lt _ _ (by omega), this]
                     have hmFlt : (mData + MktOff.insFronted).toNat + 8 < 2 ^ 64 := by rw [hmFaddr]; omega
                     have hMFout : (mData + MktOff.insFronted).toNat + 8 ≤ fData.toNat ∨ fData.toNat + 952 ≤ (mData + MktOff.insFronted).toNat := by rw [hmFaddr]; omega
                     have ⟨hSt4, hV4⟩ := hDwriteOut s3 (mData + MktOff.insFronted) (s3.readU64 (mData + MktOff.insFronted) - wo) hmFlt
-                      (by have : DexOff.size.toNat = 200 := rfl; rw [hmFaddr]; omega)
+                      (by have : DexOff.size.toNat = 208 := rfl; rw [hmFaddr]; omega)
                     exact hAfterWo (sf - wo) _ (by rw [writeU64_stackSp, hsp3]) (hSt4 hSt3) (hV4.trans hV3)
                       (fun _ => ⟨hPnlZ, by rw [hFread_of_write_out _ _ _ _ hmFlt (by decide) hMFout, hCapZ]⟩) had
                 · rw [ite_eq_right_of_eq_false _ _ (eq_false hwo)] at had
@@ -2352,17 +2378,17 @@ theorem settleAndRefreshLeg_preserves_stock_and_no_shielding
             · rw [ite_eq_left_of_eq_true _ _ (eq_true hdp)] at hab
               simp only [storeU64, rawStoreU64, SolanaM.bind] at hab
               let s2w := s2.writeU64 (fData + PflOff.capital) (cap - capDeb)
-              have hd200 : dData.toNat + 200 < 2 ^ 64 := hdV
-              have hm352 : mData.toNat + 352 < 2 ^ 64 := hmV
+              have hd208 : dData.toNat + 208 < 2 ^ 64 := hdV
+              have hm400 : mData.toNat + 400 < 2 ^ 64 := hmV
               have hf952 : fData.toNat + 952 < 2 ^ 64 := hfV
-              have hDM' : dData.toNat + 200 ≤ mData.toNat ∨ mData.toNat + 352 ≤ dData.toNat := hDM
-              have hDF' : dData.toNat + 200 ≤ fData.toNat ∨ fData.toNat + 952 ≤ dData.toNat := hDF
-              have hMF' : mData.toNat + 352 ≤ fData.toNat ∨ fData.toNat + 952 ≤ mData.toNat := hMF
+              have hDM' : dData.toNat + 208 ≤ mData.toNat ∨ mData.toNat + 400 ≤ dData.toNat := hDM
+              have hDF' : dData.toNat + 208 ≤ fData.toNat ∨ fData.toNat + 952 ≤ dData.toNat := hDF
+              have hMF' : mData.toNat + 400 ≤ fData.toNat ∨ fData.toNat + 952 ≤ mData.toNat := hMF
               have hfCaddr : (fData + PflOff.capital).toNat = fData.toNat + 88 := by
                 have : PflOff.capital.toNat = 88 := rfl; rw [u64_add_toNat_of_lt _ _ (by omega), this]
               have hfClt : (fData + PflOff.capital).toNat + 8 < 2 ^ 64 := by rw [hfCaddr]; omega
               have ⟨hSt2w, hV2w⟩ := hDwriteOut s2 (fData + PflOff.capital) (cap - capDeb) hfClt
-                (by have : DexOff.size.toNat = 200 := rfl; rw [hfCaddr]; omega)
+                (by have : DexOff.size.toNat = 208 := rfl; rw [hfCaddr]; omega)
               cases hsubC : subU64At dData DexOff.totalCapital capDeb s2w with
               | err c st => rw [hsubC] at hab; cases hab
               | ok u s2a =>
@@ -2372,13 +2398,13 @@ theorem settleAndRefreshLeg_preserves_stock_and_no_shielding
                 | ok u s3 =>
                   rw [hcred] at hab; dsimp only at hab
                   have ⟨hsubCLt, hs2a⟩ := subU64At_ok_spec _ _ _ _ _ hsubC
-                  have ⟨hs3sp, hV3, hC3, hS3, hIR3, hF3⟩ :=
+                  have ⟨hs3sp, hV3, hC3, hS3, hRw3, hIR3, hF3⟩ :=
                     creditMarketFromLoser_stock_and_frame dData mData fData capDeb s2a s3 hdV hmV hfV hDM hDF hMF hcred
                   have hDCaddr : (dData + DexOff.totalCapital).toNat = dData.toNat + 168 := by
                     have : DexOff.totalCapital.toNat = 168 := rfl; rw [u64_add_toNat_of_lt _ _ (by omega), this]
                   have hDClt : (dData + DexOff.totalCapital).toNat + 8 < 2 ^ 64 := by rw [hDCaddr]; omega
                   have hDCout : (dData + DexOff.totalCapital).toNat + 8 ≤ fData.toNat ∨ fData.toNat + 952 ≤ (dData + DexOff.totalCapital).toNat := by rw [hDCaddr]; omega
-                  have hDdisj : ∀ o : UInt64, o.toNat + 8 ≤ 200 → (o.toNat + 8 ≤ 168 ∨ 176 ≤ o.toNat) →
+                  have hDdisj : ∀ o : UInt64, o.toNat + 8 ≤ 208 → (o.toNat + 8 ≤ 168 ∨ 176 ≤ o.toNat) →
                       s2a.readU64 (dData + o) = s2w.readU64 (dData + o) := by
                     intro o ho hdj
                     have hoa : (dData + o).toNat = dData.toNat + o.toNat := u64_add_toNat_of_lt _ _ (by omega)
@@ -2393,12 +2419,13 @@ theorem settleAndRefreshLeg_preserves_stock_and_no_shielding
                     have hleC : capDeb.toNat ≤ (s2w.readU64 (dData + DexOff.totalCapital)).toNat :=
                       UInt64.le_iff_toNat_le.mp hsubCLt
                     unfold dexStockExact at hStw ⊢
-                    rw [hV3, hC3, hS3, Nat.add_assoc (s2a.readU64 (dData + DexOff.totalCapital)).toNat, hIR3,
+                    rw [hV3, hC3, hS3, hRw3, Nat.add_assoc (s2a.readU64 (dData + DexOff.totalCapital)).toNat, hIR3,
                         hCap2a,
                         hDdisj DexOff.vaultBalance (by decide) (by decide),
                         hDdisj DexOff.totalInsurance (by decide) (by decide),
                         hDdisj DexOff.totalResidual (by decide) (by decide),
-                        hDdisj DexOff.totalSurplus (by decide) (by decide)]
+                        hDdisj DexOff.totalSurplus (by decide) (by decide),
+                        hDdisj DexOff.totalRewards (by decide) (by decide)]
                     omega
                   have hV3' : s3.readU64 (dData + DexOff.vaultBalance) = s.readU64 (dData + DexOff.vaultBalance) := by
                     rw [hV3, hDdisj DexOff.vaultBalance (by decide) (by decide), hV2w, hV2]
@@ -2427,13 +2454,13 @@ theorem settleAndRefreshLeg_preserves_stock_and_no_shielding
             | ok u s2 =>
               rw [hburn] at h; dsimp only at h
               have ⟨_, hs2⟩ := subU64At_ok_spec _ _ _ _ _ hburn
-              have hm352 : mData.toNat + 352 < 2 ^ 64 := hmV
-              have hDM' : dData.toNat + 200 ≤ mData.toNat ∨ mData.toNat + 352 ≤ dData.toNat := hDM
+              have hm400 : mData.toNat + 400 < 2 ^ 64 := hmV
+              have hDM' : dData.toNat + 208 ≤ mData.toNat ∨ mData.toNat + 400 ≤ dData.toNat := hDM
               have hmPaddr : (mData + MktOff.totalPosPnl).toNat = mData.toNat + 240 := by
                 have h240 : MktOff.totalPosPnl.toNat = 240 := rfl; rw [u64_add_toNat_of_lt _ _ (by omega), h240]
               have hmPlt : (mData + MktOff.totalPosPnl).toNat + 8 < 2 ^ 64 := by rw [hmPaddr]; omega
               have ⟨hSt2, hV2⟩ := hDwriteOut s1 (mData + MktOff.totalPosPnl) (s1.readU64 (mData + MktOff.totalPosPnl) - pnlBurned) hmPlt
-                (by have : DexOff.size.toNat = 200 := rfl; rw [hmPaddr]; omega)
+                (by have : DexOff.size.toNat = 208 := rfl; rw [hmPaddr]; omega)
               exact hAfterBurn s2 (by rw [hs2, writeU64_stackSp])
                 (by rw [hs2]; exact hSt2 (hSt1f hStock)) (by rw [hs2]; exact hV2.trans hV1f) h
           · rw [ite_eq_right_of_eq_false _ _ (eq_false hbp)] at h
@@ -2441,12 +2468,12 @@ theorem settleAndRefreshLeg_preserves_stock_and_no_shielding
       · rw [ite_eq_right_of_eq_false _ _ (eq_false hloss)] at h
         dsimp only [storeU64, rawStoreU64, Pure.pure, SolanaM.pure] at h
         have hf952 : fData.toNat + 952 < 2 ^ 64 := hfV
-        have hDF' : dData.toNat + 200 ≤ fData.toNat ∨ fData.toNat + 952 ≤ dData.toNat := hDF
+        have hDF' : dData.toNat + 208 ≤ fData.toNat ∨ fData.toNat + 952 ≤ dData.toNat := hDF
         have hEKaddr : (lp + LegOff.entryK).toNat = fData.toNat + 120 + slotIdx.toNat * 104 + 56 := by
           have h56 : LegOff.entryK.toNat = 56 := rfl; rw [u64_add_toNat_of_lt _ _ (by rw [hlpNat]; omega), hlpNat, h56]
         have hEKlt : (lp + LegOff.entryK).toNat + 8 < 2 ^ 64 := by rw [hEKaddr]; omega
         have ⟨hSte, hVe⟩ := hDwriteOut s (lp + LegOff.entryK) kSide hEKlt
-          (by have : DexOff.size.toNat = 200 := rfl; rw [hEKaddr]; omega)
+          (by have : DexOff.size.toNat = 208 := rfl; rw [hEKaddr]; omega)
         exact hPhase2 posPnl0 0 _ (by rw [writeU64_stackSp]; omega)
           (by rw [writeU64_stackSp]; exact UInt64.le_refl _)
           (hSte hStock) hVe (fun h0 => absurd h0 (by decide)) h
@@ -3051,9 +3078,9 @@ theorem liquidateInsDrawCore_bounds_and_stock
     (cap ≠ 0 → s' = s) ∧
     (s.readU64 (mData + MktOff.insurance)).toNat - (s'.readU64 (mData + MktOff.insurance)).toNat ≤
       ((s.readU64 (mData + MktOff.insurance)).toNat * (s.readU64 (mData + MktOff.maxInsDrawBps)).toNat) / Spec.bpsDenNat := by
-  have hd200 : dData.toNat + 200 < 2 ^ 64 := hdV
-  have hm352 : mData.toNat + 352 < 2 ^ 64 := hmV
-  have hDM' : dData.toNat + 200 ≤ mData.toNat ∨ mData.toNat + 352 ≤ dData.toNat := hDM
+  have hd208 : dData.toNat + 208 < 2 ^ 64 := hdV
+  have hm400 : mData.toNat + 400 < 2 ^ 64 := hmV
+  have hDM' : dData.toNat + 208 ≤ mData.toNat ∨ mData.toNat + 400 ≤ dData.toNat := hDM
   by_cases hcond : (decide (shortfall > 0) && (cap == 0)) = true
   · rw [ite_eq_left_of_eq_true _ _ (eq_true hcond)] at h
     have hcap0 : cap = 0 := beq_iff_eq.mp (Bool.and_eq_true _ _ |>.mp hcond).2
@@ -3067,11 +3094,11 @@ theorem liquidateInsDrawCore_bounds_and_stock
       have ⟨_, hmaxDraw, _, _, hmem1⟩ := mulDiv64_stack_and_mem hsp hmd
       have hbd : BPS_DEN.toNat = Spec.bpsDenNat := rfl
       rw [hbd] at hmaxDraw
-      have hD1 : ∀ off : UInt64, off.toNat + 8 ≤ 200 → s1.readU64 (dData + off) = s.readU64 (dData + off) := fun off hoff =>
+      have hD1 : ∀ off : UInt64, off.toNat + 8 ≤ 208 → s1.readU64 (dData + off) = s.readU64 (dData + off) := fun off hoff =>
         readU64_of_memEqAbove hmem1
           (u64_le_of_add_lt _ _ _ (UInt64.le_iff_toNat_le.mp hdSt) (by omega))
           (by rw [u64_add_toNat_of_lt _ _ (by omega)]; omega)
-      have hM1 : ∀ off : UInt64, off.toNat + 8 ≤ 352 → s1.readU64 (mData + off) = s.readU64 (mData + off) := fun off hoff =>
+      have hM1 : ∀ off : UInt64, off.toNat + 8 ≤ 400 → s1.readU64 (mData + off) = s.readU64 (mData + off) := fun off hoff =>
         readU64_of_memEqAbove hmem1
           (u64_le_of_add_lt _ _ _ (UInt64.le_iff_toNat_le.mp hmSt) (by omega))
           (by rw [u64_add_toNat_of_lt _ _ (by omega)]; omega)
@@ -3079,7 +3106,7 @@ theorem liquidateInsDrawCore_bounds_and_stock
         unfold dexStockExact at hStock ⊢
         rw [hD1 DexOff.totalCapital (by decide), hD1 DexOff.totalInsurance (by decide),
             hD1 DexOff.totalResidual (by decide), hD1 DexOff.totalSurplus (by decide),
-            hD1 DexOff.vaultBalance (by decide)]
+            hD1 DexOff.totalRewards (by decide), hD1 DexOff.vaultBalance (by decide)]
         exact hStock
       let draw1 := if shortfall < maxDraw then shortfall else maxDraw
       let insDraw := if draw1 < ins then draw1 else ins
@@ -3103,24 +3130,25 @@ theorem liquidateInsDrawCore_bounds_and_stock
         have ⟨hdiLe, hs3⟩ := subU64At_ok_spec _ _ _ _ _ h2
         have ⟨_, hs4⟩ := addU64At_ok_spec _ _ _ _ _ h3
         have ⟨hdrLt, hs'⟩ := addU64At_ok_spec _ _ _ _ _ h4
-        have hMout : ∀ (st : SvmState) (off v : UInt64), off.toNat + 8 ≤ 352 →
+        have hMout : ∀ (st : SvmState) (off v : UInt64), off.toNat + 8 ≤ 400 →
             (st.writeU64 (mData + off) v).readU64 (dData + DexOff.vaultBalance) = st.readU64 (dData + DexOff.vaultBalance) ∧
             (st.writeU64 (mData + off) v).readU64 (dData + DexOff.totalCapital) = st.readU64 (dData + DexOff.totalCapital) ∧
             (st.writeU64 (mData + off) v).readU64 (dData + DexOff.totalInsurance) = st.readU64 (dData + DexOff.totalInsurance) ∧
             (st.writeU64 (mData + off) v).readU64 (dData + DexOff.totalResidual) = st.readU64 (dData + DexOff.totalResidual) ∧
-            (st.writeU64 (mData + off) v).readU64 (dData + DexOff.totalSurplus) = st.readU64 (dData + DexOff.totalSurplus) := by
+            (st.writeU64 (mData + off) v).readU64 (dData + DexOff.totalSurplus) = st.readU64 (dData + DexOff.totalSurplus) ∧
+            (st.writeU64 (mData + off) v).readU64 (dData + DexOff.totalRewards) = st.readU64 (dData + DexOff.totalRewards) := by
           intro st off v hoff
           have ha := u64_add_toNat_of_lt mData off (by omega)
-          have hds : DexOff.size.toNat = 200 := rfl
+          have hds : DexOff.size.toNat = 208 := rfl
           exact dexStockExact_writeU64_outside (s := st) (v := v) hdV (by omega) (by omega)
-        have hDoutM : ∀ (st : SvmState) (doff v : UInt64), doff.toNat + 8 ≤ 200 →
+        have hDoutM : ∀ (st : SvmState) (doff v : UInt64), doff.toNat + 8 ≤ 208 →
             (st.writeU64 (dData + doff) v).readU64 (mData + MktOff.insurance) = st.readU64 (mData + MktOff.insurance) := by
           intro st doff v hdoff
           have hmI : MktOff.insurance.toNat = 224 := rfl
           have ha := u64_add_toNat_of_lt dData doff (by omega)
           have hb := u64_add_toNat_of_lt mData MktOff.insurance (by omega)
           exact readU64_writeU64_of_disjNat _ _ _ _ (by omega) (by omega) (by omega)
-        have hDoutD : ∀ (st : SvmState) (o1 o2 v : UInt64), o1.toNat + 8 ≤ 200 → o2.toNat + 8 ≤ 200 →
+        have hDoutD : ∀ (st : SvmState) (o1 o2 v : UInt64), o1.toNat + 8 ≤ 208 → o2.toNat + 8 ≤ 208 →
             (o1.toNat + 8 ≤ o2.toNat ∨ o2.toNat + 8 ≤ o1.toNat) →
             (st.writeU64 (dData + o1) v).readU64 (dData + o2) = st.readU64 (dData + o2) := by
           intro st o1 o2 v h1' h2' hdj
@@ -3135,8 +3163,8 @@ theorem liquidateInsDrawCore_bounds_and_stock
           have ha := u64_add_toNat_of_lt mData MktOff.realizedPool (by omega)
           have hb := u64_add_toNat_of_lt mData MktOff.insurance (by omega)
           exact readU64_writeU64_of_disjNat _ _ _ _ (by omega) (by omega) (by omega)
-        have ⟨eV1, eC1, eI1, eR1, eS1⟩ := hMout s1 MktOff.insurance (s1.readU64 (mData + MktOff.insurance) - insDraw) (by decide)
-        have ⟨eV3, eC3, eI3, eR3, eS3⟩ := hMout s3 MktOff.realizedPool (s3.readU64 (mData + MktOff.realizedPool) + insDraw) (by decide)
+        have ⟨eV1, eC1, eI1, eR1, eS1, eRw1⟩ := hMout s1 MktOff.insurance (s1.readU64 (mData + MktOff.insurance) - insDraw) (by decide)
+        have ⟨eV3, eC3, eI3, eR3, eS3, eRw3⟩ := hMout s3 MktOff.realizedPool (s3.readU64 (mData + MktOff.realizedPool) + insDraw) (by decide)
         subst hs2; subst hs3; subst hs4; subst hs'
         refine ⟨?_, ?_, fun hne => absurd hcap0 hne, ?_⟩
         · unfold dexStockExact at hSt1 ⊢
@@ -3144,14 +3172,16 @@ theorem liquidateInsDrawCore_bounds_and_stock
               hDoutD _ DexOff.totalResidual DexOff.totalCapital _ (by decide) (by decide) (by decide),
               hDoutD _ DexOff.totalResidual DexOff.totalInsurance _ (by decide) (by decide) (by decide),
               hDoutD _ DexOff.totalResidual DexOff.totalSurplus _ (by decide) (by decide) (by decide),
+              hDoutD _ DexOff.totalResidual DexOff.totalRewards _ (by decide) (by decide) (by decide),
               hDoutD _ DexOff.totalResidual DexOff.vaultBalance _ (by decide) (by decide) (by decide),
-              eC3, eI3, eR3, eS3, eV3,
+              eC3, eI3, eR3, eS3, eRw3, eV3,
               SvmState.readU64_writeU64_same, u64_sub_toNat_of_le _ _ (UInt64.le_iff_toNat_le.mp hdiLe),
               hDoutD _ DexOff.totalInsurance DexOff.totalCapital _ (by decide) (by decide) (by decide),
               hDoutD _ DexOff.totalInsurance DexOff.totalResidual _ (by decide) (by decide) (by decide),
               hDoutD _ DexOff.totalInsurance DexOff.totalSurplus _ (by decide) (by decide) (by decide),
+              hDoutD _ DexOff.totalInsurance DexOff.totalRewards _ (by decide) (by decide) (by decide),
               hDoutD _ DexOff.totalInsurance DexOff.vaultBalance _ (by decide) (by decide) (by decide),
-              eC1, eI1, eR1, eS1, eV1]
+              eC1, eI1, eR1, eS1, eRw1, eV1]
           have hleI : (if (if shortfall < maxDraw then shortfall else maxDraw) < s.readU64 (mData + MktOff.insurance)
               then if shortfall < maxDraw then shortfall else maxDraw else s.readU64 (mData + MktOff.insurance)).toNat
               ≤ (s1.readU64 (dData + DexOff.totalInsurance)).toNat := by
@@ -3244,10 +3274,11 @@ theorem depositInsuranceMintCore_optimistic_nav_refines_spec
           · rw [ite_eq_right_of_eq_false _ _ (eq_false hmpos)] at h; dsimp only [SolanaM.fail] at h; cases h
       · rw [ite_eq_right_of_eq_false _ _ (eq_false hnavPos)] at h; dsimp only [SolanaM.fail, SolanaM.bind] at h; cases h
 
-/-- **Refinement #21 (`handleSweepSurplus` Accounting Core Preserves `dexStockExact` & User `C, I, R`)**:
+/-- **Refinement #21 (`handleSweepSurplus` Accounting Core Preserves `dexStockExact` & User `C, I, R, F`)**:
     Directly on `SvmState.mem`, the accounting core of `Program.handleSweepSurplus`:
-    1. Preserves `dexStockExact s' dData` bit-for-bit!
-    2. Leaves `DexOff.totalCapital`, `DexOff.totalInsurance`, and `DexOff.totalResidual` 100% UNCHANGED!
+    1. Preserves 5-bucket `dexStockExact s' dData` bit-for-bit!
+    2. Leaves `DexOff.totalCapital`, `DexOff.totalInsurance`, `DexOff.totalResidual`, AND `DexOff.totalRewards`
+       100% UNCHANGED (`dexAdmin` can NEVER sweep permissionless markets' accrued reward fees!).
     3. Enforces `sweepAmt ≤ avail` (`DexOff.totalSurplus`). -/
 theorem sweepSurplusCore_preserves_stock_and_user_buckets
     (dData : Ptr) (reqAmt : UInt64) (s s' : SvmState)
@@ -3262,8 +3293,9 @@ theorem sweepSurplusCore_preserves_stock_and_user_buckets
     dexStockExact s' dData ∧
     s'.readU64 (dData + DexOff.totalCapital)   = s.readU64 (dData + DexOff.totalCapital) ∧
     s'.readU64 (dData + DexOff.totalInsurance) = s.readU64 (dData + DexOff.totalInsurance) ∧
-    s'.readU64 (dData + DexOff.totalResidual)  = s.readU64 (dData + DexOff.totalResidual) := by
-  have hd200 : dData.toNat + 200 < 2 ^ 64 := hdV
+    s'.readU64 (dData + DexOff.totalResidual)  = s.readU64 (dData + DexOff.totalResidual) ∧
+    s'.readU64 (dData + DexOff.totalRewards)   = s.readU64 (dData + DexOff.totalRewards) := by
+  have hd208 : dData.toNat + 208 < 2 ^ 64 := hdV
   simp only [loadU64, rawLoadU64, Bind.bind, SolanaM.bind, SolanaM.require] at h
   let avail := s.readU64 (dData + DexOff.totalSurplus)
   let sweepAmt := if reqAmt == 0 then avail else reqAmt
@@ -3273,7 +3305,7 @@ theorem sweepSurplusCore_preserves_stock_and_user_buckets
     obtain ⟨_, s1, hsubS, hsubV⟩ := bind_ok_elim h
     have ⟨hleS, hs1⟩ := subU64At_ok_spec _ _ _ _ _ hsubS
     have ⟨hleV, hs'⟩ := subU64At_ok_spec _ _ _ _ _ hsubV
-    have hDout : ∀ (st : SvmState) (o1 o2 v : UInt64), o1.toNat + 8 ≤ 200 → o2.toNat + 8 ≤ 200 →
+    have hDout : ∀ (st : SvmState) (o1 o2 v : UInt64), o1.toNat + 8 ≤ 208 → o2.toNat + 8 ≤ 208 →
         (o1.toNat + 8 ≤ o2.toNat ∨ o2.toNat + 8 ≤ o1.toNat) →
         (st.writeU64 (dData + o1) v).readU64 (dData + o2) = st.readU64 (dData + o2) := by
       intro st o1 o2 v h1 h2 hdj
@@ -3287,17 +3319,21 @@ theorem sweepSurplusCore_preserves_stock_and_user_buckets
       by rw [hDout _ DexOff.vaultBalance DexOff.totalInsurance _ (by decide) (by decide) (by decide),
              hDout _ DexOff.totalSurplus DexOff.totalInsurance _ (by decide) (by decide) (by decide)],
       by rw [hDout _ DexOff.vaultBalance DexOff.totalResidual _ (by decide) (by decide) (by decide),
-             hDout _ DexOff.totalSurplus DexOff.totalResidual _ (by decide) (by decide) (by decide)]⟩
+             hDout _ DexOff.totalSurplus DexOff.totalResidual _ (by decide) (by decide) (by decide)],
+      by rw [hDout _ DexOff.vaultBalance DexOff.totalRewards _ (by decide) (by decide) (by decide),
+             hDout _ DexOff.totalSurplus DexOff.totalRewards _ (by decide) (by decide) (by decide)]⟩
     unfold dexStockExact at hStock ⊢
     rw [SvmState.readU64_writeU64_same, u64_sub_toNat_of_le _ _ (UInt64.le_iff_toNat_le.mp hleV),
         hDout _ DexOff.vaultBalance DexOff.totalCapital _ (by decide) (by decide) (by decide),
         hDout _ DexOff.vaultBalance DexOff.totalInsurance _ (by decide) (by decide) (by decide),
         hDout _ DexOff.vaultBalance DexOff.totalResidual _ (by decide) (by decide) (by decide),
         hDout _ DexOff.vaultBalance DexOff.totalSurplus _ (by decide) (by decide) (by decide),
+        hDout _ DexOff.vaultBalance DexOff.totalRewards _ (by decide) (by decide) (by decide),
         SvmState.readU64_writeU64_same, u64_sub_toNat_of_le _ _ (UInt64.le_iff_toNat_le.mp hleS),
         hDout _ DexOff.totalSurplus DexOff.totalCapital _ (by decide) (by decide) (by decide),
         hDout _ DexOff.totalSurplus DexOff.totalInsurance _ (by decide) (by decide) (by decide),
         hDout _ DexOff.totalSurplus DexOff.totalResidual _ (by decide) (by decide) (by decide),
+        hDout _ DexOff.totalSurplus DexOff.totalRewards _ (by decide) (by decide) (by decide),
         hDout _ DexOff.totalSurplus DexOff.vaultBalance _ (by decide) (by decide) (by decide)]
     have hleV' : sweepAmt.toNat ≤ (s.readU64 (dData + DexOff.vaultBalance)).toNat := by
       rw [← hDout s DexOff.totalSurplus DexOff.vaultBalance (s.readU64 (dData + DexOff.totalSurplus) - sweepAmt)
@@ -3479,6 +3515,206 @@ theorem oracleClampedStepCore_refines_spec
       dsimp only
       rw [hdiffEq]
       have h0 : (0 : UInt64).toNat = 0 := rfl
+      omega
+
+/-- **Refinement #23 (`handleClaimReward` Accounting Core Preserves 5-Bucket `dexStockExact` & Isolates `C, I, R, S`)**:
+    Directly on `SvmState.mem`, the accounting core of `Program.handleClaimReward`:
+    1. Preserves 5-bucket `dexStockExact s' dData` bit-for-bit!
+    2. Leaves `DexOff.totalCapital`, `DexOff.totalInsurance`, `DexOff.totalResidual`, AND `DexOff.totalSurplus`
+       100% UNCHANGED — a reward module can NEVER touch user capital, insurance, realized PnL, or surplus!
+    3. Leaves `m.insurance` and `m.realizedPool` bit-for-bit UNCHANGED! -/
+theorem claimRewardCore_preserves_stock_and_isolates_buckets
+    (dData mData : Ptr) (reqAmt : UInt64) (s s' : SvmState)
+    (hdV : regionValid dData DexOff.size)
+    (hmV : regionValid mData MktOff.size)
+    (hDM : regionDisjoint dData DexOff.size mData MktOff.size)
+    (hStock : dexStockExact s dData)
+    (h : (do
+        let avail ← loadU64 mData MktOff.rewardAccrued
+        let claimAmt := if reqAmt == 0 then avail else reqAmt
+        SolanaM.require (claimAmt > 0 && claimAmt <= avail) PErr.invalidParams
+        subU64At mData MktOff.rewardAccrued claimAmt
+        subU64At dData DexOff.totalRewards  claimAmt
+        subU64At dData DexOff.vaultBalance  claimAmt) s = .ok () s') :
+    dexStockExact s' dData ∧
+    s'.readU64 (dData + DexOff.totalCapital)   = s.readU64 (dData + DexOff.totalCapital) ∧
+    s'.readU64 (dData + DexOff.totalInsurance) = s.readU64 (dData + DexOff.totalInsurance) ∧
+    s'.readU64 (dData + DexOff.totalResidual)  = s.readU64 (dData + DexOff.totalResidual) ∧
+    s'.readU64 (dData + DexOff.totalSurplus)   = s.readU64 (dData + DexOff.totalSurplus) ∧
+    s'.readU64 (mData + MktOff.insurance)      = s.readU64 (mData + MktOff.insurance) := by
+  have hd208 : dData.toNat + 208 < 2 ^ 64 := hdV
+  have hm400 : mData.toNat + 400 < 2 ^ 64 := hmV
+  have hDM' : dData.toNat + 208 ≤ mData.toNat ∨ mData.toNat + 400 ≤ dData.toNat := hDM
+  simp only [loadU64, rawLoadU64, Bind.bind, SolanaM.bind, SolanaM.require] at h
+  let avail := s.readU64 (mData + MktOff.rewardAccrued)
+  let claimAmt := if reqAmt == 0 then avail else reqAmt
+  by_cases hc : (decide (claimAmt > 0) && decide (claimAmt ≤ avail)) = true
+  · rw [ite_eq_left_of_eq_true _ _ (eq_true hc)] at h
+    dsimp only [SolanaM.pure] at h
+    obtain ⟨_, s1, hsubM, h⟩ := bind_ok_elim h
+    obtain ⟨_, s2, hsubF, hsubV⟩ := bind_ok_elim h
+    have ⟨_, hs1⟩ := subU64At_ok_spec _ _ _ _ _ hsubM
+    have ⟨hleF, hs2⟩ := subU64At_ok_spec _ _ _ _ _ hsubF
+    have ⟨hleV, hs'⟩ := subU64At_ok_spec _ _ _ _ _ hsubV
+    have hDout : ∀ (st : SvmState) (o1 o2 v : UInt64), o1.toNat + 8 ≤ 208 → o2.toNat + 8 ≤ 208 →
+        (o1.toNat + 8 ≤ o2.toNat ∨ o2.toNat + 8 ≤ o1.toNat) →
+        (st.writeU64 (dData + o1) v).readU64 (dData + o2) = st.readU64 (dData + o2) := by
+      intro st o1 o2 v h1 h2 hdj
+      have ha := u64_add_toNat_of_lt dData o1 (by omega)
+      have hb := u64_add_toNat_of_lt dData o2 (by omega)
+      exact readU64_writeU64_of_disjNat _ _ _ _ (by omega) (by omega) (by omega)
+    have hMrewOutD : ∀ (st : SvmState) (v : UInt64),
+        (st.writeU64 (mData + MktOff.rewardAccrued) v).readU64 (dData + DexOff.vaultBalance) = st.readU64 (dData + DexOff.vaultBalance) ∧
+        (st.writeU64 (mData + MktOff.rewardAccrued) v).readU64 (dData + DexOff.totalCapital) = st.readU64 (dData + DexOff.totalCapital) ∧
+        (st.writeU64 (mData + MktOff.rewardAccrued) v).readU64 (dData + DexOff.totalInsurance) = st.readU64 (dData + DexOff.totalInsurance) ∧
+        (st.writeU64 (mData + MktOff.rewardAccrued) v).readU64 (dData + DexOff.totalResidual) = st.readU64 (dData + DexOff.totalResidual) ∧
+        (st.writeU64 (mData + MktOff.rewardAccrued) v).readU64 (dData + DexOff.totalSurplus) = st.readU64 (dData + DexOff.totalSurplus) ∧
+        (st.writeU64 (mData + MktOff.rewardAccrued) v).readU64 (dData + DexOff.totalRewards) = st.readU64 (dData + DexOff.totalRewards) := by
+      intro st v
+      have hmr : MktOff.rewardAccrued.toNat = 360 := rfl
+      have ha := u64_add_toNat_of_lt mData MktOff.rewardAccrued (by omega)
+      have hds : DexOff.size.toNat = 208 := rfl
+      exact dexStockExact_writeU64_outside (s := st) (v := v) hdV (by omega) (by omega)
+    have hDoutM : ∀ (st : SvmState) (doff v : UInt64), doff.toNat + 8 ≤ 208 →
+        (st.writeU64 (dData + doff) v).readU64 (mData + MktOff.insurance) = st.readU64 (mData + MktOff.insurance) := by
+      intro st doff v hdoff
+      have hmI : MktOff.insurance.toNat = 224 := rfl
+      have ha := u64_add_toNat_of_lt dData doff (by omega)
+      have hb := u64_add_toNat_of_lt mData MktOff.insurance (by omega)
+      exact readU64_writeU64_of_disjNat _ _ _ _ (by omega) (by omega) (by omega)
+    have hMrewOutMI : ∀ (st : SvmState) (v : UInt64),
+        (st.writeU64 (mData + MktOff.rewardAccrued) v).readU64 (mData + MktOff.insurance) = st.readU64 (mData + MktOff.insurance) := by
+      intro st v
+      have hmR : MktOff.rewardAccrued.toNat = 360 := rfl
+      have hmI : MktOff.insurance.toNat = 224 := rfl
+      have ha := u64_add_toNat_of_lt mData MktOff.rewardAccrued (by omega)
+      have hb := u64_add_toNat_of_lt mData MktOff.insurance (by omega)
+      exact readU64_writeU64_of_disjNat _ _ _ _ (by omega) (by omega) (by omega)
+    have ⟨eV0, eC0, eI0, eR0, eS0, eF0⟩ := hMrewOutD s (s.readU64 (mData + MktOff.rewardAccrued) - claimAmt)
+    subst hs1; subst hs2; subst hs'
+    refine ⟨?_,
+      by rw [hDout _ DexOff.vaultBalance DexOff.totalCapital _ (by decide) (by decide) (by decide),
+             hDout _ DexOff.totalRewards DexOff.totalCapital _ (by decide) (by decide) (by decide), eC0],
+      by rw [hDout _ DexOff.vaultBalance DexOff.totalInsurance _ (by decide) (by decide) (by decide),
+             hDout _ DexOff.totalRewards DexOff.totalInsurance _ (by decide) (by decide) (by decide), eI0],
+      by rw [hDout _ DexOff.vaultBalance DexOff.totalResidual _ (by decide) (by decide) (by decide),
+             hDout _ DexOff.totalRewards DexOff.totalResidual _ (by decide) (by decide) (by decide), eR0],
+      by rw [hDout _ DexOff.vaultBalance DexOff.totalSurplus _ (by decide) (by decide) (by decide),
+             hDout _ DexOff.totalRewards DexOff.totalSurplus _ (by decide) (by decide) (by decide), eS0],
+      by rw [hDoutM _ DexOff.vaultBalance _ (by decide),
+             hDoutM _ DexOff.totalRewards _ (by decide), hMrewOutMI]⟩
+    unfold dexStockExact at hStock ⊢
+    rw [SvmState.readU64_writeU64_same, u64_sub_toNat_of_le _ _ (UInt64.le_iff_toNat_le.mp hleV),
+        hDout _ DexOff.vaultBalance DexOff.totalCapital _ (by decide) (by decide) (by decide),
+        hDout _ DexOff.vaultBalance DexOff.totalInsurance _ (by decide) (by decide) (by decide),
+        hDout _ DexOff.vaultBalance DexOff.totalResidual _ (by decide) (by decide) (by decide),
+        hDout _ DexOff.vaultBalance DexOff.totalSurplus _ (by decide) (by decide) (by decide),
+        hDout _ DexOff.vaultBalance DexOff.totalRewards _ (by decide) (by decide) (by decide),
+        SvmState.readU64_writeU64_same, u64_sub_toNat_of_le _ _ (UInt64.le_iff_toNat_le.mp hleF),
+        hDout _ DexOff.totalRewards DexOff.totalCapital _ (by decide) (by decide) (by decide),
+        hDout _ DexOff.totalRewards DexOff.totalInsurance _ (by decide) (by decide) (by decide),
+        hDout _ DexOff.totalRewards DexOff.totalResidual _ (by decide) (by decide) (by decide),
+        hDout _ DexOff.totalRewards DexOff.totalSurplus _ (by decide) (by decide) (by decide),
+        hDout _ DexOff.totalRewards DexOff.vaultBalance _ (by decide) (by decide) (by decide),
+        eC0, eI0, eR0, eS0, eF0, eV0]
+    have hleV' : claimAmt.toNat ≤ (s.readU64 (dData + DexOff.vaultBalance)).toNat := by
+      rw [← eV0, ← hDout (s.writeU64 (mData + MktOff.rewardAccrued) (s.readU64 (mData + MktOff.rewardAccrued) - claimAmt))
+            DexOff.totalRewards DexOff.vaultBalance _ (by decide) (by decide) (by decide)]
+      exact UInt64.le_iff_toNat_le.mp hleV
+    have hleF' : claimAmt.toNat ≤ (s.readU64 (dData + DexOff.totalRewards)).toNat := by
+      rw [← eF0]; exact UInt64.le_iff_toNat_le.mp hleF
+    dsimp only [claimAmt, avail] at hleV' hleF'
+    omega
+  · rw [ite_eq_right_of_eq_false _ _ (eq_false hc)] at h; dsimp only [SolanaM.fail] at h; cases h
+
+/-- **Refinement #24 (`RewardModule.nextReserveRateU64` Computes Exact `RewardModule.nextReserveRateNat`)**:
+    Directly on `SvmState.mem`, `RewardModule.nextReserveRateU64` computes exact
+    `RewardModule.nextReserveRateNat` with ZERO 64-bit overflow even on a 1,000,000× token dump! -/
+theorem nextReserveRateU64_refines_spec (prevRate Q B Bvirt r : UInt64)
+    (s s' : SvmState)
+    (hsp : 8 ≤ s.stackSp.toNat)
+    (h : RewardModule.nextReserveRateU64 prevRate Q B Bvirt s = .ok r s') :
+    r.toNat = RewardModule.nextReserveRateNat prevRate.toNat Q.toNat B.toNat Bvirt.toNat ∧
+    memEqAbove s' s s.stackSp := by
+  unfold RewardModule.nextReserveRateU64 at h
+  unfold RewardModule.nextReserveRateNat
+  have h1nat : (1 : UInt64).toNat = 1 := rfl
+  have hps : POS_SCALE.toNat = 1_000_000 := rfl
+  have hmax : RewardModule.MAX_RATE_E6.toNat = 1_000_000_000_000 := rfl
+  have hshr1 : ∀ x : UInt64, (x >>> 1).toNat = x.toNat / 2 := by
+    intro x; rw [UInt64.toNat_shiftRight]; change x.toNat >>> 1 = x.toNat / 2; rw [Nat.shiftRight_eq_div_pow]
+  have hshr2 : ∀ x : UInt64, (x >>> 2).toNat = x.toNat / 4 := by
+    intro x; rw [UInt64.toNat_shiftRight]; change x.toNat >>> 2 = x.toNat / 4; rw [Nat.shiftRight_eq_div_pow]
+  by_cases hc : (decide (B ≥ Bvirt) && decide (B > 0) && decide (Q > 0)) = true
+  · rw [ite_eq_left_of_eq_true _ _ (eq_true hc)] at h
+    have hge : Bvirt.toNat ≤ B.toNat := UInt64.le_iff_toNat_le.mp (of_decide_eq_true (Bool.and_eq_true _ _ |>.mp (Bool.and_eq_true _ _ |>.mp hc).1).1)
+    have hBp : 0 < B.toNat := UInt64.lt_iff_toNat_lt.mp (of_decide_eq_true (Bool.and_eq_true _ _ |>.mp (Bool.and_eq_true _ _ |>.mp hc).1).2)
+    have hQp : 0 < Q.toNat := UInt64.lt_iff_toNat_lt.mp (of_decide_eq_true (Bool.and_eq_true _ _ |>.mp hc).2)
+    have hnat : B.toNat ≥ Bvirt.toNat ∧ B.toNat > 0 ∧ Q.toNat > 0 := ⟨hge, hBp, hQp⟩
+    rw [ite_eq_left_of_eq_true _ _ (eq_true hnat)]
+    by_cases hcap : B / Q ≥ 4_000_000
+    · rw [ite_eq_left_of_eq_true _ _ (eq_true hcap)] at h
+      dsimp only [Pure.pure, SolanaM.pure] at h; cases h
+      have hdivGe : B.toNat / Q.toNat ≥ 4_000_000 := by
+        have := UInt64.le_iff_toNat_le.mp hcap
+        rw [UInt64.toNat_div] at this
+        exact this
+      have hmulGe : 4_000_000 * Q.toNat ≤ B.toNat := by
+        have h1 := Nat.mul_le_mul_right Q.toNat hdivGe
+        have h2 := Nat.div_mul_le_self B.toNat Q.toNat
+        omega
+      have hrateGe : (B.toNat * 1_000_000) / Q.toNat ≥ 4_000_000_000_000 := by
+        apply (Nat.le_div_iff_mul_le hQp).mpr
+        have h1 : 4_000_000_000_000 * Q.toNat = (4_000_000 * Q.toNat) * 1_000_000 := by omega
+        have h2 := Nat.mul_le_mul_right 1_000_000 hmulGe
+        omega
+      refine ⟨?_, memEqAbove_refl s s.stackSp⟩
+      dsimp only; rw [hmax]; omega
+    · rw [ite_eq_right_of_eq_false _ _ (eq_false hcap)] at h
+      simp only [Bind.bind, Pure.pure, SolanaM.bind] at h
+      cases hmd : mulDiv64 B POS_SCALE Q s with
+      | err c st => rw [hmd] at h; cases h
+      | ok cr s1 =>
+        rw [hmd] at h; dsimp only at h
+        have ⟨_, hcr, _, _, hmem⟩ := mulDiv64_stack_and_mem hsp hmd
+        rw [hps] at hcr
+        let r4 := cr >>> 2
+        have hr4Nat : (cr >>> 2).toNat = (B.toNat * 1_000_000) / Q.toNat / 4 := by
+          rw [hshr2, hcr]
+        by_cases hlt1 : r4 < 1
+        · rw [ite_eq_left_of_eq_true _ _ (eq_true hlt1)] at h; cases h
+          have hlt1Nat : (cr >>> 2).toNat < 1 := UInt64.lt_iff_toNat_lt.mp hlt1
+          refine ⟨?_, hmem⟩; dsimp only; rw [h1nat]; omega
+        · rw [ite_eq_right_of_eq_false _ _ (eq_false hlt1)] at h
+          have hge1Nat : 1 ≤ (cr >>> 2).toNat := Nat.le_of_not_lt (fun h' => hlt1 (UInt64.lt_iff_toNat_lt.mpr h'))
+          by_cases hgtM : r4 > RewardModule.MAX_RATE_E6
+          · rw [ite_eq_left_of_eq_true _ _ (eq_true hgtM)] at h; cases h
+            have hgtMNat : 1_000_000_000_000 < (cr >>> 2).toNat := by
+              have h1 := UInt64.lt_iff_toNat_lt.mp hgtM
+              dsimp only [r4] at h1; rw [hmax] at h1; exact h1
+            refine ⟨?_, hmem⟩; dsimp only; rw [hmax]; omega
+          · rw [ite_eq_right_of_eq_false _ _ (eq_false hgtM)] at h; cases h
+            have hleMNat : (cr >>> 2).toNat ≤ 1_000_000_000_000 :=
+              Nat.le_of_not_lt (fun h' => hgtM (UInt64.lt_iff_toNat_lt.mpr (by rw [hmax]; omega)))
+            refine ⟨?_, hmem⟩; dsimp only; omega
+  · rw [ite_eq_right_of_eq_false _ _ (eq_false hc)] at h
+    dsimp only [Pure.pure, SolanaM.pure] at h; cases h
+    have hnotNat : ¬ (B.toNat ≥ Bvirt.toNat ∧ B.toNat > 0 ∧ Q.toNat > 0) := by
+      intro ⟨h1, h2, h3⟩
+      have hd1 : decide (B ≥ Bvirt) = true := decide_eq_true (UInt64.le_iff_toNat_le.mpr h1)
+      have hd2 : decide (B > 0) = true := decide_eq_true (UInt64.lt_iff_toNat_lt.mpr h2)
+      have hd3 : decide (Q > 0) = true := decide_eq_true (UInt64.lt_iff_toNat_lt.mpr h3)
+      simp [hd1, hd2, hd3] at hc
+    rw [ite_eq_right_of_eq_false _ _ (eq_false hnotNat)]
+    refine ⟨?_, memEqAbove_refl s s.stackSp⟩
+    let half := prevRate >>> 1
+    have hhalfNat : (prevRate >>> 1).toNat = prevRate.toNat / 2 := hshr1 prevRate
+    by_cases hlt1 : half < 1
+    · rw [ite_eq_left_of_eq_true _ _ (eq_true hlt1)]
+      have : (prevRate >>> 1).toNat < 1 := UInt64.lt_iff_toNat_lt.mp hlt1
+      rw [h1nat]; omega
+    · rw [ite_eq_right_of_eq_false _ _ (eq_false hlt1)]
+      have : 1 ≤ (prevRate >>> 1).toNat := Nat.le_of_not_lt (fun h' => hlt1 (UInt64.lt_iff_toNat_lt.mpr h'))
       omega
 
 end Percolator.Refinement

@@ -4,7 +4,7 @@ set -euo pipefail
 echo "=== 1. Build Lean 4 formal model, verify all kernel proofs (0 sorry, 0 axioms) ==="
 lake build
 
-echo "=== 2. Compile core Percolator + external Matcher & OracleAdapter to Solana sBPF (.so) ==="
+echo "=== 2. Compile core Percolator + external Matcher, OracleAdapter & RewardModule to Solana sBPF (.so) ==="
 mkdir -p build
 LEAN_PATH=../lean-svm/.lake/build/lib/lean:.lake/build/lib/lean \
   ../lean-svm/.lake/build/bin/lean-svm build Percolator.Program Percolator.Program.entrypoint -o build/percolator.so
@@ -12,7 +12,9 @@ LEAN_PATH=../lean-svm/.lake/build/lib/lean:.lake/build/lib/lean \
   ../lean-svm/.lake/build/bin/lean-svm build Percolator.Matcher Percolator.Matcher.entrypoint -o build/matcher.so
 LEAN_PATH=../lean-svm/.lake/build/lib/lean:.lake/build/lib/lean \
   ../lean-svm/.lake/build/bin/lean-svm build Percolator.OracleAdapter Percolator.OracleAdapter.entrypoint -o build/oracle_adapter.so
+LEAN_PATH=../lean-svm/.lake/build/lib/lean:.lake/build/lib/lean \
+  ../lean-svm/.lake/build/bin/lean-svm build Percolator.RewardModule Percolator.RewardModule.entrypoint -o build/reward_module.so
 
-echo "=== 3. Execute all 12 LiteSVM verification, boring exchange, 8-leg CU stress, CPI & fuzz suites (Agave 3.1.3) ==="
+echo "=== 3. Execute all 13 LiteSVM verification, boring exchange, 8-leg CU stress, reward buy-and-burn, CPI & fuzz suites (Agave 3.1.3) ==="
 cargo run --manifest-path svm-runner/Cargo.toml --release -- \
-  build/percolator.so build/matcher.so build/oracle_adapter.so
+  build/percolator.so build/matcher.so build/oracle_adapter.so build/reward_module.so

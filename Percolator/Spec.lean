@@ -115,9 +115,12 @@ structure MarketState where
   adlShort       : Nat
   resolvedNum    : Nat
   resolvedDen    : Nat
-  activeLegs     : Nat
-  maxFrontBps    : Nat  := 0
-  insFronted     : Nat  := 0
+  activeLegs      : Nat
+  maxFrontBps     : Nat  := 0
+  insFronted      : Nat  := 0
+  rewardBps       : Nat  := 0
+  rewardAccrued   : Nat  := 0
+  rewardRecipient : Nat  := 0
   deriving DecidableEq, Repr
 
 structure LegState where
@@ -148,17 +151,18 @@ structure DexState where
   totalCapital    : Nat          -- C_tot = Σ pfl.capital
   totalInsurance  : Nat          -- I_tot = Σ m.insurance
   totalResidual   : Nat          -- R_tot = Σ m.realizedPool
-  totalSurplus    : Nat          -- S_tot = Σ m.feeSurplus
+  totalSurplus    : Nat          -- S_tot = DEX protocol surplus
+  totalRewards    : Nat := 0     -- F_tot = Σ m.rewardAccrued (per-market buy-and-burn reward fees!)
   markets         : Nat → Option MarketState
   portfolios      : Nat → Option PortfolioState
   insShares       : Nat → Nat → Nat
 
 /-! ### Core Invariant Predicates -/
 
-/-- EXACT global stock equality: every single atom in `DexVault` belongs to
-    exactly one disjoint class (`C_tot`, `I_tot`, `R_tot`, or `S_tot`)! -/
+/-- EXACT 5-bucket global stock equality: every single atom in `DexVault` belongs to
+    exactly one disjoint class (`C_tot`, `I_tot`, `R_tot`, `S_tot`, or `F_tot`)! -/
 def DexState.stockExact (st : DexState) : Prop :=
-  st.totalCapital + st.totalInsurance + st.totalResidual + st.totalSurplus = st.vault
+  st.totalCapital + st.totalInsurance + st.totalResidual + st.totalSurplus + st.totalRewards = st.vault
 
 def MarketState.oiBalanced (m : MarketState) : Prop :=
   (m.status = .active ∨ m.status = .windDown) →
@@ -611,15 +615,20 @@ def getIns (ms : Nat → Option MarketState) (mid : Nat) : Nat :=
 def getRes (ms : Nat → Option MarketState) (mid : Nat) : Nat :=
   match ms mid with | some m => m.realizedPool | none => 0
 
+def getRew (ms : Nat → Option MarketState) (mid : Nat) : Nat :=
+  match ms mid with | some m => m.rewardAccrued | none => 0
+
 def sumCaps (st : DexState) (pids : List Nat) : Nat := (pids.map (getCap st.portfolios)).sum
 def sumIns  (st : DexState) (mids : List Nat) : Nat := (mids.map (getIns st.markets)).sum
 def sumRes  (st : DexState) (mids : List Nat) : Nat := (mids.map (getRes st.markets)).sum
+def sumRew  (st : DexState) (mids : List Nat) : Nat := (mids.map (getRew st.markets)).sum
 
 def DexState.coherent (st : DexState) (mids pids : List Nat) : Prop :=
   st.stockExact ∧
   st.totalCapital = sumCaps st pids ∧
   st.totalInsurance = sumIns st mids ∧
-  st.totalResidual = sumRes st mids
+  st.totalResidual = sumRes st mids ∧
+  st.totalRewards = sumRew st mids
 
 /-- HLP / Counterparty Liquidation Takeover (ZERO ADL!): transfers `rawClose` from victim `pid`
     to well-collateralized liquidator `liqPid ≠ pid`, preserving `oiLong == oiShort` and `stockExact`! -/
@@ -690,7 +699,9 @@ def stepTradeOpenPostAdl (st : DexState) (mid pidL pidS qty spreadLToS spreadSTo
   let pL ← st.portfolios pidL
   let pS ← st.portfolios pidS
   let fee := marginReq (marginNotional qty m.markPrice) m.tradeFeeBps
-  if m.status = .active ∧ qty > 0 ∧
+  let rewFee := (2 * fee * m.rewardBps) / bpsDenNat
+  let insFee := 2 * fee - rewFee
+  if m.status = .active ∧ qty > 0 ∧ m.rewardBps ≤ bpsDenNat ∧
      (m.rawBasisLong = 0 ∨ m.oiLong > 0) ∧
      (m.rawBasisShort = 0 ∨ m.oiShort > 0) ∧
      m.oiLong + qty ≤ m.maxOi ∧ m.oiShort + qty ≤ m.maxOi ∧
@@ -704,7 +715,8 @@ def stepTradeOpenPostAdl (st : DexState) (mid pidL pidS qty spreadLToS spreadSTo
     let rL'  := m.rawBasisLong + rAddL
     let rS'  := m.rawBasisShort + rAddS
     let m' := { m with
-      insurance     := m.insurance + 2 * fee
+      insurance     := m.insurance + insFee
+      rewardAccrued := m.rewardAccrued + rewFee
       oiLong        := oiL'
       oiShort       := oiS'
       rawBasisLong  := rL'
@@ -717,7 +729,8 @@ def stepTradeOpenPostAdl (st : DexState) (mid pidL pidS qty spreadLToS spreadSTo
     let ps2 := updateFn ps1 pidS (some pS')
     some { st with
       totalCapital   := st.totalCapital - 2 * fee
-      totalInsurance := st.totalInsurance + 2 * fee
+      totalInsurance := st.totalInsurance + insFee
+      totalRewards   := st.totalRewards + rewFee
       markets        := updateFn st.markets mid (some m')
       portfolios     := ps2 }
   else none
@@ -976,6 +989,22 @@ def stepLiquidateFullCap (st : DexState) (mid pid liqFeeCap loss : Nat) : Option
       totalResidual  := st.totalResidual + toR + insDraw
       markets        := updateFn st.markets mid (some m')
       portfolios     := updateFn st.portfolios pid (some pfl') }
+  else none
+
+/-- Exact `ClaimReward` (`Program.handleClaimReward`): ONLY market `mid`'s immutable
+    `rewardRecipient` can withdraw `claimAmt ≤ m.rewardAccrued` out of `DexVault`,
+    leaving `C_tot`, `I_tot`, `R_tot`, `S_tot`, and EVERY other market's `F_{m'}` unchanged! -/
+def stepClaimReward (st : DexState) (mid signer reqAmt : Nat) : Option DexState := do
+  let m ← st.markets mid
+  let claimAmt := if reqAmt = 0 then m.rewardAccrued else reqAmt
+  if m.rewardRecipient ≠ 0 ∧ signer = m.rewardRecipient ∧
+     claimAmt > 0 ∧ claimAmt ≤ m.rewardAccrued ∧
+     claimAmt ≤ st.totalRewards ∧ claimAmt ≤ st.vault then
+    let m' := { m with rewardAccrued := m.rewardAccrued - claimAmt }
+    some { st with
+      vault        := st.vault - claimAmt
+      totalRewards := st.totalRewards - claimAmt
+      markets      := updateFn st.markets mid (some m') }
   else none
 
 end Percolator.Spec

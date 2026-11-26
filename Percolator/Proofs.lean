@@ -962,8 +962,8 @@ theorem depositCollateral_preserves_coherent (st st' : DexState) (mids pids : Li
   | some pfl =>
     simp [hp] at h
     rcases h with ⟨_, hst⟩; subst hst
-    rcases hcoh with ⟨hstock, hC, hI, hR⟩
-    refine ⟨by unfold DexState.stockExact at *; dsimp only; omega, ?_, hI, hR⟩
+    rcases hcoh with ⟨hstock, hC, hI, hR, hF⟩
+    refine ⟨by unfold DexState.stockExact at *; dsimp only; omega, ?_, hI, hR, hF⟩
     unfold sumCaps at *; dsimp only
     rw [hC]; symm
     have hmap : pids.map (getCap (updateFn st.portfolios pid (some { pfl with capital := pfl.capital + amount }))) =
@@ -984,8 +984,8 @@ theorem withdrawCollateral_preserves_coherent (st st' : DexState) (mids pids : L
   | some pfl =>
     simp [hp] at h
     rcases h with ⟨⟨_, hcap, htc, hv, _, _⟩, hst⟩; subst hst
-    rcases hcoh with ⟨hstock, hC, hI, hR⟩
-    refine ⟨by unfold DexState.stockExact at *; dsimp only; omega, ?_, hI, hR⟩
+    rcases hcoh with ⟨hstock, hC, hI, hR, hF⟩
+    refine ⟨by unfold DexState.stockExact at *; dsimp only; omega, ?_, hI, hR, hF⟩
     unfold sumCaps at *; dsimp only
     rw [hC]; symm
     have hmap : pids.map (getCap (updateFn st.portfolios pid (some { pfl with capital := pfl.capital - amount }))) =
@@ -1016,9 +1016,9 @@ theorem realizeLegPnl_preserves_coherent (st st' : DexState) (mids pids : List N
         rcases h with ⟨⟨_, _, hleP, hleR⟩, hst⟩; subst hst
         have hpayLe : haircutPayout leg.posPnl m.realizedPool m.totalPosPnl ≤ m.realizedPool :=
           haircutPayout_le_residual _ _ _ hleP
-        rcases hcoh with ⟨hstock, hC, hI, hR⟩
+        rcases hcoh with ⟨hstock, hC, hI, hR, hF⟩
         let pay := haircutPayout leg.posPnl m.realizedPool m.totalPosPnl
-        refine ⟨by unfold DexState.stockExact at *; dsimp only; omega, ?_, ?_, ?_⟩
+        refine ⟨by unfold DexState.stockExact at *; dsimp only; omega, ?_, ?_, ?_, ?_⟩
         · unfold sumCaps at *; dsimp only
           rw [hC]; symm
           have hmap : pids.map (getCap (updateFn st.portfolios pid (some { pfl with capital := pfl.capital + pay, legs := updateFn pfl.legs mid (some { leg with posPnl := 0 }) }))) =
@@ -1046,6 +1046,14 @@ theorem realizeLegPnl_preserves_coherent (st st' : DexState) (mids pids : List N
             · simp [getRes, updateFn, hx]
           have hle : pay ≤ getRes st.markets mid := by simp [getRes, hm]; exact hpayLe
           rw [hmap, (sum_map_update_sub mids (getRes st.markets) mid pay hndM hmemM hle).1]
+        · unfold sumRew at *; dsimp only
+          have hmap : mids.map (getRew (updateFn st.markets mid (some { m with realizedPool := m.realizedPool - pay, totalPosPnl := m.totalPosPnl - leg.posPnl }))) =
+                      mids.map (getRew st.markets) := by
+            apply List.map_congr_left; intro x _
+            by_cases hx : x = mid
+            · subst hx; simp [getRew, updateFn, hm]
+            · simp [getRew, updateFn, hx]
+          rw [hmap, hF]
 
 /-- Anti-DoS Exit-Liveness Theorem #1: ANY flat portfolio (`totalIm = 0`, all legs empty)
     in a coherent DEX can unconditionally withdraw `100%` of its `capital > 0` at ANY slot! -/
@@ -1057,7 +1065,7 @@ theorem flat_portfolio_unconditionally_withdrawable
     (hflat : ∀ mid, pfl.legs mid = none) :
     ∃ st', stepWithdrawCollateralAuth st pid pfl.owner pfl.capital curSlot = some st' ∧
            st'.coherent mids pids := by
-  rcases hcoh with ⟨hstock, hC, hI, hR⟩
+  rcases hcoh with ⟨hstock, hC, hI, hR, hF⟩
   have hcapLeC : pfl.capital ≤ st.totalCapital := by
     rw [hC]; unfold sumCaps
     exact (sum_map_update_sub pids (getCap st.portfolios) pid pfl.capital hndP hmemP (by simp [getCap, hp])).2
@@ -1067,7 +1075,7 @@ theorem flat_portfolio_unconditionally_withdrawable
                            portfolios := updateFn st.portfolios pid (some { pfl with capital := 0 }) } := by
     unfold stepWithdrawCollateral
     simp [hp, hpos, hcapLeC, hcapLeV, him, hflat, legFreshAt]
-  refine ⟨_, ?_, withdrawCollateral_preserves_coherent st _ mids pids pid pfl.capital curSlot ⟨hstock, hC, hI, hR⟩ hndP hmemP hw⟩
+  refine ⟨_, ?_, withdrawCollateral_preserves_coherent st _ mids pids pid pfl.capital curSlot ⟨hstock, hC, hI, hR, hF⟩ hndP hmemP hw⟩
   unfold stepWithdrawCollateralAuth
   simp [hp, hw]
 
@@ -1249,7 +1257,7 @@ theorem tradeOpenPostAdl_sound
         | none => simp [hm, hpL, hpS] at h
         | some pS =>
           simp only [hm, hpL, hpS, Bind.bind, Option.bind] at h
-          by_cases hc : m.status = .active ∧ qty > 0 ∧
+          by_cases hc : m.status = .active ∧ qty > 0 ∧ m.rewardBps ≤ bpsDenNat ∧
               (m.rawBasisLong = 0 ∨ m.oiLong > 0) ∧
               (m.rawBasisShort = 0 ∨ m.oiShort > 0) ∧
               m.oiLong + qty ≤ m.maxOi ∧ m.oiShort + qty ≤ m.maxOi ∧
@@ -1257,8 +1265,13 @@ theorem tradeOpenPostAdl_sound
               pS.capital + spLS ≥ marginReq (marginNotional qty m.markPrice) m.tradeFeeBps + spSL ∧
               st.totalCapital ≥ 2 * marginReq (marginNotional qty m.markPrice) m.tradeFeeBps
           · simp only [hc, and_self, ↓reduceIte, Option.some.injEq] at h
-            rcases hc with ⟨hact, _, _, _, hmaxL, _, _, _, htotCap⟩
+            rcases hc with ⟨hact, _, hbps, _, _, hmaxL, _, _, _, htotCap⟩
             subst h
+            have hrewLe : (2 * marginReq (marginNotional qty m.markPrice) m.tradeFeeBps * m.rewardBps) / bpsDenNat ≤
+                2 * marginReq (marginNotional qty m.markPrice) m.tradeFeeBps := by
+              have hmul := Nat.mul_le_mul_left (2 * marginReq (marginNotional qty m.markPrice) m.tradeFeeBps) hbps
+              have hdiv := Nat.div_le_div_right (c := bpsDenNat) hmul
+              rwa [Nat.mul_div_cancel _ (by decide)] at hdiv
             have hmWf := hwf m hm
             rcases hmWf with ⟨hoi, hadl, henv⟩
             have ⟨hbal, _⟩ := hoi (Or.inl hact)

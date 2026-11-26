@@ -562,8 +562,13 @@ def handleCreateMarket (input : Ptr) : SolanaM Unit := do
   let maxInsDrawBps ← loadU64 ix.ptr 76
   let maxOi         ← loadU64 ix.ptr 84
   let minMm         ← if ix.len >= 100 then loadU64 ix.ptr 92 else pure 0
+  let rewardBps     ← if ix.len >= 140 then loadU64 ix.ptr 100 else pure 0
 
   SolanaM.require (maxFrontBps.toUInt64 <= maxInsDrawBps && maxInsDrawBps <= BPS_DEN) PErr.invalidParams
+  SolanaM.require (rewardBps <= BPS_DEN) PErr.invalidParams
+  if rewardBps > 0 then
+    SolanaM.require (ix.len >= 140) Err.invalidInstructionData
+    SolanaM.require (!(← pubkeyIsZero (ix.ptr + 108))) PErr.invalidParams
   SolanaM.require (initPrice > 0 && initPrice <= MAX_PRICE) PErr.invalidParams
   SolanaM.require (exitWindow >= MIN_EXIT_WINDOW && exitWindow <= MAX_EXIT_WINDOW &&
                    maxStaleness >= 1 && maxStaleness <= MAX_STALENESS && warmupSlots == 0) PErr.invalidParams
@@ -613,6 +618,9 @@ def handleCreateMarket (input : Ptr) : SolanaM Unit := do
   storeU64 mData MktOff.kLong K_ZERO
   storeU64 mData MktOff.kShort K_ZERO
   storeU64 mData MktOff.minMm minMm
+  storeU64 mData MktOff.rewardBps rewardBps
+  if rewardBps > 0 then
+    pubkeyCopy (mData + MktOff.rewardRecipient) (ix.ptr + 108)
 
 /-- Burn (`n == 2` or zero key) or transfer `marketAdmin` (`role == 0`), or rotate `oracleAuth` (`role == 1`). -/
 def handleUpdateMarketAuth (input : Ptr) : SolanaM Unit := do
@@ -1021,9 +1029,16 @@ def handleTrade (input : Ptr) : SolanaM Unit := do
       storeU64 fLData PflOff.capital (cL - fee)
       storeU64 fSData PflOff.capital (cS - fee)
       let fee2 ← checkedAdd64 fee fee
-      subU64At dData DexOff.totalCapital   fee2
-      addU64At mData MktOff.insurance      fee2
-      addU64At dData DexOff.totalInsurance fee2
+      subU64At dData DexOff.totalCapital fee2
+      let rewBps ← loadU64 mData MktOff.rewardBps
+      let rewFee ← if rewBps == 0 then pure 0 else mulDiv64 fee2 rewBps BPS_DEN
+      let insFee := fee2 - rewFee
+      if insFee > 0 then
+        addU64At mData MktOff.insurance      insFee
+        addU64At dData DexOff.totalInsurance insFee
+      if rewFee > 0 then
+        addU64At mData MktOff.rewardAccrued  rewFee
+        addU64At dData DexOff.totalRewards   rewFee
 
     if sL == SIDE_FLAT then
       storeU8  lpL LegOff.side SIDE_LONG
@@ -1565,6 +1580,7 @@ def handleTombstoneMarket (input : Ptr) : SolanaM Unit := do
   SolanaM.require ((← loadU64 mData MktOff.oiLong) == 0 && (← loadU64 mData MktOff.oiShort) == 0 &&
                    (← loadU64 mData MktOff.rawBasisLong) == 0 && (← loadU64 mData MktOff.rawBasisShort) == 0 &&
                    (← loadU64 mData MktOff.insurance) == 0 && (← loadU64 mData MktOff.realizedPool) == 0 &&
+                   (← loadU64 mData MktOff.rewardAccrued) == 0 &&
                    (← loadU64 mData MktOff.activeLegs) == 0 && (← loadU64 mData MktOff.totalPosPnl) == 0) PErr.nonzeroState
   storeU8 mData MktOff.status STATUS_TOMBSTONED
 
@@ -1637,7 +1653,41 @@ def handleSweepSurplus (input : Ptr) : SolanaM Unit := do
     TAG_DEX_VAULT (AccountView.keyPtr dex) bump
   log64 EvtTag.sweepSurplus sweepAmt (avail - sweepAmt) 0 0
 
-/-! ### Top-Level Solana Entrypoint (`lean-svm` lowers opcode dispatch to O(log2 21) binary search!) -/
+/-- Claim market-specific accrued reward fees (`MktOff.rewardAccrued`, `F_m`) from `DexVault` → `destTok`.
+    ONLY the market's immutable `MktOff.rewardRecipient` (e.g. a per-market `RewardModule` buy-and-burn PDA)
+    may sign! User capital (`C`), insurance (`I`), realized pools (`R`), protocol surplus (`S`), and EVERY
+    other market's `F_{m'}` are 100% untouchable (`V -= claimAmt`, `F_tot -= claimAmt`, `F_m -= claimAmt`)! -/
+def handleClaimReward (input : Ptr) : SolanaM Unit := do
+  let (dex, mkt, rewAuth, mint, vaultPda, destTok, tokProg, ix, progId) ← parse7 input
+  SolanaM.require (ix.len >= 9) Err.invalidInstructionData
+  requireSigner rewAuth; requireWritable dex; requireWritable mkt
+  requireWritable vaultPda; requireWritable destTok
+  checkOwnedMagic dex progId DexOff.size MAGIC_DEX
+  checkOwnedMagic mkt progId MktOff.size MAGIC_MARKET
+  let dData := AccountView.dataPtr dex
+  let mData := AccountView.dataPtr mkt
+  requireKeyEq (AccountView.keyPtr dex) (mData + MktOff.dex) PErr.dexMismatch
+  checkDexVaultAndMint dData mint vaultPda tokProg
+  requireKeyNe (AccountView.keyPtr destTok) (dData + DexOff.vaultPda) PErr.aliasedAccounts
+  SolanaM.require (!(← pubkeyIsZero (mData + MktOff.rewardRecipient))) PErr.unauthorized
+  requireKeyEq (AccountView.keyPtr rewAuth) (mData + MktOff.rewardRecipient) PErr.unauthorized
+
+  let reqAmt ← loadU64 ix.ptr 1
+  let avail  ← loadU64 mData MktOff.rewardAccrued
+  let claimAmt := if reqAmt == 0 then avail else reqAmt
+  SolanaM.require (claimAmt > 0 && claimAmt <= avail) PErr.invalidParams
+
+  subU64At mData MktOff.rewardAccrued claimAmt
+  subU64At dData DexOff.totalRewards  claimAmt
+  subU64At dData DexOff.vaultBalance  claimAmt
+  let dec  ← loadU8 dData DexOff.decimals
+  let bump ← loadU8 dData DexOff.vaultBump
+  tokenTransferCheckedSigned tokProg vaultPda mint destTok vaultPda claimAmt dec
+    TAG_DEX_VAULT (AccountView.keyPtr dex) bump
+  let mid ← loadU64 mData MktOff.marketId
+  log64 EvtTag.claimReward mid claimAmt (avail - claimAmt) 0
+
+/-! ### Top-Level Solana Entrypoint (`lean-svm` lowers opcode dispatch to O(log2 22) binary search!) -/
 
 def dispatch (input : Ptr) : SolanaM Unit := do
   let (_, _, ix, _) ← parseIxOnly input
@@ -1664,6 +1714,7 @@ def dispatch (input : Ptr) : SolanaM Unit := do
   else if op == IxOp.tombstoneMarket    then handleTombstoneMarket input
   else if op == IxOp.closeAccount       then handleCloseAccount input
   else if op == IxOp.sweepSurplus       then handleSweepSurplus input
+  else if op == IxOp.claimReward        then handleClaimReward input
   else SolanaM.fail PErr.invalidInstruction
 
 def entrypoint (input : Ptr) (s : SvmState) : UInt64 × SvmState :=

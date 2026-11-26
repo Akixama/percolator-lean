@@ -6,4 +6,5 @@ import Percolator.ThreatModel
 import Percolator.Program
 import Percolator.Matcher
 import Percolator.OracleAdapter
+import Percolator.RewardModule
 import Percolator.Refinement

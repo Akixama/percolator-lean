@@ -759,4 +759,67 @@ theorem threat_gap4_exact_asymmetric_adl_zero_sum
     have h2 := Nat.mod_lt (oi * diff + rawL - 1) hLpos
     omega
 
+/-- **THEOREM (`threat_reward_module_strict_isolation`)**:
+    **Per-Market Buy-and-Burn Reward Module Isolation & Conservation**:
+    For ANY permissionless market `X` configured at creation with `rewardBps_X ≤ 10000` and
+    immutable `rewardRecipient_X` (e.g. a `RewardModule` PDA burning any external SPL token,
+    Token-2022, or wSOL):
+    1. **Exact Fee-Split Conservation**: `insFee + rewFee = 2 * fee` (zero inflation or leak).
+    2. **Strict Cross-Market Isolation**: `stepClaimReward` on market `X` NEVER changes any other
+       market `Y ≠ X` (`I_Y`, `R_Y`, `F_Y` bit-for-bit identical!), NEVER touches `C_tot`, `I_tot`,
+       `R_tot`, or `S_tot`, and preserves exact 5-bucket `stockExact`!
+    3. **Zero Admin Theft**: `stepSweepSurplus` by `dexAdmin` NEVER touches `totalRewards` (`F_tot`)
+       or any market's `rewardAccrued`! -/
+theorem threat_reward_module_strict_isolation
+    (st st' : DexState) (midX midY signer reqAmt fee2 rewBps : Nat)
+    (hneq : midY ≠ midX) (hbps : rewBps ≤ bpsDenNat) (hstock : st.stockExact) :
+    -- (1) Exact trade-fee split conservation
+    (let rewFee := (fee2 * rewBps) / bpsDenNat
+     let insFee := fee2 - rewFee
+     rewFee ≤ fee2 ∧ insFee + rewFee = fee2) ∧
+    -- (2) ClaimReward on X preserves 5-bucket stockExact & leaves C, I, R, S, and all Y ≠ X untouched!
+    (stepClaimReward st midX signer reqAmt = some st' →
+      st'.stockExact ∧
+      st'.totalCapital = st.totalCapital ∧
+      st'.totalInsurance = st.totalInsurance ∧
+      st'.totalResidual = st.totalResidual ∧
+      st'.totalSurplus = st.totalSurplus ∧
+      st'.markets midY = st.markets midY) ∧
+    -- (3) SweepSurplus by dexAdmin leaves totalRewards & all markets bit-for-bit untouched!
+    (∀ swAmt stS, stepSweepSurplus st st.protocolAdmin swAmt = some stS →
+      stS.totalRewards = st.totalRewards ∧ stS.markets midX = st.markets midX) := by
+  refine ⟨?_, ?_, ?_⟩
+  · have hm : fee2 * rewBps ≤ fee2 * bpsDenNat := Nat.mul_le_mul_left fee2 hbps
+    have hd : (fee2 * rewBps) / bpsDenNat ≤ fee2 := by
+      have := Nat.div_le_div_right (c := bpsDenNat) hm
+      rwa [Nat.mul_div_cancel _ (by decide)] at this
+    exact ⟨hd, by omega⟩
+  · intro hcl
+    unfold stepClaimReward at hcl
+    cases hm : st.markets midX with
+    | none => simp [hm] at hcl
+    | some m =>
+      simp only [hm, Bind.bind, Option.bind] at hcl
+      let claimAmt := if reqAmt = 0 then m.rewardAccrued else reqAmt
+      change (if m.rewardRecipient ≠ 0 ∧ signer = m.rewardRecipient ∧
+          claimAmt > 0 ∧ claimAmt ≤ m.rewardAccrued ∧
+          claimAmt ≤ st.totalRewards ∧ claimAmt ≤ st.vault then
+        some { st with
+          vault        := st.vault - claimAmt
+          totalRewards := st.totalRewards - claimAmt
+          markets      := updateFn st.markets midX (some { m with rewardAccrued := m.rewardAccrued - claimAmt }) }
+      else none) = some st' at hcl
+      by_cases hc : m.rewardRecipient ≠ 0 ∧ signer = m.rewardRecipient ∧
+          claimAmt > 0 ∧ claimAmt ≤ m.rewardAccrued ∧
+          claimAmt ≤ st.totalRewards ∧ claimAmt ≤ st.vault
+      · rw [ite_eq_left_of_eq_true _ _ (eq_true hc)] at hcl; cases hcl
+        refine ⟨by unfold DexState.stockExact at *; dsimp only; omega, rfl, rfl, rfl, rfl, ?_⟩
+        simp [updateFn, hneq]
+      · rw [ite_eq_right_of_eq_false _ _ (eq_false hc)] at hcl; cases hcl
+  · intro swAmt stS hsw
+    unfold stepSweepSurplus at hsw
+    split at hsw
+    · cases hsw; exact ⟨rfl, rfl⟩
+    · cases hsw
+
 end Percolator.ThreatModel

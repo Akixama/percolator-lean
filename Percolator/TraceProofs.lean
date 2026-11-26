@@ -138,6 +138,14 @@ private theorem sum_map_eq_sub (ids : List Nat) (f g : Nat → Nat) (k delta : N
   have := sum_map_update_one_addSub ids f g k 0 delta hnd hm (by omega) (by omega) hgO
   omega
 
+private theorem sumRew_update_same (st : DexState) (mids : List Nat) (mid : Nat) (m m' : MarketState)
+    (hm : st.markets mid = some m) (hr : m'.rewardAccrued = m.rewardAccrued) :
+    (mids.map (getRew st.markets)).sum = (mids.map (getRew (updateFn st.markets mid (some m')))).sum := by
+  apply sum_map_update_const; intro x _
+  by_cases hx : x = mid
+  · subst hx; simp [getRew, updateFn, hm, hr]
+  · simp [getRew, updateFn, hx]
+
 theorem depositInsurance_preserves_coherent (st st' : DexState) (mids pids : List Nat)
     (mid lp amount : Nat) (donate : Bool)
     (hcoh : st.coherent mids pids) (hndM : mids.Nodup) (hmemM : mid ∈ mids)
@@ -158,8 +166,8 @@ theorem depositInsurance_preserves_coherent (st st' : DexState) (mids pids : Lis
               markets        := updateFn st.markets mid (some { m with insurance := m.insurance + amount, totalInsShares := m.totalInsShares + minted })
               insShares      := updateFn st.insShares mid (updateFn (st.insShares mid) lp (st.insShares mid lp + minted)) } : DexState).coherent mids pids := by
           intro minted
-          rcases hcoh with ⟨hstock, hC, hI, hR⟩
-          refine ⟨by unfold DexState.stockExact at *; dsimp only; omega, hC, ?_, ?_⟩
+          rcases hcoh with ⟨hstock, hC, hI, hR, hF⟩
+          refine ⟨by unfold DexState.stockExact at *; dsimp only; omega, hC, ?_, ?_, ?_⟩
           · unfold sumIns at *; dsimp only; rw [hI]
             exact sum_map_eq_add mids (getIns st.markets) _ mid amount hndM hmemM
               (by simp [getIns, updateFn, hm]) (fun x hx => by simp [getIns, updateFn, hx])
@@ -168,6 +176,8 @@ theorem depositInsurance_preserves_coherent (st st' : DexState) (mids pids : Lis
             by_cases hx : x = mid
             · subst hx; simp [getRes, updateFn, hm]
             · simp [getRes, updateFn, hx]
+          · unfold sumRew at *; dsimp only; rw [hF]
+            apply sumRew_update_same st mids mid m _ hm; rfl
         by_cases h0 : m.totalInsShares = 0 ∨ m.insurance = 0
         · simp only [h0, ↓reduceIte] at h
           split at h
@@ -179,8 +189,8 @@ theorem depositInsurance_preserves_coherent (st st' : DexState) (mids pids : Lis
           · cases h; exact hdone (amount * m.totalInsShares / m.insurance)
       · simp only [↓reduceIte] at h
         cases h
-        rcases hcoh with ⟨hstock, hC, hI, hR⟩
-        refine ⟨by unfold DexState.stockExact at *; dsimp only; omega, hC, ?_, ?_⟩
+        rcases hcoh with ⟨hstock, hC, hI, hR, hF⟩
+        refine ⟨by unfold DexState.stockExact at *; dsimp only; omega, hC, ?_, ?_, ?_⟩
         · unfold sumIns at *; dsimp only; rw [hI]
           exact sum_map_eq_add mids (getIns st.markets) _ mid amount hndM hmemM
             (by simp [getIns, updateFn, hm]) (fun x hx => by simp [getIns, updateFn, hx])
@@ -189,6 +199,8 @@ theorem depositInsurance_preserves_coherent (st st' : DexState) (mids pids : Lis
           by_cases hx : x = mid
           · subst hx; simp [getRes, updateFn, hm]
           · simp [getRes, updateFn, hx]
+        · unfold sumRew at *; dsimp only; rw [hF]
+          apply sumRew_update_same st mids mid m _ hm; rfl
     · cases h
 
 theorem withdrawInsurance_preserves_coherent (st st' : DexState) (mids pids : List Nat)
@@ -209,8 +221,8 @@ theorem withdrawInsurance_preserves_coherent (st st' : DexState) (mids pids : Li
         cases h
         have hpayLe : (burnShares * m.insurance) / m.totalInsShares ≤ m.insurance :=
           Nat.div_le_of_le_mul (Nat.mul_le_mul_right m.insurance hc.2.2.2.2.2.2.2)
-        rcases hcoh with ⟨hstock, hC, hI, hR⟩
-        refine ⟨by unfold DexState.stockExact at *; dsimp only; omega, hC, ?_, ?_⟩
+        rcases hcoh with ⟨hstock, hC, hI, hR, hF⟩
+        refine ⟨by unfold DexState.stockExact at *; dsimp only; omega, hC, ?_, ?_, ?_⟩
         · unfold sumIns at *; dsimp only; rw [hI]
           exact sum_map_eq_sub mids (getIns st.markets) _ mid
             ((burnShares * m.insurance) / m.totalInsShares) hndM hmemM
@@ -221,6 +233,8 @@ theorem withdrawInsurance_preserves_coherent (st st' : DexState) (mids pids : Li
           by_cases hx : x = mid
           · subst hx; simp [getRes, updateFn, hm]
           · simp [getRes, updateFn, hx]
+        · unfold sumRew at *; dsimp only; rw [hF]
+          apply sumRew_update_same st mids mid m _ hm; rfl
     · cases h
 
 theorem settleContainedLoss_preserves_coherent (st st' : DexState) (mids pids : List Nat)
@@ -243,10 +257,10 @@ theorem settleContainedLoss_preserves_coherent (st st' : DexState) (mids pids : 
         split at h
         · next hc =>
           cases h
-          rcases hcoh with ⟨hstock, hC, hI, hR⟩
+          rcases hcoh with ⟨hstock, hC, hI, hR, hF⟩
           have hdebLe : (applyContainedLoss pfl.capital pfl.totalMm leg loss).2.2.2.1 ≤ pfl.capital := by
             unfold applyContainedLoss capAvailableForLeg; dsimp only; omega
-          refine ⟨by unfold DexState.stockExact at *; dsimp only; omega, ?_, ?_, ?_⟩
+          refine ⟨by unfold DexState.stockExact at *; dsimp only; omega, ?_, ?_, ?_, ?_⟩
           · unfold sumCaps at *; dsimp only; rw [hC]
             exact sum_map_eq_sub pids (getCap st.portfolios) _ pid _ hndP hmemP
               (by simp [getCap, updateFn, hp, applyContainedLoss])
@@ -261,6 +275,8 @@ theorem settleContainedLoss_preserves_coherent (st st' : DexState) (mids pids : 
             exact sum_map_eq_add mids (getRes st.markets) _ mid _ hndM hmemM
               (by simp [getRes, updateFn, hm])
               (fun x hx => by simp [getRes, updateFn, hx])
+          · unfold sumRew at *; dsimp only; rw [hF]
+            apply sumRew_update_same st mids mid m _ hm; rfl
         · cases h
 
 theorem tradeOpenPostAdl_preserves_coherent (st st' : DexState) (mids pids : List Nat)
@@ -283,7 +299,7 @@ theorem tradeOpenPostAdl_preserves_coherent (st st' : DexState) (mids pids : Lis
         | none => simp [hm, hpL, hpS] at h
         | some pS =>
           simp only [hm, hpL, hpS, Bind.bind, Option.bind] at h
-          by_cases hc : m.status = .active ∧ qty > 0 ∧
+          by_cases hc : m.status = .active ∧ qty > 0 ∧ m.rewardBps ≤ bpsDenNat ∧
               (m.rawBasisLong = 0 ∨ m.oiLong > 0) ∧
               (m.rawBasisShort = 0 ∨ m.oiShort > 0) ∧
               m.oiLong + qty ≤ m.maxOi ∧ m.oiShort + qty ≤ m.maxOi ∧
@@ -293,8 +309,16 @@ theorem tradeOpenPostAdl_preserves_coherent (st st' : DexState) (mids pids : Lis
           · simp only [hc, and_self, ↓reduceIte, Option.some.injEq] at h
             subst h
             let fee := marginReq (marginNotional qty m.markPrice) m.tradeFeeBps
-            rcases hcoh with ⟨hstock, hC, hI, hR⟩
-            refine ⟨by unfold DexState.stockExact at *; dsimp only; omega, ?_, ?_, ?_⟩
+            let rewFee := (2 * fee * m.rewardBps) / bpsDenNat
+            let insFee := 2 * fee - rewFee
+            have hrewLe : rewFee ≤ 2 * fee := by
+              have hbps : m.rewardBps ≤ bpsDenNat := hc.2.2.1
+              have hmul : 2 * fee * m.rewardBps ≤ 2 * fee * bpsDenNat := Nat.mul_le_mul_left _ hbps
+              have hdiv := Nat.div_le_div_right (c := bpsDenNat) hmul
+              rwa [Nat.mul_div_cancel _ (by decide)] at hdiv
+            dsimp only [rewFee, fee] at hrewLe
+            rcases hcoh with ⟨hstock, hC, hI, hR, hF⟩
+            refine ⟨by unfold DexState.stockExact at *; dsimp only; omega, ?_, ?_, ?_, ?_⟩
             · unfold sumCaps at *; dsimp only; rw [hC]
               have hTwo := sum_map_update_two_addSub pids (getCap st.portfolios)
                 (getCap (updateFn (updateFn st.portfolios pidL
@@ -309,15 +333,19 @@ theorem tradeOpenPostAdl_preserves_coherent (st st' : DexState) (mids pids : Lis
               dsimp only [fee] at hTwo
               omega
             · unfold sumIns at *; dsimp only; rw [hI]
-              exact sum_map_eq_add mids (getIns st.markets) _ mid (2 * fee) hndM hmemM
-                (by simp [getIns, updateFn, hm, fee])
+              exact sum_map_eq_add mids (getIns st.markets) _ mid insFee hndM hmemM
+                (by simp [getIns, updateFn, hm, insFee, rewFee, fee])
                 (fun x hx => by simp [getIns, updateFn, hx])
             · unfold sumRes at *; dsimp only; rw [hR]
               apply sum_map_update_const; intro x _
               by_cases hx : x = mid
               · subst hx; simp [getRes, updateFn, hm]
               · simp [getRes, updateFn, hx]
-          · simp only [hc, ↓reduceIte] at h; cases h
+            · unfold sumRew at *; dsimp only; rw [hF]
+              exact sum_map_eq_add mids (getRew st.markets) _ mid rewFee hndM hmemM
+                (by simp [getRew, updateFn, hm, rewFee, fee])
+                (fun x hx => by simp [getRew, updateFn, hx])
+          · rw [ite_eq_right_of_eq_false _ _ (eq_false hc)] at h; cases h
 
 theorem tradeReduce_preserves_coherent (st st' : DexState) (mids pids : List Nat)
     (mid pidL pidS qty : Nat)
@@ -349,8 +377,8 @@ theorem tradeReduce_preserves_coherent (st st' : DexState) (mids pids : List Nat
                 · split at h
                   · cases h
                   · cases h
-                    rcases hcoh with ⟨hstock, hC, hI, hR⟩
-                    refine ⟨hstock, ?_, ?_, ?_⟩
+                    rcases hcoh with ⟨hstock, hC, hI, hR, hF⟩
+                    refine ⟨hstock, ?_, ?_, ?_, ?_⟩
                     · unfold sumCaps at *; dsimp only; rw [hC]
                       apply sum_map_update_const; intro x _
                       by_cases hxS : x = pidS
@@ -368,6 +396,8 @@ theorem tradeReduce_preserves_coherent (st st' : DexState) (mids pids : List Nat
                       by_cases hx : x = mid
                       · subst hx; simp [getRes, updateFn, hm]
                       · simp [getRes, updateFn, hx]
+                    · unfold sumRew at *; dsimp only; rw [hF]
+                      apply sumRew_update_same st mids mid m _ hm; rfl
               · cases h
 
 theorem tradeHandoff_preserves_coherent (st st' : DexState) (mids pids : List Nat)
@@ -400,8 +430,8 @@ theorem tradeHandoff_preserves_coherent (st st' : DexState) (mids pids : List Na
                       pidBuy (some { pBuy with capital := pBuy.capital + spSB - spBS })
                   ({ st with portfolios := ps' } : DexState).coherent mids pids := by
                 intro lSell' ps'
-                rcases hcoh with ⟨hstock, hC, hI, hR⟩
-                refine ⟨hstock, ?_, hI, hR⟩
+                rcases hcoh with ⟨hstock, hC, hI, hR, hF⟩
+                refine ⟨hstock, ?_, hI, hR, hF⟩
                 unfold sumCaps at *; dsimp only; rw [hC]
                 have hTwo := sum_map_update_two_addSub pids (getCap st.portfolios) (getCap ps')
                   pidSell pidBuy spBS spSB spSB spBS hndP hmemS hmemB hneSB
@@ -471,11 +501,11 @@ theorem liquidate_preserves_coherent (st st' : DexState) (mids pids : List Nat)
                     posPnl := (applyContainedLoss pfl.capital pfl.totalMm leg loss).2.1,
                     cachedMm := 0, cachedIm := 0 }) }) } : DexState).coherent mids pids := by
             intro oiL' oiS' rL' rS' capDeb cap1 liqFee shortfall insDraw htc hv hti
-            rcases hcoh with ⟨hstock, hC, hI, hR⟩
+            rcases hcoh with ⟨hstock, hC, hI, hR, hF⟩
             have hdebLe : capDeb + liqFee ≤ pfl.capital := by
               dsimp only [capDeb, cap1, liqFee, applyContainedLoss, capAvailableForLeg]; omega
             have hinsLe : insDraw ≤ m.insurance := by dsimp only [insDraw]; omega
-            refine ⟨by unfold DexState.stockExact at *; dsimp only; omega, ?_, ?_, ?_⟩
+            refine ⟨by unfold DexState.stockExact at *; dsimp only; omega, ?_, ?_, ?_, ?_⟩
             · unfold sumCaps at *; dsimp only; rw [hC, Nat.sub_sub]
               exact sum_map_eq_sub pids (getCap st.portfolios) _ pid (capDeb + liqFee) hndP hmemP
                 (by simp [getCap, updateFn, hp, cap1, capDeb, liqFee, applyContainedLoss]; omega)
@@ -490,6 +520,8 @@ theorem liquidate_preserves_coherent (st st' : DexState) (mids pids : List Nat)
               exact sum_map_eq_add mids (getRes st.markets) _ mid (capDeb + insDraw) hndM hmemM
                 (by simp only [getRes, updateFn, ↓reduceIte, hm]; rw [Nat.add_assoc])
                 (fun x hx => by simp [getRes, updateFn, hx])
+            · unfold sumRew at *; dsimp only; rw [hF]
+              apply sumRew_update_same st mids mid m _ hm; rfl
           cases hside : leg.side
           · simp only [hside] at h
             split at h
@@ -532,7 +564,7 @@ theorem liquidateTakeoverPostAdl_preserves_coherent (st st' : DexState) (mids pi
             · split at h
               · next hc =>
                 cases h
-                rcases hcoh with ⟨hstock, hC, hI, hR⟩
+                rcases hcoh with ⟨hstock, hC, hI, hR, hF⟩
                 let capDeb := (applyContainedLoss pfl.capital pfl.totalMm leg loss).2.2.2.1
                 let cap1 := (applyContainedLoss pfl.capital pfl.totalMm leg loss).1
                 let liqFee := min liqFeeCap (cap1 - (pfl.totalMm - leg.cachedMm))
@@ -541,7 +573,7 @@ theorem liquidateTakeoverPostAdl_preserves_coherent (st st' : DexState) (mids pi
                 have hdebLe : capDeb + liqFee ≤ pfl.capital := by
                   dsimp only [capDeb, cap1, liqFee, applyContainedLoss, capAvailableForLeg]; omega
                 have hinsLe : insDraw ≤ m.insurance := by dsimp only [insDraw]; omega
-                refine ⟨by unfold DexState.stockExact at *; dsimp only; omega, ?_, ?_, ?_⟩
+                refine ⟨by unfold DexState.stockExact at *; dsimp only; omega, ?_, ?_, ?_, ?_⟩
                 · unfold sumCaps at *; dsimp only; rw [hC, Nat.sub_sub]
                   exact sum_map_eq_sub pids (getCap st.portfolios) _ pid (capDeb + liqFee) hndP hmemP
                     (by simp [getCap, updateFn, hnePL, hp, cap1, capDeb, liqFee, applyContainedLoss]; omega)
@@ -559,6 +591,8 @@ theorem liquidateTakeoverPostAdl_preserves_coherent (st st' : DexState) (mids pi
                   exact sum_map_eq_add mids (getRes st.markets) _ mid (capDeb + insDraw) hndM hmemM
                     (by simp only [getRes, updateFn, ↓reduceIte, hm, capDeb, insDraw, shortfall]; rw [Nat.add_assoc])
                     (fun x hx => by simp [getRes, updateFn, hx])
+                · unfold sumRew at *; dsimp only; rw [hF]
+                  apply sumRew_update_same st mids mid m _ hm; rfl
               · cases h
             · cases h
 
@@ -585,8 +619,8 @@ theorem claimResolved_preserves_coherent (st st' : DexState) (mids pids : List N
           · cases h
           · next hpayLe =>
             cases h
-            rcases hcoh with ⟨hstock, hC, hI, hR⟩
-            refine ⟨by unfold DexState.stockExact at *; dsimp only; omega, ?_, ?_, ?_⟩
+            rcases hcoh with ⟨hstock, hC, hI, hR, hF⟩
+            refine ⟨by unfold DexState.stockExact at *; dsimp only; omega, ?_, ?_, ?_, ?_⟩
             · unfold sumCaps at *; dsimp only; rw [hC]
               exact sum_map_eq_add pids (getCap st.portfolios) _ pid _ hndP hmemP
                 (by simp [getCap, updateFn, hp])
@@ -601,6 +635,8 @@ theorem claimResolved_preserves_coherent (st st' : DexState) (mids pids : List N
                 (by simp [getRes, updateFn, hm])
                 (by simp [getRes, hm]; omega)
                 (fun x hx => by simp [getRes, updateFn, hx])
+            · unfold sumRew at *; dsimp only; rw [hF]
+              apply sumRew_update_same st mids mid m _ hm; rfl
         · cases h
 
 theorem sweepOrphanInsurance_preserves_coherent (st st' : DexState) (mids pids : List Nat)
@@ -616,8 +652,8 @@ theorem sweepOrphanInsurance_preserves_coherent (st st' : DexState) (mids pids :
     split at h
     · next hc =>
       cases h
-      rcases hcoh with ⟨hstock, hC, hI, hR⟩
-      refine ⟨by unfold DexState.stockExact at *; dsimp only; omega, hC, ?_, ?_⟩
+      rcases hcoh with ⟨hstock, hC, hI, hR, hF⟩
+      refine ⟨by unfold DexState.stockExact at *; dsimp only; omega, hC, ?_, ?_, ?_⟩
       · unfold sumIns at *; dsimp only; rw [hI]
         exact sum_map_eq_sub mids (getIns st.markets) _ mid m.insurance hndM hmemM
           (by simp [getIns, updateFn, hm]) (by simp [getIns, hm])
@@ -627,6 +663,8 @@ theorem sweepOrphanInsurance_preserves_coherent (st st' : DexState) (mids pids :
         by_cases hx : x = mid
         · subst hx; simp [getRes, updateFn, hm]
         · simp [getRes, updateFn, hx]
+      · unfold sumRew at *; dsimp only; rw [hF]
+        apply sumRew_update_same st mids mid m _ hm; rfl
     · cases h
 
 theorem settleFullCapitalLoss_preserves_coherent (st st' : DexState) (mids pids : List Nat)
@@ -649,7 +687,7 @@ theorem settleFullCapitalLoss_preserves_coherent (st st' : DexState) (mids pids 
         split at h
         · next hc =>
           cases h
-          rcases hcoh with ⟨hstock, hC, hI, hR⟩
+          rcases hcoh with ⟨hstock, hC, hI, hR, hF⟩
           let pnlBurned := min loss leg.posPnl
           let rem1      := loss - pnlBurned
           let capDeb    := min rem1 pfl.capital
@@ -657,7 +695,7 @@ theorem settleFullCapitalLoss_preserves_coherent (st st' : DexState) (mids pids 
           let toR       := capDeb - repay
           have hdebLe : capDeb ≤ pfl.capital := Nat.min_le_right _ _
           have hrepLe : repay ≤ capDeb := Nat.min_le_left _ _
-          refine ⟨by unfold DexState.stockExact at *; dsimp only; omega, ?_, ?_, ?_⟩
+          refine ⟨by unfold DexState.stockExact at *; dsimp only; omega, ?_, ?_, ?_, ?_⟩
           · unfold sumCaps at *; dsimp only; rw [hC]
             exact sum_map_eq_sub pids (getCap st.portfolios) _ pid capDeb hndP hmemP
               (by simp [getCap, updateFn, hp, capDeb, rem1, pnlBurned])
@@ -671,6 +709,8 @@ theorem settleFullCapitalLoss_preserves_coherent (st st' : DexState) (mids pids 
             exact sum_map_eq_add mids (getRes st.markets) _ mid toR hndM hmemM
               (by simp [getRes, updateFn, hm, toR, repay, capDeb, rem1, pnlBurned])
               (fun x hx => by simp [getRes, updateFn, hx])
+          · unfold sumRew at *; dsimp only; rw [hF]
+            apply sumRew_update_same st mids mid m _ hm; rfl
         · cases h
 
 theorem realizeFrontedPnl_preserves_coherent (st st' : DexState) (mids pids : List Nat)
@@ -693,7 +733,7 @@ theorem realizeFrontedPnl_preserves_coherent (st st' : DexState) (mids pids : Li
         split at h
         · next hc =>
           cases h
-          rcases hcoh with ⟨hstock, hC, hI, hR⟩
+          rcases hcoh with ⟨hstock, hC, hI, hR, hF⟩
           let fromR   := min leg.posPnl m.realizedPool
           let fromIns := leg.posPnl - fromR
           have hfrLeR : fromR ≤ m.realizedPool := Nat.min_le_right _ _
@@ -705,7 +745,7 @@ theorem realizeFrontedPnl_preserves_coherent (st st' : DexState) (mids pids : Li
             have h3 : min (((m.insurance + m.insFronted) * m.maxFrontBps) / bpsDenNat - m.insFronted) m.insurance ≤ m.insurance :=
               Nat.min_le_right _ _
             omega
-          refine ⟨by unfold DexState.stockExact at *; dsimp only; omega, ?_, ?_, ?_⟩
+          refine ⟨by unfold DexState.stockExact at *; dsimp only; omega, ?_, ?_, ?_, ?_⟩
           · unfold sumCaps at *; dsimp only; rw [hC]
             exact sum_map_eq_add pids (getCap st.portfolios) _ pid leg.posPnl hndP hmemP
               (by simp [getCap, updateFn, hp])
@@ -720,6 +760,8 @@ theorem realizeFrontedPnl_preserves_coherent (st st' : DexState) (mids pids : Li
               (by simp [getRes, updateFn, hm, fromR])
               (by simp [getRes, hm]; exact hfrLeR)
               (fun x hx => by simp [getRes, updateFn, hx])
+          · unfold sumRew at *; dsimp only; rw [hF]
+            apply sumRew_update_same st mids mid m _ hm; rfl
         · cases h
 
 theorem sweepSurplus_preserves_coherent (st st' : DexState) (mids pids : List Nat)
@@ -731,9 +773,51 @@ theorem sweepSurplus_preserves_coherent (st st' : DexState) (mids pids : List Na
   split at h
   · next hc =>
     cases h
-    rcases hcoh with ⟨hstock, hC, hI, hR⟩
-    exact ⟨by unfold DexState.stockExact at *; dsimp only; omega, hC, hI, hR⟩
+    rcases hcoh with ⟨hstock, hC, hI, hR, hF⟩
+    exact ⟨by unfold DexState.stockExact at *; dsimp only; omega, hC, hI, hR, hF⟩
   · cases h
+
+theorem claimReward_preserves_coherent (st st' : DexState) (mids pids : List Nat)
+    (mid signer reqAmt : Nat)
+    (hcoh : st.coherent mids pids) (hndM : mids.Nodup) (hmemM : mid ∈ mids)
+    (h : stepClaimReward st mid signer reqAmt = some st') :
+    st'.coherent mids pids := by
+  unfold stepClaimReward at h
+  cases hm : st.markets mid with
+  | none => simp [hm] at h
+  | some m =>
+    simp only [hm, Bind.bind, Option.bind] at h
+    let claimAmt := if reqAmt = 0 then m.rewardAccrued else reqAmt
+    change (if m.rewardRecipient ≠ 0 ∧ signer = m.rewardRecipient ∧
+        claimAmt > 0 ∧ claimAmt ≤ m.rewardAccrued ∧
+        claimAmt ≤ st.totalRewards ∧ claimAmt ≤ st.vault then
+      some { st with
+        vault        := st.vault - claimAmt
+        totalRewards := st.totalRewards - claimAmt
+        markets      := updateFn st.markets mid (some { m with rewardAccrued := m.rewardAccrued - claimAmt }) }
+    else none) = some st' at h
+    by_cases hc : m.rewardRecipient ≠ 0 ∧ signer = m.rewardRecipient ∧
+        claimAmt > 0 ∧ claimAmt ≤ m.rewardAccrued ∧
+        claimAmt ≤ st.totalRewards ∧ claimAmt ≤ st.vault
+    · rw [ite_eq_left_of_eq_true _ _ (eq_true hc)] at h; cases h
+      rcases hcoh with ⟨hstock, hC, hI, hR, hF⟩
+      refine ⟨by unfold DexState.stockExact at *; dsimp only; omega, hC, ?_, ?_, ?_⟩
+      · unfold sumIns at *; dsimp only; rw [hI]
+        apply sum_map_update_const; intro x _
+        by_cases hx : x = mid
+        · subst hx; simp [getIns, updateFn, hm]
+        · simp [getIns, updateFn, hx]
+      · unfold sumRes at *; dsimp only; rw [hR]
+        apply sum_map_update_const; intro x _
+        by_cases hx : x = mid
+        · subst hx; simp [getRes, updateFn, hm]
+        · simp [getRes, updateFn, hx]
+      · unfold sumRew at *; dsimp only; rw [hF]
+        exact sum_map_eq_sub mids (getRew st.markets) _ mid claimAmt hndM hmemM
+          (by simp [getRew, updateFn, hm])
+          (by simp [getRew, hm]; exact hc.2.2.2.1)
+          (fun x hx => by simp [getRew, updateFn, hx])
+    · rw [ite_eq_right_of_eq_false _ _ (eq_false hc)] at h; cases h
 
 theorem updateOracle_preserves_coherent (st st' : DexState) (mids pids : List Nat)
     (mid newPrice fundE6 curSlot : Nat)
@@ -750,8 +834,8 @@ theorem updateOracle_preserves_coherent (st st' : DexState) (mids pids : List Na
         diff + fundE6 ≤ (m.markPrice * m.maxMoveBps) / bpsDenNat
     · simp only [diff, hc, and_self, ↓reduceIte, Option.some.injEq] at h
       subst h
-      rcases hcoh with ⟨hstock, hC, hI, hR⟩
-      refine ⟨hstock, hC, ?_, ?_⟩
+      rcases hcoh with ⟨hstock, hC, hI, hR, hF⟩
+      refine ⟨hstock, hC, ?_, ?_, ?_⟩
       · unfold sumIns at *; dsimp only; rw [hI]
         apply sum_map_update_const; intro x _
         by_cases hx : x = mid
@@ -762,6 +846,8 @@ theorem updateOracle_preserves_coherent (st st' : DexState) (mids pids : List Na
         by_cases hx : x = mid
         · subst hx; simp [getRes, updateFn, hm]
         · simp [getRes, updateFn, hx]
+      · unfold sumRew at *; dsimp only; rw [hF]
+        apply sumRew_update_same st mids mid m _ hm; rfl
     · simp only [diff, hc, ↓reduceIte] at h; cases h
 
 theorem liquidateFullCap_preserves_coherent (st st' : DexState) (mids pids : List Nat)
@@ -798,7 +884,7 @@ theorem liquidateFullCap_preserves_coherent (st st' : DexState) (mids pids : Lis
             st.totalCapital ≥ capDeb + liqFee ∧ st.vault ≥ liqFee ∧
             st.totalInsurance + repay ≥ insDraw ∧ m.totalPosPnl ≥ pnlBurned
         · rw [ite_eq_left_of_eq_true _ _ (eq_true hc)] at h; cases h
-          rcases hcoh with ⟨hstock, hC, hI, hR⟩
+          rcases hcoh with ⟨hstock, hC, hI, hR, hF⟩
           have hdebLe : capDeb + liqFee ≤ pfl.capital := by
             dsimp only [capDeb, cap1, liqFee]; omega
           have hrepLe : repay ≤ capDeb := Nat.min_le_left _ _
@@ -808,10 +894,10 @@ theorem liquidateFullCap_preserves_coherent (st st' : DexState) (mids pids : Lis
           have htc  : st.totalCapital ≥ capDeb + liqFee := hc.2.2.2.1
           have hv   : st.vault ≥ liqFee := hc.2.2.2.2.1
           have htoR : toR + repay = capDeb := by dsimp only [toR]; omega
-          refine ⟨?_, ?_, ?_, ?_⟩
+          refine ⟨?_, ?_, ?_, ?_, ?_⟩
           · unfold DexState.stockExact at hstock ⊢
             change st.totalCapital - capDeb - liqFee + (st.totalInsurance + repay - insDraw) +
-                (st.totalResidual + toR + insDraw) + st.totalSurplus = st.vault - liqFee
+                (st.totalResidual + toR + insDraw) + st.totalSurplus + st.totalRewards = st.vault - liqFee
             omega
           · unfold sumCaps at *; dsimp only; rw [hC, Nat.sub_sub]
             exact sum_map_eq_sub pids (getCap st.portfolios) _ pid (capDeb + liqFee) hndP hmemP
@@ -836,6 +922,8 @@ theorem liquidateFullCap_preserves_coherent (st st' : DexState) (mids pids : Lis
             exact sum_map_eq_add mids (getRes st.markets) _ mid (toR + insDraw) hndM hmemM
               (by simp only [getRes, updateFn, ↓reduceIte, hm, toR, insDraw, insAfterRepay, maxDraw, shortfall, wo, sfRaw, repay, cap1, capDeb, rem1, pnlBurned]; rw [Nat.add_assoc])
               (fun x hx => by simp [getRes, updateFn, hx])
+          · unfold sumRew at *; dsimp only; rw [hF]
+            apply sumRew_update_same st mids mid m _ hm; rfl
         · rw [ite_eq_right_of_eq_false _ _ (eq_false hc)] at h; cases h
 
 /-- Single-step relation covering EVERY balance-moving transition in `percolator-lean` v2.1
@@ -879,6 +967,8 @@ inductive DexStep (mids pids : List Nat) : DexState → DexState → Prop where
       mid ∈ mids → stepSweepOrphanInsurance st mid = some st' → DexStep mids pids st st'
   | sweepSurplus {st st' signer amt} :
       stepSweepSurplus st signer amt = some st' → DexStep mids pids st st'
+  | claimReward {st st' mid signer amt} :
+      mid ∈ mids → stepClaimReward st mid signer amt = some st' → DexStep mids pids st st'
   | updateOracle {st st' mid newPrice fundE6 curSlot} :
       stepUpdateOracle st mid newPrice fundE6 curSlot = some st' → DexStep mids pids st st'
 
@@ -888,11 +978,11 @@ inductive DexReachable (mids pids : List Nat) : DexState → DexState → Prop w
   | step {st0 st1 st2 : DexState} :
       DexReachable mids pids st0 st1 → DexStep mids pids st1 st2 → DexReachable mids pids st0 st2
 
-/-- **Unified Multi-Step Trace Coherence Theorem (Global No-LOF Proof Across ALL 18 Transitions!)**:
+/-- **Unified Multi-Step Trace Coherence Theorem (Global No-LOF Proof Across ALL 19 Transitions!)**:
     Starting from ANY coherent DEX state `st0`, EVERY state `st` reachable via ANY finite
-    interleaving of all 18 protocol transitions preserves exact aggregate coherence:
-    `C_tot = ∑ capital`, `I_tot = ∑ insurance`, `R_tot = ∑ realizedPool`,
-    AND `C_tot + I_tot + R_tot + S_tot = V`! -/
+    interleaving of all 19 protocol transitions preserves exact 5-bucket aggregate coherence:
+    `C_tot = ∑ capital`, `I_tot = ∑ insurance`, `R_tot = ∑ realizedPool`, `F_tot = ∑ rewardAccrued`,
+    AND `C_tot + I_tot + R_tot + S_tot + F_tot = V`! -/
 theorem reachable_preserves_coherent (mids pids : List Nat)
     (hndM : mids.Nodup) (hndP : pids.Nodup)
     (st0 st : DexState) (h0 : st0.coherent mids pids)
@@ -919,37 +1009,33 @@ theorem reachable_preserves_coherent (mids pids : List Nat)
     | claimResolved hm hp h => exact claimResolved_preserves_coherent _ _ _ _ _ _ ih hndM hm hndP hp h
     | sweepOrphanInsurance hm h => exact sweepOrphanInsurance_preserves_coherent _ _ _ _ _ ih hndM hm h
     | sweepSurplus h => exact sweepSurplus_preserves_coherent _ _ _ _ _ _ ih h
+    | claimReward hm h => exact claimReward_preserves_coherent _ _ _ _ _ _ _ ih hndM hm h
     | updateOracle h => exact updateOracle_preserves_coherent _ _ _ _ _ _ _ _ ih h
 
-/-- **Corollary (Global Multi-Step Solvency Conservation)**:
-    Across ANY finite trace of all 18 protocol instructions, the exact sum of all portfolio capitals,
-    all per-market insurance pools, all per-market realized pools, and global surplus equals
-    the SPL vault balance `V` to the last atom! -/
+/-- **Corollary (Global Multi-Step 5-Bucket Solvency Conservation)**:
+    Across ANY finite trace of all 19 protocol instructions, the exact sum of all portfolio capitals,
+    all per-market insurance pools, all per-market realized pools, global surplus, and all per-market
+    accrued reward pools equals the SPL vault balance `V` to the last atom! -/
 theorem reachable_global_solvency (mids pids : List Nat)
     (hndM : mids.Nodup) (hndP : pids.Nodup)
     (st0 st : DexState) (h0 : st0.coherent mids pids)
     (hreach : DexReachable mids pids st0 st) :
-    sumCaps st pids + sumIns st mids + sumRes st mids + st.totalSurplus = st.vault := by
-  have ⟨hstock, hC, hI, hR⟩ := reachable_preserves_coherent mids pids hndM hndP st0 st h0 hreach
+    sumCaps st pids + sumIns st mids + sumRes st mids + st.totalSurplus + sumRew st mids = st.vault := by
+  have ⟨hstock, hC, hI, hR, hF⟩ := reachable_preserves_coherent mids pids hndM hndP st0 st h0 hreach
   unfold DexState.stockExact at hstock
   omega
 
 /-- **Gap #5 Theorem (`adversarial_multi_account_net_extraction_bound`)**:
-    **Multi-Account Adversarial Economic Net-Extraction Bound Over Arbitrary `DexReachable` Traces!**
+    **Multi-Account Adversarial Economic Net-Extraction Bound Over Arbitrary 19-Transition Traces!**
     Partition portfolios into `attackerPids ++ honestPids` (`pids`) and markets into
-    `trustedMids ++ untrustedMids` (`mids`). Across ANY finite `DexReachable` trace `st0 →* st`
-    with exact external vault delta `st.vault - st0.vault` (net deposits minus withdrawals):
-    1. **Global Economic Extraction Identity**: Every single atom gained by ALL attacker accounts
-       combined (`∑_{a ∈ A} cap_a`) beyond net vault inflows MUST come atom-for-atom from a decrease
-       in honest capitals, trusted market pools (`I_T + R_T`), untrusted market pools (`I_U + R_U`),
-       or protocol surplus `S`!
+    `trustedMids ++ untrustedMids` (`mids`). Across ANY finite `DexReachable` trace `st0 →* st`:
+    1. **Global 5-Bucket Economic Extraction Identity**: Every atom gained by ALL attacker accounts
+       beyond net vault inflows MUST come atom-for-atom from honest capitals, trusted pools
+       (`I_T + R_T + F_T`), untrusted pools (`I_U + R_U + F_U`), or protocol surplus `S`!
     2. **Zero Trusted-Pool Extraction Corollary**: Whenever honest users' capitals + trusted markets'
-       `I_T + R_T` + `S` do not decrease (as guaranteed over any Solana `K = 4` leader window by
-       `threat_gap1_multileg_k4_zero_bad_debt`, `threat_permissionless_cross_margin_non_contagion`,
-       Bug 1B full-capital debit, and `threat_mango_self_trade_containment`), total attacker net
-       extraction across ALL attacker accounts combined is **STRICTLY BOUNDED BY
-       `sumIns st0 untrustedMids + sumRes st0 untrustedMids`**
-       (and **EXACT `0`** when `untrustedMids` have `0` external insurance/residual)! -/
+       `I_T + R_T + F_T` + `S` do not decrease, total attacker net extraction across ALL attacker
+       accounts combined is **STRICTLY BOUNDED BY `sumIns st0 untrustedMids + sumRes st0 untrustedMids + sumRew st0 untrustedMids`**
+       (and **EXACT `0`** when `untrustedMids` have `0` external pools)! -/
 theorem adversarial_multi_account_net_extraction_bound
     (trustedMids untrustedMids attackerPids honestPids : List Nat)
     (hndM : (trustedMids ++ untrustedMids).Nodup)
@@ -958,10 +1044,10 @@ theorem adversarial_multi_account_net_extraction_bound
     (hreach : DexReachable (trustedMids ++ untrustedMids) (attackerPids ++ honestPids) st0 st) :
     let atk0 := sumCaps st0 attackerPids
     let atk1 := sumCaps st  attackerPids
-    let prot0 := sumCaps st0 honestPids + sumIns st0 trustedMids + sumRes st0 trustedMids + st0.totalSurplus
-    let prot1 := sumCaps st  honestPids + sumIns st  trustedMids + sumRes st  trustedMids + st.totalSurplus
-    let unt0 := sumIns st0 untrustedMids + sumRes st0 untrustedMids
-    let unt1 := sumIns st  untrustedMids + sumRes st  untrustedMids
+    let prot0 := sumCaps st0 honestPids + sumIns st0 trustedMids + sumRes st0 trustedMids + sumRew st0 trustedMids + st0.totalSurplus
+    let prot1 := sumCaps st  honestPids + sumIns st  trustedMids + sumRes st  trustedMids + sumRew st  trustedMids + st.totalSurplus
+    let unt0 := sumIns st0 untrustedMids + sumRes st0 untrustedMids + sumRew st0 untrustedMids
+    let unt1 := sumIns st  untrustedMids + sumRes st  untrustedMids + sumRew st  untrustedMids
     -- (1) Exact multi-account economic conservation identity
     atk1 + prot1 + unt1 = st.vault ∧
     atk0 + prot0 + unt0 = st0.vault ∧
@@ -976,7 +1062,9 @@ theorem adversarial_multi_account_net_extraction_bound
     intro s; unfold sumIns; rw [List.map_append, List.sum_append]
   have hSplitRes : ∀ s : DexState, sumRes s (trustedMids ++ untrustedMids) = sumRes s trustedMids + sumRes s untrustedMids := by
     intro s; unfold sumRes; rw [List.map_append, List.sum_append]
-  rw [hSplitCap, hSplitIns, hSplitRes] at hS0 hS1
+  have hSplitRew : ∀ s : DexState, sumRew s (trustedMids ++ untrustedMids) = sumRew s trustedMids + sumRew s untrustedMids := by
+    intro s; unfold sumRew; rw [List.map_append, List.sum_append]
+  rw [hSplitCap, hSplitIns, hSplitRes, hSplitRew] at hS0 hS1
   dsimp only
   refine ⟨by omega, by omega, fun hv hp => ⟨by omega, fun hu => by omega⟩⟩
 
