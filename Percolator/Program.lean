@@ -240,7 +240,6 @@ def findOrAllocLegSlot (pflData mktKey : Ptr) (mid : UInt64) : SolanaM UInt64 :=
   storeU64 lp LegOff.cachedMm 0
   storeU64 lp LegOff.cachedIm 0
   storeU64 lp LegOff.lastRefreshSlot 0
-  storeU64 lp LegOff.reservedMm 0
   storeU8 pflData PflOff.legCount (cnt + 1)
   return empty
 
@@ -313,8 +312,8 @@ def legEffectiveQty (mktData lp : Ptr) : SolanaM UInt64 := do
   mulDiv64 rawB adl ADL_ONE
 
 /-- Refresh `cachedMm` / `cachedIm` on `slotIdx` and maintain exact `pfl.totalMm` / `pfl.totalIm`.
-    Cross-market isolation is enforced structurally at `findOrAllocLegSlot` (`MktOff.crossMargin`),
-    so no broken `reservedMm` shielding exists (`reservedMm = 0`, `totalReservedMm = 0 <= capital`)! -/
+    Cross-market isolation is enforced by per-market K=4 compounded clamps, full-capital settlement
+    (zero shielding), and `I_m`-contained fronting/realization — zero dead `reservedMm` fields! -/
 def syncLegMargins (mktData pflData : Ptr) (slotIdx curSlot : UInt64) : SolanaM Unit := do
   let lp := legPtrAt pflData slotIdx
   let oldMm ← loadU64 lp LegOff.cachedMm
@@ -330,12 +329,10 @@ def syncLegMargins (mktData pflData : Ptr) (slotIdx curSlot : UInt64) : SolanaM 
   let baseIm := if totIm >= oldIm then totIm - oldIm else 0
   let newTotMm ← checkedAdd64 baseMm newMm
   let newTotIm ← checkedAdd64 baseIm newIm
-  storeU64 pflData PflOff.totalMm         newTotMm
-  storeU64 pflData PflOff.totalIm         newTotIm
-  storeU64 pflData PflOff.totalReservedMm 0
+  storeU64 pflData PflOff.totalMm newTotMm
+  storeU64 pflData PflOff.totalIm newTotIm
   storeU64 lp LegOff.cachedMm        newMm
   storeU64 lp LegOff.cachedIm        newIm
-  storeU64 lp LegOff.reservedMm      0
   storeU64 lp LegOff.lastRefreshSlot curSlot
 
 /-- Route a loser's `capDeb` USD payment into market `m`, repaying `Mkt.insFronted` senior
@@ -553,7 +550,7 @@ def handleCreateMarket (input : Ptr) : SolanaM Unit := do
   let initPrice     ← loadU64 ix.ptr 4
   let exitWindow    ← loadU64 ix.ptr 12
   let maxStaleness  ← loadU64 ix.ptr 20
-  let warmupSlots   ← loadU64 ix.ptr 28
+  let reservedPad   ← loadU64 ix.ptr 28
   let imBps         ← loadU64 ix.ptr 36
   let mmBps         ← loadU64 ix.ptr 44
   let liqFeeBps     ← loadU64 ix.ptr 52
@@ -571,7 +568,7 @@ def handleCreateMarket (input : Ptr) : SolanaM Unit := do
     SolanaM.require (!(← pubkeyIsZero (ix.ptr + 108))) PErr.invalidParams
   SolanaM.require (initPrice > 0 && initPrice <= MAX_PRICE) PErr.invalidParams
   SolanaM.require (exitWindow >= MIN_EXIT_WINDOW && exitWindow <= MAX_EXIT_WINDOW &&
-                   maxStaleness >= 1 && maxStaleness <= MAX_STALENESS && warmupSlots == 0) PErr.invalidParams
+                   maxStaleness >= 1 && maxStaleness <= MAX_STALENESS && reservedPad == 0) PErr.invalidParams
   SolanaM.require (mmBps > 0 && mmBps < imBps && imBps <= BPS_DEN) PErr.invalidParams
   -- Gap #1 Fix (Solana K=4 compounding leader window): `k4MoveBps + liqFeeBps <= mmBps`
   -- where `k4MoveBps = 4*m + ceil(m^2 / 1000)` strictly bounds `((10000+m)^4 - 10000^4) / 10000^3`
@@ -605,7 +602,6 @@ def handleCreateMarket (input : Ptr) : SolanaM Unit := do
   storeU64 mData MktOff.lastOracleSlot (← getClockSlot)
   storeU64 mData MktOff.exitWindow exitWindow
   storeU64 mData MktOff.maxStaleness maxStaleness
-  storeU64 mData MktOff.warmupSlots warmupSlots
   storeU64 mData MktOff.imBps imBps
   storeU64 mData MktOff.mmBps mmBps
   storeU64 mData MktOff.liqFeeBps liqFeeBps
@@ -719,7 +715,6 @@ def handleInitPortfolio (input : Ptr) : SolanaM Unit := do
   storeU32 fData PflOff.magic MAGIC_PORTFOLIO
   storeU8  fData PflOff.legCount 0
   storeU64 fData PflOff.portfolioId pid
-  storeU64 fData PflOff.episode 1
   pubkeyCopy (fData + PflOff.dex)   (AccountView.keyPtr dex)
   pubkeyCopy (fData + PflOff.owner) (AccountView.keyPtr owner)
 
@@ -957,30 +952,14 @@ def applyExecSpread (mData fLData fSData : Ptr) (qty execPrice : UInt64) : Solan
       storeU64 fSData PflOff.capital (cS - spread)
       addU64At fLData PflOff.capital spread
 
-def handleTrade (input : Ptr) : SolanaM Unit := do
-  let (dex, mkt, pflL, ownerL, pflS, ownerS, ix, progId) ← parse6 input
-  SolanaM.require (ix.len >= 10) Err.invalidInstructionData
-  requireSigner ownerL; requireSigner ownerS
-  requireWritable dex; requireWritable mkt; requireWritable pflL; requireWritable pflS
-  requireKeyNe (AccountView.keyPtr pflL) (AccountView.keyPtr pflS) PErr.aliasedAccounts
-  checkOwnedMagic dex  progId DexOff.size MAGIC_DEX
-  checkOwnedMagic mkt  progId MktOff.size MAGIC_MARKET
-  checkOwnedMagic pflL progId PflOff.size MAGIC_PORTFOLIO
-  checkOwnedMagic pflS progId PflOff.size MAGIC_PORTFOLIO
-
-  let dData  := AccountView.dataPtr dex
-  let mData  := AccountView.dataPtr mkt
-  let fLData := AccountView.dataPtr pflL
-  let fSData := AccountView.dataPtr pflS
-  requireKeyEq (AccountView.keyPtr dex)    (mData  + MktOff.dex)   PErr.dexMismatch
-  requireKeyEq (AccountView.keyPtr dex)    (fLData + PflOff.dex)   PErr.dexMismatch
-  requireKeyEq (AccountView.keyPtr dex)    (fSData + PflOff.dex)   PErr.dexMismatch
-  requireKeyEq (AccountView.keyPtr ownerL) (fLData + PflOff.owner) PErr.ownerMismatch
-  requireKeyEq (AccountView.keyPtr ownerS) (fSData + PflOff.owner) PErr.ownerMismatch
-
-  let mode      ← loadU8  ix.ptr 1
-  let qty       ← loadU64 ix.ptr 2
-  let execPrice ← if ix.len >= 18 then loadU64 ix.ptr 10 else pure 0
+/-- Shared core bilateral trade execution (used identically by `Trade` and CPI-Out `TradeWithMatcher`).
+    Takes 5 pointer args (`argsPtr` = `[mktKeyPtr:u64, mode:u64, qty:u64, execPrice:u64]`) so both
+    paths share 100% identical conservation, `maxMoveBps` spread clamping, fee splitting, and margin checks. -/
+@[noinline] def tradeCore (dData mData fLData fSData argsPtr : Ptr) : SolanaM Unit := do
+  let mktKeyPtr ← loadU64 argsPtr 0
+  let mode      ← loadU8  argsPtr 8
+  let qty       ← loadU64 argsPtr 16
+  let execPrice ← loadU64 argsPtr 24
   SolanaM.require (qty > 0) PErr.invalidParams
 
   let st ← loadU8 mData MktOff.status
@@ -992,8 +971,8 @@ def handleTrade (input : Ptr) : SolanaM Unit := do
     SolanaM.require (st == STATUS_ACTIVE) PErr.invalidStatus
     checkOracleFresh mData curSlot
 
-    let slotL ← findOrAllocLegSlot fLData (AccountView.keyPtr mkt) mid
-    let slotS ← findOrAllocLegSlot fSData (AccountView.keyPtr mkt) mid
+    let slotL ← findOrAllocLegSlot fLData mktKeyPtr mid
+    let slotS ← findOrAllocLegSlot fSData mktKeyPtr mid
     let lpL := legPtrAt fLData slotL
     let lpS := legPtrAt fSData slotS
     let sL ← loadU8 lpL LegOff.side
@@ -1076,8 +1055,8 @@ def handleTrade (input : Ptr) : SolanaM Unit := do
     SolanaM.require (slotL < MAX_LEGS && slotS < MAX_LEGS) PErr.legNotFound
     let lpL := legPtrAt fLData slotL
     let lpS := legPtrAt fSData slotS
-    requireKeyEq (AccountView.keyPtr mkt) (lpL + LegOff.market) PErr.marketMismatch
-    requireKeyEq (AccountView.keyPtr mkt) (lpS + LegOff.market) PErr.marketMismatch
+    requireKeyEq mktKeyPtr (lpL + LegOff.market) PErr.marketMismatch
+    requireKeyEq mktKeyPtr (lpS + LegOff.market) PErr.marketMismatch
     SolanaM.require ((← loadU8 lpL LegOff.side) == SIDE_LONG && (← loadU8 lpS LegOff.side) == SIDE_SHORT) PErr.invalidSide
 
     let _ ← settleAndRefreshLeg dData mData fLData slotL curSlot false
@@ -1149,10 +1128,10 @@ def handleTrade (input : Ptr) : SolanaM Unit := do
     let slotSell ← findLegLoop fLData mid 0
     SolanaM.require (slotSell < MAX_LEGS) PErr.legNotFound
     let lpSell := legPtrAt fLData slotSell
-    requireKeyEq (AccountView.keyPtr mkt) (lpSell + LegOff.market) PErr.marketMismatch
+    requireKeyEq mktKeyPtr (lpSell + LegOff.market) PErr.marketMismatch
     SolanaM.require ((← loadU8 lpSell LegOff.side) == targetSide) PErr.invalidSide
 
-    let slotBuy ← findOrAllocLegSlot fSData (AccountView.keyPtr mkt) mid
+    let slotBuy ← findOrAllocLegSlot fSData mktKeyPtr mid
     let lpBuy := legPtrAt fSData slotBuy
     let sBuy ← loadU8 lpBuy LegOff.side
     SolanaM.require (sBuy == SIDE_FLAT || sBuy == targetSide) PErr.invalidSide
@@ -1197,6 +1176,37 @@ def handleTrade (input : Ptr) : SolanaM Unit := do
   else
     SolanaM.fail PErr.invalidParams
   log64 EvtTag.trade ((mid <<< 8) ||| mode.toUInt64) qty execPrice (← loadU64 mData MktOff.markPrice)
+
+def handleTrade (input : Ptr) : SolanaM Unit := do
+  let (dex, mkt, pflL, ownerL, pflS, ownerS, ix, progId) ← parse6 input
+  SolanaM.require (ix.len >= 10) Err.invalidInstructionData
+  requireSigner ownerL; requireSigner ownerS
+  requireWritable dex; requireWritable mkt; requireWritable pflL; requireWritable pflS
+  requireKeyNe (AccountView.keyPtr pflL) (AccountView.keyPtr pflS) PErr.aliasedAccounts
+  checkOwnedMagic dex  progId DexOff.size MAGIC_DEX
+  checkOwnedMagic mkt  progId MktOff.size MAGIC_MARKET
+  checkOwnedMagic pflL progId PflOff.size MAGIC_PORTFOLIO
+  checkOwnedMagic pflS progId PflOff.size MAGIC_PORTFOLIO
+
+  let dData  := AccountView.dataPtr dex
+  let mData  := AccountView.dataPtr mkt
+  let fLData := AccountView.dataPtr pflL
+  let fSData := AccountView.dataPtr pflS
+  requireKeyEq (AccountView.keyPtr dex)    (mData  + MktOff.dex)   PErr.dexMismatch
+  requireKeyEq (AccountView.keyPtr dex)    (fLData + PflOff.dex)   PErr.dexMismatch
+  requireKeyEq (AccountView.keyPtr dex)    (fSData + PflOff.dex)   PErr.dexMismatch
+  requireKeyEq (AccountView.keyPtr ownerL) (fLData + PflOff.owner) PErr.ownerMismatch
+  requireKeyEq (AccountView.keyPtr ownerS) (fSData + PflOff.owner) PErr.ownerMismatch
+
+  let mode      ← loadU8  ix.ptr 1
+  let qty       ← loadU64 ix.ptr 2
+  let execPrice ← if ix.len >= 18 then loadU64 ix.ptr 10 else pure 0
+  let args ← stackAlloc 32
+  storeU64 args 0  (AccountView.keyPtr mkt)
+  storeU64 args 8  mode.toUInt64
+  storeU64 args 16 qty
+  storeU64 args 24 execPrice
+  tradeCore dData mData fLData fSData args
 
 /-- Fair, transparent $O(1)$ liquidation supporting:
     - Partial OR full liquidation (`reqQty = 0` → full leg; `reqQty > 0` → partial `min(reqQty, rawB)`),
@@ -1601,8 +1611,7 @@ def handleCloseAccount (input : Ptr) : SolanaM Unit := do
       SolanaM.require (dlen == PflOff.size) Err.invalidAccountData
       requireKeyEq (AccountView.keyPtr authority) (data + PflOff.owner) PErr.ownerMismatch
       SolanaM.require ((← loadU64 data PflOff.capital) == 0 && (← loadU8 data PflOff.legCount) == 0 &&
-                       (← loadU64 data PflOff.totalMm) == 0 && (← loadU64 data PflOff.totalIm) == 0 &&
-                       (← loadU64 data PflOff.totalReservedMm) == 0) PErr.nonzeroState
+                       (← loadU64 data PflOff.totalMm) == 0 && (← loadU64 data PflOff.totalIm) == 0) PErr.nonzeroState
       pure (PflOff.size >>> 3)
     else if magic == MAGIC_INSURANCE then do
       SolanaM.require (dlen == InsOff.size) Err.invalidAccountData
@@ -1687,7 +1696,267 @@ def handleClaimReward (input : Ptr) : SolanaM Unit := do
   let mid ← loadU64 mData MktOff.marketId
   log64 EvtTag.claimReward mid claimAmt (avail - claimAmt) 0
 
-/-! ### Top-Level Solana Entrypoint (`lean-svm` lowers opcode dispatch to O(log2 22) binary search!) -/
+/-- Op 22 (`SetPortfolioMatcher`): LP owner binds or revokes an optional external PropAMM
+    `matcherCtx` account on their `Portfolio` while keeping 100% EOA custody over withdrawals!
+    Accounts: `0. pfl (W)`, `1. owner (S)`, optional `2. matcherCtx` (omitting unbinds to 0). -/
+def handleSetPortfolioMatcher (input : Ptr) : SolanaM Unit := do
+  let (n, pfl, _, progId) ← parseIxOnly input
+  SolanaM.require (n >= 2) Err.notEnoughAccountKeys
+  let owner ← AccountView.nextCursor pfl
+  requireSigner owner; requireWritable pfl
+  checkOwnedMagic pfl progId PflOff.size MAGIC_PORTFOLIO
+  let fData := AccountView.dataPtr pfl
+  requireKeyEq (AccountView.keyPtr owner) (fData + PflOff.owner) PErr.ownerMismatch
+  if n >= 3 then
+    let mc ← AccountView.nextCursor owner
+    pubkeyCopy (fData + PflOff.matcherCtx) (AccountView.keyPtr mc)
+  else
+    storeU64 fData (PflOff.matcherCtx + 0)  0
+    storeU64 fData (PflOff.matcherCtx + 8)  0
+    storeU64 fData (PflOff.matcherCtx + 16) 0
+    storeU64 fData (PflOff.matcherCtx + 24) 0
+
+/-- Pure, verifiable adversarial PropAMM header check (Refinement #25a).
+    Validates `MatcherReturn` header at `mcData[0..16]` after a 0-signer CPI-Out call:
+    - `magic == MAGIC_MRET` (`"MRET"`), `status == 0`
+    - `seq == reqSeq` (blocks `noop.so` and stale quote replay, since `reqSeq = preSeq + 1 != preSeq`!). -/
+def validateMatcherHeader (mcData reqSeq : UInt64) : SolanaM Unit := do
+  let retMagic  ← loadU32 mcData 0
+  let retStatus ← loadU32 mcData 4
+  let retSeq    ← loadU64 mcData 8
+  SolanaM.require (retMagic == MAGIC_MRET && retStatus == 0 && retSeq == reqSeq) PErr.invalidMatcher
+
+/-- Pure, verifiable per-leg adversarial PropAMM quote check (Refinement #25b).
+    Validates `(execPrice, fillQty)` at `legRetPtr[0..16]`:
+    - `0 < execPrice <= MAX_PRICE` and `0 < fillQty <= maxQty` (blocks over-fill & zero-fill!)
+    - Enforces taker's `limitPrice` inside core `percolator` (blocks abusive quoting!). -/
+def validateMatcherLeg (legRetPtr maxQty limitPrice : UInt64) (takerIsLong : UInt8) :
+    SolanaM (UInt64 × UInt64) := do
+  let execPrice ← loadU64 legRetPtr 0
+  let fillQty   ← loadU64 legRetPtr 8
+  SolanaM.require (execPrice > 0 && execPrice <= MAX_PRICE && fillQty > 0 && fillQty <= maxQty) PErr.invalidMatcher
+  if limitPrice != 0 then
+    if takerIsLong != 0 then
+      SolanaM.require (execPrice <= limitPrice) PErr.execPriceClamp
+    else
+      SolanaM.require (execPrice >= limitPrice) PErr.execPriceClamp
+  return (execPrice, fillQty)
+
+/-- Outlined 0-signer CPI-Out into ANY untrusted external PropAMM (`matcherProg`).
+    `packedMeta` packs `(reqLen << 8) | nInfos` (`nInfos ∈ {1, 2}`).
+    Passes ONLY `[matcherCtx (W=1, S=0)]` (plus optional `[extraAcc (W=0, S=0)]` if `nInfos == 2`).
+    ZERO signer privileges (`seedsLen = 0`), ZERO core accounts exposed → re-entrancy & signer theft
+    are structurally impossible! -/
+@[noinline] def cpiCallMatcher (matcherProg matcherCtx extraAcc reqPtr : Ptr) (packedMeta : UInt64) : SolanaM Unit := do
+  let nInfos := packedMeta &&& 3
+  let reqLen := packedMeta >>> 8
+  let buf   ← stackAlloc 184
+  let metas := buf + 40
+  let infos := buf + 72
+  writeMeta metas matcherCtx 1 0
+  writeAccountInfo infos matcherCtx
+  if nInfos == 2 then
+    writeMeta (metas + 16) extraAcc 0 0
+    writeAccountInfo (infos + 56) extraAcc
+  writeInstruction buf (AccountView.keyPtr matcherProg) metas nInfos reqPtr reqLen
+  let rc ← sysInvokeSignedC buf infos nInfos 0 0
+  SolanaM.require (rc == 0) rc
+
+/-- Verify `mid` does not duplicate any previously validated market `0..j-1` in `mktArr`. -/
+def checkDistinctMarketIdLoop (mktArr : Ptr) (mid j count : UInt64) : SolanaM Unit := do
+  if h : j < count then
+    let prevMkt ← loadU64 mktArr (j * 8)
+    let prevMid ← loadU64 (AccountView.dataPtr prevMkt) MktOff.marketId
+    SolanaM.require (prevMid != mid) PErr.aliasedAccounts
+    checkDistinctMarketIdLoop mktArr mid (j + 1) count
+  else
+    return ()
+termination_by (count.toNat - j.toNat)
+decreasing_by
+  have hlt : j.toNat < count.toNat := UInt64.lt_iff_toNat_lt.mp h
+  have h1 : (1 : UInt64).toNat = 1 := rfl
+  have hadd : (j + 1).toNat = j.toNat + 1 := by
+    rw [UInt64.toNat_add, h1, Nat.mod_eq_of_lt (by have := count.toNat_lt; omega)]
+  omega
+
+/-- Validate `k` distinct market accounts & serialize all `k` offers into `reqBuf` in one pass
+    so `matcherProg` sees ALL `k` offers simultaneously in ONE CPI (zero tx introspection!).
+    `ctxBuf` holds `[dexKeyPtr, progId, ixPtr, mktArr, reqBuf, k]`. Returns cursor after `mkt_{k-1}`. -/
+def prepMatcherOffersLoop (curMkt ctxBuf : Ptr) (i : UInt64) : SolanaM Ptr := do
+  if h : i < MAX_LEGS then
+    let k ← loadU64 ctxBuf 40
+    if i < k then
+      let dexKeyPtr ← loadU64 ctxBuf 0
+      let progId    ← loadU64 ctxBuf 8
+      let ixPtr     ← loadU64 ctxBuf 16
+      let mktArr    ← loadU64 ctxBuf 24
+      let reqBuf    ← loadU64 ctxBuf 32
+      SolanaM.require ((← rawLoadU8 curMkt) == ABI.nonDupMarker) PErr.aliasedAccounts
+      requireWritable curMkt
+      checkOwnedMagic curMkt progId MktOff.size MAGIC_MARKET
+      let mData := AccountView.dataPtr curMkt
+      requireKeyEq dexKeyPtr (mData + MktOff.dex) PErr.dexMismatch
+      let mid ← loadU64 mData MktOff.marketId
+      checkDistinctMarketIdLoop mktArr mid 0 i
+      storeU64 mktArr (i * 8) curMkt
+
+      let ixOff := 2 + i * 18
+      let mode        ← loadU8  ixPtr ixOff
+      let takerIsLong ← loadU8  ixPtr (ixOff + 1)
+      let maxQty      ← loadU64 ixPtr (ixOff + 2)
+      let limitPrice  ← loadU64 ixPtr (ixOff + 10)
+      SolanaM.require ((mode == 0 || mode == 1) && maxQty > 0) PErr.invalidParams
+
+      let rOff := reqBuf + 32 + i * 48
+      storeU8  rOff 0  mode
+      storeU8  rOff 1  takerIsLong
+      storeU64 rOff 8  mid
+      storeU64 rOff 16 maxQty
+      storeU64 rOff 24 limitPrice
+      storeU64 rOff 32 (← loadU64 mData MktOff.markPrice)
+      storeU64 rOff 40 (← loadU64 mData MktOff.maxMoveBps)
+
+      let nxt ← AccountView.nextCursor curMkt
+      prepMatcherOffersLoop nxt ctxBuf (i + 1)
+    else
+      return curMkt
+  else
+    return curMkt
+termination_by (MAX_LEGS.toNat - i.toNat)
+decreasing_by
+  have hlt : i.toNat < MAX_LEGS.toNat := UInt64.lt_iff_toNat_lt.mp h
+  have h8 : MAX_LEGS.toNat = 8 := rfl
+  have h1 : (1 : UInt64).toNat = 1 := rfl
+  have hadd : (i + 1).toNat = i.toNat + 1 := by
+    rw [UInt64.toNat_add, h1, Nat.mod_eq_of_lt (by omega)]
+  omega
+
+/-- Validate & settle all `k` PropAMM quotes atomically via shared `tradeCore`. -/
+def settleMatcherOffersLoop (dData takerData lpData ctxBuf : Ptr) (i : UInt64) : SolanaM Unit := do
+  if _h : i < MAX_LEGS then
+    let k ← loadU64 ctxBuf 24
+    if i < k then
+      let ixPtr   ← loadU64 ctxBuf 0
+      let mktArr  ← loadU64 ctxBuf 8
+      let mcData  ← loadU64 ctxBuf 16
+      let argsBuf ← loadU64 ctxBuf 32
+      let mkt     ← loadU64 mktArr (i * 8)
+      let ixOff := 2 + i * 18
+      let mode        ← loadU8  ixPtr ixOff
+      let takerIsLong ← loadU8  ixPtr (ixOff + 1)
+      let maxQty      ← loadU64 ixPtr (ixOff + 2)
+      let limitPrice  ← loadU64 ixPtr (ixOff + 10)
+      let (execPrice, fillQty) ← validateMatcherLeg (mcData + 16 + i * 16) maxQty limitPrice takerIsLong
+      let fLData := if takerIsLong != 0 then takerData else lpData
+      let fSData := if takerIsLong != 0 then lpData    else takerData
+      storeU64 argsBuf 0  (AccountView.keyPtr mkt)
+      storeU64 argsBuf 8  mode.toUInt64
+      storeU64 argsBuf 16 fillQty
+      storeU64 argsBuf 24 execPrice
+      tradeCore dData (AccountView.dataPtr mkt) fLData fSData argsBuf
+      settleMatcherOffersLoop dData takerData lpData ctxBuf (i + 1)
+    else
+      return ()
+  else
+    return ()
+termination_by (MAX_LEGS.toNat - i.toNat)
+decreasing_by
+  have hlt : i.toNat < MAX_LEGS.toNat := UInt64.lt_iff_toNat_lt.mp _h
+  have h8 : MAX_LEGS.toNat = 8 := rfl
+  have h1 : (1 : UInt64).toNat = 1 := rfl
+  have hadd : (i + 1).toNat = i.toNat + 1 := by
+    rw [UInt64.toNat_add, h1, Nat.mod_eq_of_lt (by omega)]
+  omega
+
+/-- Op 23 (`TradeWithMatcher`): Unified Single- OR Multi-Market (`k ∈ [1..8]`) Legacy-Percolator
+    0-Signer CPI-Out Trade against ANY untrusted/closed-source external PropAMM!
+    ALL `k` market offers are passed in ONE single CPI call so the PropAMM sees the full basket
+    without tx introspection (e.g. tight correlated pair spreads on Long BTC + Short ETH!).
+    Accounts (`n >= 6 + k`, optional readonly non-signer `extraAcc` at index `6 + k`):
+      0. `dex` (W), 1. `takerPfl` (W), 2. `takerOwner` (S — NEVER passed to matcher!),
+      3. `lpPfl` (W, MUST have `lpPfl.matcherCtx == matcherCtx.key`),
+      4. `matcherProg` (executable, `!= progId`),
+      5. `matcherCtx` (W, `owner == matcherProg`, `dataLen >= 16 + 16 * k`),
+      6..6+k-1. `mkt_0 .. mkt_{k-1}` (all W, distinct markets belonging to `dex`),
+      6+k. *(optional)* `extraAcc` (R, non-signer).
+    Ix data (`2 + 18 * k` B): `[23:u8, k:u8, (mode:u8, takerIsLong:u8, maxQty:u64, limitPrice:u64) × k]`. -/
+def handleTradeWithMatcher (input : Ptr) : SolanaM Unit := do
+  let (n, dex, ix, progId) ← parseIxOnly input
+  SolanaM.require (n >= 7 && ix.len >= 20) Err.invalidInstructionData
+  let k8 ← loadU8 ix.ptr 1
+  let k := k8.toUInt64
+  SolanaM.require (k >= 1 && k <= MAX_LEGS) PErr.invalidParams
+  SolanaM.require (n >= 6 + k) Err.notEnoughAccountKeys
+  SolanaM.require (ix.len >= 2 + k * 18) Err.invalidInstructionData
+
+  let takerPfl    ← AccountView.nextCursor dex
+  let takerOwner  ← AccountView.nextCursor takerPfl
+  let lpPfl       ← AccountView.nextCursor takerOwner
+  let matcherProg ← AccountView.nextCursor lpPfl
+  let matcherCtx  ← AccountView.nextCursor matcherProg
+  let mkt0        ← AccountView.nextCursor matcherCtx
+
+  requireSigner takerOwner
+  requireWritable dex; requireWritable takerPfl
+  requireWritable lpPfl; requireWritable matcherCtx
+  requireKeyNe (AccountView.keyPtr takerPfl) (AccountView.keyPtr lpPfl) PErr.aliasedAccounts
+  checkOwnedMagic dex      progId DexOff.size MAGIC_DEX
+  checkOwnedMagic takerPfl progId PflOff.size MAGIC_PORTFOLIO
+  checkOwnedMagic lpPfl    progId PflOff.size MAGIC_PORTFOLIO
+
+  let dData     := AccountView.dataPtr dex
+  let takerData := AccountView.dataPtr takerPfl
+  let lpData    := AccountView.dataPtr lpPfl
+  requireKeyEq (AccountView.keyPtr dex)        (takerData + PflOff.dex)   PErr.dexMismatch
+  requireKeyEq (AccountView.keyPtr dex)        (lpData    + PflOff.dex)   PErr.dexMismatch
+  requireKeyEq (AccountView.keyPtr takerOwner) (takerData + PflOff.owner) PErr.ownerMismatch
+
+  -- Pin LP-authorized `matcherCtx` owned by executable external `matcherProg != progId`!
+  SolanaM.require (!(← pubkeyIsZero (lpData + PflOff.matcherCtx))) PErr.invalidMatcher
+  requireKeyEq (AccountView.keyPtr matcherCtx) (lpData + PflOff.matcherCtx) PErr.invalidMatcher
+  SolanaM.require (← AccountView.isExecutable matcherProg) PErr.invalidMatcher
+  requireKeyNe (AccountView.keyPtr matcherProg) progId PErr.invalidMatcher
+  requireKeyEq (AccountView.ownerPtr matcherCtx) (AccountView.keyPtr matcherProg) PErr.invalidMatcher
+  SolanaM.require ((← AccountView.dataLen matcherCtx) >= 16 + k * 16) PErr.invalidMatcher
+
+  let mcData  := AccountView.dataPtr matcherCtx
+  let preSeq  ← loadU64 mcData 8
+  let reqSeq  := preSeq + 1
+  let curSlot ← getClockSlot
+
+  let mktArr  ← stackAlloc 64
+  let reqBuf  ← stackAlloc 416
+  let ctxBuf  ← stackAlloc 48
+  storeU8  reqBuf 0  5
+  storeU8  reqBuf 1  k8
+  storeU64 reqBuf 8  (← loadU64 lpData PflOff.capital)
+  storeU64 reqBuf 16 curSlot
+  storeU64 reqBuf 24 reqSeq
+  storeU64 ctxBuf 0  (AccountView.keyPtr dex)
+  storeU64 ctxBuf 8  progId
+  storeU64 ctxBuf 16 ix.ptr
+  storeU64 ctxBuf 24 mktArr
+  storeU64 ctxBuf 32 reqBuf
+  storeU64 ctxBuf 40 k
+
+  let afterMkts ← prepMatcherOffersLoop mkt0 ctxBuf 0
+  let reqLen := 32 + k * 48
+  if n >= 7 + k then
+    cpiCallMatcher matcherProg matcherCtx afterMkts reqBuf ((reqLen <<< 8) ||| 2)
+  else
+    cpiCallMatcher matcherProg matcherCtx 0 reqBuf ((reqLen <<< 8) ||| 1)
+
+  validateMatcherHeader mcData reqSeq
+
+  let argsBuf ← stackAlloc 32
+  storeU64 ctxBuf 0  ix.ptr
+  storeU64 ctxBuf 8  mktArr
+  storeU64 ctxBuf 16 mcData
+  storeU64 ctxBuf 24 k
+  storeU64 ctxBuf 32 argsBuf
+  settleMatcherOffersLoop dData takerData lpData ctxBuf 0
+
+/-! ### Top-Level Solana Entrypoint (`lean-svm` lowers opcode dispatch to O(log2 24) binary search!) -/
 
 def dispatch (input : Ptr) : SolanaM Unit := do
   let (_, _, ix, _) ← parseIxOnly input
@@ -1715,6 +1984,8 @@ def dispatch (input : Ptr) : SolanaM Unit := do
   else if op == IxOp.closeAccount       then handleCloseAccount input
   else if op == IxOp.sweepSurplus       then handleSweepSurplus input
   else if op == IxOp.claimReward        then handleClaimReward input
+  else if op == IxOp.setPortfolioMatcher then handleSetPortfolioMatcher input
+  else if op == IxOp.tradeWithMatcher   then handleTradeWithMatcher input
   else SolanaM.fail PErr.invalidInstruction
 
 def entrypoint (input : Ptr) (s : SvmState) : UInt64 × SvmState :=

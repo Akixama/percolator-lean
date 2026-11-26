@@ -1508,8 +1508,8 @@ pub fn test_security_revival_and_dirty_init_regressions(elf: &[u8]) {
     assert_eq!(read_u64(&e.svm, &dirty_pfl, 88), 0, "InitPortfolio must zero dirty capital");
     assert_eq!(read_u64(&e.svm, &dirty_pfl, 96), 0, "InitPortfolio must zero dirty totalMm");
     assert_eq!(read_u64(&e.svm, &dirty_pfl, 104), 0, "InitPortfolio must zero dirty totalIm");
-    assert_eq!(read_u64(&e.svm, &dirty_pfl, 112), 0, "InitPortfolio must zero dirty totalReservedMm");
-    assert!(init_pfl_acc.data[120..PFL_SIZE].iter().all(|&b| b == 0), "InitPortfolio must zero all 8 leg slots");
+    assert!(init_pfl_acc.data[112..144].iter().all(|&b| b == 0), "InitPortfolio must zero dirty matcherCtx");
+    assert!(init_pfl_acc.data[144..PFL_SIZE].iter().all(|&b| b == 0), "InitPortfolio must zero all 8 leg slots");
 
     // (f) WithdrawInsurance explicitly rejects any receipt with `shares > totalInsShares` (Custom(119))!
     let mut bogus_acc = e.svm.get_account(&dirty_rec).unwrap();

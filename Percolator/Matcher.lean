@@ -47,6 +47,29 @@ namespace CfgOff
   def market        : UInt64 := 128 -- Pubkey (32) pinned Market!
 end CfgOff
 
+/-! Zero-copy Multi-Market CPI-Out PropAMM Context (`208` bytes):
+    Bytes `0..144` hold the standard `percolator` `MatcherReturn` header (`16 B`: `[magic="MRET", status, seq]`)
+    followed by up to `MAX_LEGS = 8` × `16 B` `(execPrice_i, fillQty_i)` quote slots (`16..144`).
+    Bytes `144..208` hold this PropAMM's quoting parameters (`owner`, `halfSpreadBps`, `impactBps`, `maxFillQty`, `paused`). -/
+namespace PropOff
+  def size          : UInt64 := 208
+  def magic         : UInt64 := 0   -- u32 ("MRET")
+  def status        : UInt64 := 4   -- u32 (0 = ok)
+  def seq           : UInt64 := 8   -- u64
+  def quotesBase    : UInt64 := 16  -- 8 × 16B `(execPrice:u64, fillQty:u64)`
+  def owner         : UInt64 := 144 -- Pubkey (32)
+  def halfSpreadBps : UInt64 := 176 -- u64
+  def impactBps     : UInt64 := 184 -- u64
+  def maxFillQty    : UInt64 := 192 -- u64
+  def paused        : UInt64 := 200 -- u8
+end PropOff
+
+theorem matcher_layout_sizes_valid :
+    CfgOff.market + 32 ≤ CfgOff.size ∧ CfgOff.size % 8 == 0 ∧
+    PropOff.quotesBase + MAX_LEGS * 16 ≤ PropOff.owner ∧
+    PropOff.paused + 1 ≤ PropOff.size ∧ PropOff.size % 8 == 0 := by
+  decide
+
 /-! ### Pure Quote Specification & Formal Proofs (0 `sorry`, 0 custom axioms) -/
 
 def clampSpreadBpsNat (halfSpread impact qty maxMove : Nat) : Nat :=
@@ -338,6 +361,114 @@ def handleWithdrawLp (input : Ptr) : SolanaM Unit := do
   let rc ← sysInvokeSignedC buf infos 7 signersArr 1
   SolanaM.require (rc == 0) rc
 
+/-- Op 4 (`InitPropAmm`): Initialize a 96-byte CPI-Out PropAMM context account (`owner == progId`, `magic == 0`).
+    Accounts: `0. ctx (W)`, `1. owner (S)`.
+    Ix data (28B): `[4, paused:u8, pad:u16, halfSpreadBps:u64, impactBps:u64, maxFillQty:u64]`. -/
+def handleInitPropAmm (input : Ptr) : SolanaM Unit := do
+  let (ctx, owner, ix, progId) ← parse2 input
+  SolanaM.require (ix.len >= 28) Err.invalidInstructionData
+  SolanaM.require (← AccountView.isSigner owner) Err.missingRequiredSignature
+  SolanaM.require (← AccountView.isWritable ctx) Err.invalidAccountData
+  SolanaM.require (← pubkeyEq (AccountView.ownerPtr ctx) progId) Err.illegalOwner
+  SolanaM.require ((← AccountView.dataLen ctx) == PropOff.size) Err.invalidAccountData
+  SolanaM.require ((← loadU32 (AccountView.dataPtr ctx) 0) == 0) Err.accountAlreadyInitialized
+  let paused        ← loadU8  ix.ptr 1
+  let halfSpreadBps ← loadU64 ix.ptr 4
+  let impactBps     ← loadU64 ix.ptr 12
+  let maxFillQty    ← loadU64 ix.ptr 20
+  SolanaM.require (halfSpreadBps <= BPS_DEN && maxFillQty > 0) PErr.invalidParams
+  let d := AccountView.dataPtr ctx
+  zeroMatcherWords d 0 (PropOff.size >>> 3)
+  storeU32 d PropOff.magic MAGIC_MRET
+  storeU32 d PropOff.status 0
+  pubkeyCopy (d + PropOff.owner) (AccountView.keyPtr owner)
+  storeU64 d PropOff.halfSpreadBps halfSpreadBps
+  storeU64 d PropOff.impactBps     impactBps
+  storeU64 d PropOff.maxFillQty    maxFillQty
+  storeU8  d PropOff.paused        paused
+
+/-- Scan all `k` offers in the CPI-Out request to return a 2-bit side mask:
+    bit 0 = hasShort, bit 1 = hasLong. When `(mask == 3)` (both long & short in ONE batch!),
+    the PropAMM sees a correlated hedged basket without tx introspection and grants a 50% spread discount! -/
+def scanBatchSideMask (ixPtr : Ptr) (i k mask : UInt64) : SolanaM UInt64 := do
+  if _h : i < k then
+    let side ← loadU8 ixPtr (32 + i * 48 + 1)
+    let bit : UInt64 := if side != 0 then 2 else 1
+    scanBatchSideMask ixPtr (i + 1) k (mask ||| bit)
+  else
+    return mask
+termination_by (k.toNat - i.toNat)
+decreasing_by
+  have hlt : i.toNat < k.toNat := UInt64.lt_iff_toNat_lt.mp _h
+  have h1 : (1 : UInt64).toNat = 1 := rfl
+  have hadd : (i + 1).toNat = i.toNat + 1 := by
+    rw [UInt64.toNat_add, h1, Nat.mod_eq_of_lt (by have := k.toNat_lt; omega)]
+  omega
+
+/-- Quote all `k` markets in ONE CPI call, writing `(execPrice_i, fillQty_i)` into `d[16 + i*16]`. -/
+def quoteBatchOffersLoop (d ixPtr : Ptr) (effHalfSp i k : UInt64) : SolanaM Unit := do
+  if h : i < k then
+    let oPtr := ixPtr + 32 + i * 48
+    let mode        ← loadU8  oPtr 0
+    let takerIsLong ← loadU8  oPtr 1
+    let maxQty      ← loadU64 oPtr 16
+    let markP       ← loadU64 oPtr 32
+    let maxMove     ← loadU64 oPtr 40
+    SolanaM.require ((mode == 0 || mode == 1) && maxQty > 0 && markP > 0) PErr.invalidParams
+
+    let maxFill ← loadU64 d PropOff.maxFillQty
+    let fillQty := if maxQty < maxFill then maxQty else maxFill
+    let impBps  ← loadU64 d PropOff.impactBps
+    let imp     ← mulDiv64 fillQty impBps POS_SCALE
+    let rawBps  ← checkedAdd64 effHalfSp imp
+    let effBps  := if rawBps > maxMove then maxMove else rawBps
+    let delta   ← mulDiv64 markP effBps BPS_DEN
+    let execPrice ← if takerIsLong != 0 then
+        checkedAdd64 markP delta
+      else
+        pure (if markP > delta then markP - delta else 1)
+
+    let qOff := PropOff.quotesBase + i * 16
+    storeU64 d qOff       execPrice
+    storeU64 d (qOff + 8) fillQty
+    quoteBatchOffersLoop d ixPtr effHalfSp (i + 1) k
+  else
+    return ()
+termination_by (k.toNat - i.toNat)
+decreasing_by
+  have hlt : i.toNat < k.toNat := UInt64.lt_iff_toNat_lt.mp h
+  have h1 : (1 : UInt64).toNat = 1 := rfl
+  have hadd : (i + 1).toNat = i.toNat + 1 := by
+    rw [UInt64.toNat_add, h1, Nat.mod_eq_of_lt (by have := k.toNat_lt; omega)]
+  omega
+
+/-- Op 5 (`PropAmmQuote`): Multi-Market (`k ∈ [1..8]`) CPI-Out PropAMM quoting entrypoint invoked
+    by `percolator::TradeWithMatcher` with ZERO signers (`[ctx (W)]`).
+    Sees ALL `k` offers in ONE CPI without tx introspection: if the batch includes offsetting
+    long + short legs (`mask == 3`), halves `halfSpreadBps` across the entire basket! -/
+def handlePropAmmQuote (input : Ptr) : SolanaM Unit := do
+  let (n, ctx, ix, progId) ← parseIxOnly input
+  SolanaM.require (n >= 1 && ix.len >= 80) Err.invalidInstructionData
+  SolanaM.require (← AccountView.isWritable ctx) Err.invalidAccountData
+  SolanaM.require (← pubkeyEq (AccountView.ownerPtr ctx) progId) Err.illegalOwner
+  SolanaM.require ((← AccountView.dataLen ctx) == PropOff.size) Err.invalidAccountData
+  let d := AccountView.dataPtr ctx
+  SolanaM.require ((← loadU32 d PropOff.magic) == MAGIC_MRET) PErr.invalidMagic
+  SolanaM.require ((← loadU8 d PropOff.paused) == 0) MErr.paused
+
+  let k := (← loadU8 ix.ptr 1).toUInt64
+  SolanaM.require (k >= 1 && k <= MAX_LEGS && ix.len >= 32 + k * 48) Err.invalidInstructionData
+  let reqSeq ← loadU64 ix.ptr 24
+
+  let halfSp ← loadU64 d PropOff.halfSpreadBps
+  let mask ← scanBatchSideMask ix.ptr 0 k 0
+  let effHalfSp := if k >= 2 && mask == 3 then halfSp >>> 1 else halfSp
+
+  quoteBatchOffersLoop d ix.ptr effHalfSp 0 k
+  storeU32 d PropOff.magic  MAGIC_MRET
+  storeU32 d PropOff.status 0
+  storeU64 d PropOff.seq    reqSeq
+
 def dispatch (input : Ptr) : SolanaM Unit := do
   let (_, _, ix, _) ← parseIxOnly input
   SolanaM.require (ix.len >= 1) Err.invalidInstructionData
@@ -346,6 +477,8 @@ def dispatch (input : Ptr) : SolanaM Unit := do
   else if op == 1 then handleUpdateMatcher input
   else if op == 2 then handleFill input
   else if op == 3 then handleWithdrawLp input
+  else if op == 4 then handleInitPropAmm input
+  else if op == 5 then handlePropAmmQuote input
   else SolanaM.fail PErr.invalidInstruction
 
 def entrypoint (input : Ptr) (s : SvmState) : UInt64 × SvmState :=

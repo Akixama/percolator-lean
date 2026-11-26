@@ -23,14 +23,15 @@ const SPL_TOKEN_RENT_MIN: u64 = 2_039_280;
 // Exact v2 layout constants matching Percolator/Layout.lean & Percolator/RewardModule.lean
 const DEX_SIZE: usize = 208;
 const MKT_SIZE: usize = 400;
-const PFL_SIZE: usize = 952;
+const PFL_SIZE: usize = 912;
 const INS_SIZE: usize = 88;
 const REW_SIZE: usize = 400;
 const EPOCH_SIZE: usize = 104;
 const BID_SIZE: usize = 120;
+const PROP_AMM_SIZE: usize = 208;
 const MAX_LEGS: usize = 8;
-const LEG_HEADER: usize = 120;
-const LEG_STRIDE: usize = 104;
+const LEG_HEADER: usize = 144;
+const LEG_STRIDE: usize = 96;
 const POS_SCALE: u64 = 1_000_000;
 const ADL_ONE: u64 = 1_000_000_000;
 
@@ -328,30 +329,23 @@ fn assert_dex_invariants(
         let cap = read_u64(svm, p, 88);
         let tot_mm = read_u64(svm, p, 96);
         let tot_im = read_u64(svm, p, 104);
-        let tot_res = read_u64(svm, p, 112);
         let leg_cnt = read_u8(svm, p, 4);
         assert!(leg_cnt as usize <= MAX_LEGS, "[{}] Portfolio legCount exceeded MAX_LEGS: {}", label, leg_cnt);
         let mut calc_mm: u64 = 0;
         let mut calc_im: u64 = 0;
-        let mut calc_res: u64 = 0;
         let mut calc_cnt: u8 = 0;
         for idx in 0..MAX_LEGS {
             let base = LEG_HEADER + idx * LEG_STRIDE;
             if read_u8(svm, p, base) != 0 {
                 let l_mm = read_u64(svm, p, base + 72);
                 let l_im = read_u64(svm, p, base + 80);
-                let l_res = read_u64(svm, p, base + 96);
-                assert_eq!(l_res, 0, "[{}] Bug 1B: leg reservedMm ({}) must be 0!", label, l_res);
                 calc_cnt += 1;
                 calc_mm += l_mm;
                 calc_im += l_im;
-                calc_res += l_res;
             }
         }
         assert_eq!(calc_mm, tot_mm, "[{}] Portfolio totalMm mismatch: calc {} != stored {}", label, calc_mm, tot_mm);
         assert_eq!(calc_im, tot_im, "[{}] Portfolio totalIm mismatch: calc {} != stored {}", label, calc_im, tot_im);
-        assert_eq!(calc_res, tot_res, "[{}] Portfolio totalReservedMm mismatch: calc {} != stored {}", label, calc_res, tot_res);
-        assert_eq!(tot_res, 0, "[{}] Bug 1B: totalReservedMm ({}) must be 0!", label, tot_res);
         assert_eq!(calc_cnt, leg_cnt, "[{}] Portfolio legCount mismatch: calc {} != stored {}", label, calc_cnt, leg_cnt);
         sum_c += cap;
     }
@@ -509,6 +503,86 @@ fn ix_claim_reward(
             AccountMeta::new(vault_pda, false),
             AccountMeta::new(dest_tok, false),
             AccountMeta::new_readonly(tok_prog, false),
+        ],
+        data,
+    }
+}
+
+fn ix_set_portfolio_matcher(
+    prog: Address, pfl: Address, owner: Address, matcher_ctx: Option<Address>,
+) -> Instruction {
+    let mut accounts = vec![
+        AccountMeta::new(pfl, false),
+        AccountMeta::new_readonly(owner, true),
+    ];
+    if let Some(mc) = matcher_ctx {
+        accounts.push(AccountMeta::new_readonly(mc, false));
+    }
+    Instruction { program_id: prog, accounts, data: vec![22] }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ix_trade_with_matcher_batch(
+    prog: Address, dex: Address,
+    taker_pfl: Address, taker_owner: Address, lp_pfl: Address,
+    matcher_prog: Address, matcher_ctx: Address,
+    offers: &[(Address, u8, bool, u64, u64)], // (mkt, mode, taker_is_long, max_qty, limit_price)
+    extra_acc: Option<Address>,
+) -> Instruction {
+    let k = offers.len();
+    let mut data = vec![0u8; 2 + k * 18];
+    data[0] = 23;
+    data[1] = k as u8;
+    let mut accounts = vec![
+        AccountMeta::new(dex, false),
+        AccountMeta::new(taker_pfl, false),
+        AccountMeta::new_readonly(taker_owner, true),
+        AccountMeta::new(lp_pfl, false),
+        AccountMeta::new_readonly(matcher_prog, false),
+        AccountMeta::new(matcher_ctx, false),
+    ];
+    for (i, &(mkt, mode, taker_is_long, max_qty, limit_price)) in offers.iter().enumerate() {
+        let off = 2 + i * 18;
+        data[off] = mode;
+        data[off + 1] = if taker_is_long { 1 } else { 0 };
+        data[off + 2..off + 10].copy_from_slice(&max_qty.to_le_bytes());
+        data[off + 10..off + 18].copy_from_slice(&limit_price.to_le_bytes());
+        accounts.push(AccountMeta::new(mkt, false));
+    }
+    if let Some(ex) = extra_acc {
+        accounts.push(AccountMeta::new_readonly(ex, false));
+    }
+    Instruction { program_id: prog, accounts, data }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ix_trade_with_matcher(
+    prog: Address, dex: Address, mkt: Address,
+    taker_pfl: Address, taker_owner: Address, lp_pfl: Address,
+    matcher_prog: Address, matcher_ctx: Address, extra_acc: Option<Address>,
+    mode: u8, taker_is_long: bool, max_qty: u64, limit_price: u64,
+) -> Instruction {
+    ix_trade_with_matcher_batch(
+        prog, dex, taker_pfl, taker_owner, lp_pfl, matcher_prog, matcher_ctx,
+        &[(mkt, mode, taker_is_long, max_qty, limit_price)], extra_acc,
+    )
+}
+
+fn ix_init_prop_amm(
+    matcher_prog: Address, ctx: Address, owner: Address,
+    paused: u8, half_spread_bps: u64, impact_bps: u64, max_fill_qty: u64,
+) -> Instruction {
+    let mut data = vec![0u8; 28];
+    data[0] = 4;
+    data[1] = paused;
+    data[4..12].copy_from_slice(&half_spread_bps.to_le_bytes());
+    data[12..20].copy_from_slice(&impact_bps.to_le_bytes());
+    data[20..28].copy_from_slice(&max_fill_qty.to_le_bytes());
+    Instruction {
+        program_id: matcher_prog,
+        accounts: vec![
+            AccountMeta::new(ctx, false),
+            AccountMeta::new_readonly(owner, true),
         ],
         data,
     }
@@ -3433,7 +3507,271 @@ fn main() {
     assert_dex_invariants(&svm, &r_dex, &r_vault, &r_mkts, &[r_trader_pfl, r_mm_pfl], "suite13-final");
     println!("[PASS] Suite 13: Gavel xy=k X-Min Uniform-Price Batch Reward Modules (8-Leg User x 8 Unique Modules: 6x SPL + Token-2022 + wSOL, R1-R6 Verified, settle max={} CU, claim max={} CU)", max_settle_cu, max_claim_cu);
 
+    // =========================================================================
+    // SUITE 14: Legacy-Percolator CPI-Out Adversarial PropAMM (`TradeWithMatcher`)
+    //   ZERO taker signer delegation! LP retains 100% EOA custody over withdrawals!
+    //   Tests BOTH honest external PropAMM (`matcher.so` Op 4/5) AND all 11 adversarial
+    //   exploit vectors using `evil_matcher.so` & `noop.so`:
+    //     1) Unbound LP rejected (`Custom(131)`)
+    //     2) Mismatched `matcherCtx` rejected (`Custom(131)`)
+    //     3) Self-CPI (`matcherProg == percProg`) rejected (`Custom(131)`)
+    //     4) Over-fill (`fillQty = maxQty + 1`) rejected (`Custom(131)`)
+    //     5) Abusive price violating taker `limitPrice` rejected (`Custom(130)`)
+    //     6) Nonzero `status` rejected (`Custom(131)`)
+    //     7) `noop.so` / stale `seq` replay rejected (`Custom(131)`)
+    //     8) Corrupt return magic rejected (`Custom(131)`)
+    //     9) Zero fill (`fillQty = 0`) rejected (`Custom(131)`)
+    //    10) Exceeds core `maxMoveBps` clamp with `limitPrice = 0` rejected (`Custom(130)`)
+    //    11) Tampering with readonly `extraAcc` rejected by Agave VM write-protection!
+    //    12) LP revokes `SetPortfolioMatcher(None)` & withdraws 100% EOA collateral!
+    // =========================================================================
+    let evil_path = std::env::args()
+        .nth(5)
+        .unwrap_or_else(|| "build/evil_matcher.so".to_string());
+    let evil_elf = std::fs::read(&evil_path).unwrap_or_else(|e| panic!("Failed to read {}: {}", evil_path, e));
+    let evil_prog = Keypair::new().pubkey();
+    svm.add_program(evil_prog, &evil_elf).expect("evil_matcher ELF load failed");
+
+    let prop_lp_kp = Keypair::new();
+    let prop_taker_kp = Keypair::new();
+    svm.airdrop(&prop_lp_kp.pubkey(), 1_000_000_000).unwrap();
+    svm.airdrop(&prop_taker_kp.pubkey(), 1_000_000_000).unwrap();
+    let prop_lp_tok = create_tok_acc(&mut svm, &mint, &prop_lp_kp.pubkey(), 5_000 * POS_SCALE);
+    let prop_taker_tok = create_tok_acc(&mut svm, &mint, &prop_taker_kp.pubkey(), 5_000 * POS_SCALE);
+
+    let prop_lp_pfl = create_prog_acc(&mut svm, &prog_id, PFL_SIZE);
+    let prop_taker_pfl = create_prog_acc(&mut svm, &prog_id, PFL_SIZE);
+    send_ok(&mut svm, ix_init_portfolio(prog_id, r_dex, prop_lp_pfl, prop_lp_kp.pubkey()), &payer, &[&payer, &prop_lp_kp]);
+    send_ok(&mut svm, ix_init_portfolio(prog_id, r_dex, prop_taker_pfl, prop_taker_kp.pubkey()), &payer, &[&payer, &prop_taker_kp]);
+    send_ok(&mut svm, ix_deposit_collateral(prog_id, r_dex, prop_lp_pfl, prop_lp_kp.pubkey(), prop_lp_tok, mint, r_vault, TOKEN_PROGRAM_ID, 2_000 * POS_SCALE), &payer, &[&payer, &prop_lp_kp]);
+    send_ok(&mut svm, ix_deposit_collateral(prog_id, r_dex, prop_taker_pfl, prop_taker_kp.pubkey(), prop_taker_tok, mint, r_vault, TOKEN_PROGRAM_ID, 1_000 * POS_SCALE), &payer, &[&payer, &prop_taker_kp]);
+
+    // Refresh oracles on r_mkts[0..5] so ALL 5 markets are fresh at current slot
+    let prop_slot = get_slot(&svm) + 1;
+    set_slot(&mut svm, prop_slot);
+    for i in 0..5 {
+        send_ok(&mut svm, ix_update_oracle(prog_id, r_mkts[i], r_orc.pubkey(), 100 * POS_SCALE, 0, 0), &payer, &[&payer, &r_orc]);
+    }
+
+    // Initialize honest Multi-Market PropAMM context on `matcher_prog` (halfSpread=20bps, impact=10bps/unit, maxFill=5.0)
+    let prop_ctx = create_prog_acc(&mut svm, &matcher_prog, PROP_AMM_SIZE);
+    send_ok(&mut svm, ix_init_prop_amm(matcher_prog, prop_ctx, prop_lp_kp.pubkey(), 0, 20, 10, 5 * POS_SCALE), &payer, &[&payer, &prop_lp_kp]);
+
+    // 14.1 Unbound LP MUST reject TradeWithMatcher (Custom(131))!
+    send_err_custom(
+        &mut svm,
+        ix_trade_with_matcher(prog_id, r_dex, r_mkts[0], prop_taker_pfl, prop_taker_kp.pubkey(), prop_lp_pfl, matcher_prog, prop_ctx, None, 0, true, 4 * POS_SCALE, 101 * POS_SCALE),
+        &payer, &[&payer, &prop_taker_kp], 131, "Unbound lpPfl rejected",
+    );
+
+    // 14.2 Unauthorized non-owner cannot bind matcherCtx!
+    send_err_custom(
+        &mut svm,
+        ix_set_portfolio_matcher(prog_id, prop_lp_pfl, attacker.pubkey(), Some(prop_ctx)),
+        &payer, &[&payer, &attacker], 111, "Non-owner SetPortfolioMatcher rejected",
+    );
+
+    // LP binds honest PropAMM while retaining 100% EOA custody of `prop_lp_pfl`!
+    send_ok(&mut svm, ix_set_portfolio_matcher(prog_id, prop_lp_pfl, prop_lp_kp.pubkey(), Some(prop_ctx)), &payer, &[&payer, &prop_lp_kp]);
+
+    // Mismatched matcherCtx, self-CPI, & aliased duplicate markets in batch rejected!
+    let wrong_ctx = create_prog_acc(&mut svm, &matcher_prog, PROP_AMM_SIZE);
+    send_err_custom(
+        &mut svm,
+        ix_trade_with_matcher(prog_id, r_dex, r_mkts[0], prop_taker_pfl, prop_taker_kp.pubkey(), prop_lp_pfl, matcher_prog, wrong_ctx, None, 0, true, 4 * POS_SCALE, 101 * POS_SCALE),
+        &payer, &[&payer, &prop_taker_kp], 131, "Mismatched matcherCtx rejected",
+    );
+    send_err_custom(
+        &mut svm,
+        ix_trade_with_matcher(prog_id, r_dex, r_mkts[0], prop_taker_pfl, prop_taker_kp.pubkey(), prop_lp_pfl, prog_id, prop_ctx, None, 0, true, 4 * POS_SCALE, 101 * POS_SCALE),
+        &payer, &[&payer, &prop_taker_kp], 131, "Self-CPI matcherProg == percProg rejected",
+    );
+    send_err_custom(
+        &mut svm,
+        ix_trade_with_matcher_batch(
+            prog_id, r_dex, prop_taker_pfl, prop_taker_kp.pubkey(), prop_lp_pfl, matcher_prog, prop_ctx,
+            &[(r_mkts[0], 0, true, POS_SCALE, 101 * POS_SCALE), (r_mkts[0], 0, false, POS_SCALE, 99 * POS_SCALE)], None,
+        ),
+        &payer, &[&payer, &prop_taker_kp], 109, "Aliased duplicate market in batch rejected",
+    );
+
+    // 14.3 Single-market (k=1) CPI-Out Open Long (maxQty=8 > maxFill=5 -> partial-fill 5.0 at standalone ask = $100.70!)
+    //      Also passes an optional readonly extra account to verify forwarding!
+    let dummy_oracle_acc = create_prog_acc(&mut svm, &matcher_prog, 64);
+    let lp_cap_0 = read_u64(&svm, &prop_lp_pfl, 88);
+    let taker_cap_0 = read_u64(&svm, &prop_taker_pfl, 88);
+    let cu_pm_open = send_ok(
+        &mut svm,
+        ix_trade_with_matcher(prog_id, r_dex, r_mkts[0], prop_taker_pfl, prop_taker_kp.pubkey(), prop_lp_pfl, matcher_prog, prop_ctx, Some(dummy_oracle_acc), 0, true, 8 * POS_SCALE, 101 * POS_SCALE),
+        &payer, &[&payer, &prop_taker_kp],
+    );
+    assert_eq!(read_u64(&svm, &prop_ctx, 8), 1, "PropAMM seq advanced 0 -> 1");
+    assert_eq!(read_u64(&svm, &prop_ctx, 16), 100_700_000, "Standalone k=1 ask price exact ($100.70 = 20+50 bps)");
+    assert_eq!(read_u64(&svm, &prop_ctx, 24), 5 * POS_SCALE, "PropAMM partial fillQty capped at maxFillQty (5.0)");
+    assert_eq!(read_u64(&svm, &prop_lp_pfl, 88), lp_cap_0 + 3_500_000 - 5_000_000, "LP earned exact $3.50 spread - $5 fee");
+    assert_eq!(read_u64(&svm, &prop_taker_pfl, 88), taker_cap_0 - 3_500_000 - 5_000_000, "Taker paid exact $3.50 spread + $5 fee");
+    assert_dex_invariants(&svm, &r_dex, &r_vault, &r_mkts, &[r_trader_pfl, r_mm_pfl, prop_lp_pfl, prop_taker_pfl], "suite14-k1-open");
+
+    // 14.4 Single-market (k=1) CPI-Out Reduce Close (taker is fL closing existing Long at spread-adjusted $100.70!)
+    let cu_pm_close = send_ok(
+        &mut svm,
+        ix_trade_with_matcher(prog_id, r_dex, r_mkts[0], prop_taker_pfl, prop_taker_kp.pubkey(), prop_lp_pfl, matcher_prog, prop_ctx, None, 1, true, 5 * POS_SCALE, 101 * POS_SCALE),
+        &payer, &[&payer, &prop_taker_kp],
+    );
+    assert_eq!(read_u64(&svm, &prop_ctx, 8), 2, "PropAMM seq advanced 1 -> 2");
+    assert_eq!(read_u64(&svm, &prop_ctx, 16), 100_700_000, "Standalone k=1 reduce quote exact ($100.70)");
+    assert_eq!(read_u8(&svm, &prop_taker_pfl, 4), 0, "Taker closed completely via CPI-Out PropAMM!");
+    assert_eq!(read_u8(&svm, &prop_lp_pfl, 4), 0, "LP closed completely via CPI-Out PropAMM!");
+
+    // 14.5 MULTI-MARKET (k=2) ATOMIC CORRELATED BASKET IN ONE SINGLE IX & ONE CPI (ZERO TX INTROSPECTION!):
+    //   Taker submits Long Mkt0 (4.0) + Short Mkt1 (4.0) in ONE TradeWithMatcher ix!
+    //   PropAMM sees BOTH offers simultaneously -> grants 50% hedged-basket halfSpread discount:
+    //     Standalone 4.0 spread = 20 + 40 = 60 bps ($100.60 / $99.40)
+    //     Hedged k=2 basket spread = 10 + 40 = 50 bps ($100.50 on Mkt0, $99.50 on Mkt1) — strict MM price efficiency!
+    //   First prove atomicity: if leg 1 violates limitPrice ($99.80 > $99.50), ENTIRE 2-leg batch reverts (0 legs opened)!
+    send_err_custom(
+        &mut svm,
+        ix_trade_with_matcher_batch(
+            prog_id, r_dex, prop_taker_pfl, prop_taker_kp.pubkey(), prop_lp_pfl, matcher_prog, prop_ctx,
+            &[(r_mkts[0], 0, true, 4 * POS_SCALE, 101 * POS_SCALE), (r_mkts[1], 0, false, 4 * POS_SCALE, 99_800_000)], None,
+        ),
+        &payer, &[&payer, &prop_taker_kp], 130, "Atomic k=2 batch reverts ALL legs if leg 1 fails limitPrice",
+    );
+    assert_eq!(read_u8(&svm, &prop_taker_pfl, 4), 0, "Reverted k=2 batch opened ZERO legs!");
+
+    let cu_pm_batch2 = send_ok(
+        &mut svm,
+        ix_trade_with_matcher_batch(
+            prog_id, r_dex, prop_taker_pfl, prop_taker_kp.pubkey(), prop_lp_pfl, matcher_prog, prop_ctx,
+            &[(r_mkts[0], 0, true, 4 * POS_SCALE, 101 * POS_SCALE), (r_mkts[1], 0, false, 4 * POS_SCALE, 99 * POS_SCALE)], None,
+        ),
+        &payer, &[&payer, &prop_taker_kp],
+    );
+    assert_eq!(read_u64(&svm, &prop_ctx, 8), 3, "Multi-market k=2 batch advanced seq 2 -> 3 in ONE CPI!");
+    assert_eq!(read_u64(&svm, &prop_ctx, 16), 100_500_000, "Mkt0 got hedged 50bps ask ($100.50 vs $100.60 standalone)!");
+    assert_eq!(read_u64(&svm, &prop_ctx, 32), 99_500_000, "Mkt1 got hedged 50bps bid ($99.50 vs $99.40 standalone)!");
+    assert_eq!(read_u8(&svm, &prop_taker_pfl, 4), 2, "Taker opened BOTH cross-margin legs in ONE TradeWithMatcher ix!");
+    assert_eq!(read_u8(&svm, &prop_lp_pfl, 4), 2, "LP opened BOTH offsetting legs in ONE TradeWithMatcher ix!");
+    assert_dex_invariants(&svm, &r_dex, &r_vault, &r_mkts, &[r_trader_pfl, r_mm_pfl, prop_lp_pfl, prop_taker_pfl], "suite14-k2-batch-open");
+
+    // Close BOTH legs atomically in ONE k=2 reduce batch!
+    send_ok(
+        &mut svm,
+        ix_trade_with_matcher_batch(
+            prog_id, r_dex, prop_taker_pfl, prop_taker_kp.pubkey(), prop_lp_pfl, matcher_prog, prop_ctx,
+            &[(r_mkts[0], 1, true, 4 * POS_SCALE, 101 * POS_SCALE), (r_mkts[1], 1, false, 4 * POS_SCALE, 99 * POS_SCALE)], None,
+        ),
+        &payer, &[&payer, &prop_taker_kp],
+    );
+    assert_eq!(read_u8(&svm, &prop_taker_pfl, 4), 0, "Taker closed BOTH legs in ONE k=2 reduce ix!");
+    assert_eq!(read_u8(&svm, &prop_lp_pfl, 4), 0, "LP closed BOTH legs in ONE k=2 reduce ix!");
+    assert_dex_invariants(&svm, &r_dex, &r_vault, &r_mkts, &[r_trader_pfl, r_mm_pfl, prop_lp_pfl, prop_taker_pfl], "suite14-k2-batch-close");
+
+    // 14.5b 5-MARKET MIXED LONG/SHORT ATOMIC BASKET IN ONE SINGLE IX & ONE 0-SIGNER CPI!
+    //   Long m0 (2.0), Short m1 (2.0), Long m2 (2.0), Short m3 (2.0), Long m4 (2.0) — ALL 5 priced atomically!
+    //   Hedged 5-market spread = 10 + 20 = 30 bps ($100.30 asks, $99.70 bids) vs 40 bps standalone!
+    let offers_5_open = [
+        (r_mkts[0], 0u8, true,  2 * POS_SCALE, 101 * POS_SCALE),
+        (r_mkts[1], 0u8, false, 2 * POS_SCALE,  99 * POS_SCALE),
+        (r_mkts[2], 0u8, true,  2 * POS_SCALE, 101 * POS_SCALE),
+        (r_mkts[3], 0u8, false, 2 * POS_SCALE,  99 * POS_SCALE),
+        (r_mkts[4], 0u8, true,  2 * POS_SCALE, 101 * POS_SCALE),
+    ];
+    let ix_5_open = ix_trade_with_matcher_batch(
+        prog_id, r_dex, prop_taker_pfl, prop_taker_kp.pubkey(), prop_lp_pfl, matcher_prog, prop_ctx,
+        &offers_5_open, None,
+    );
+    let cu_pm_batch5 = send_ok(&mut svm, ix_5_open, &payer, &[&payer, &prop_taker_kp]);
+    assert_eq!(read_u64(&svm, &prop_ctx, 8), 5, "5-market basket advanced seq 4 -> 5 in ONE CPI!");
+    for j in 0..5 {
+        let exp_p = if j % 2 == 0 { 100_300_000 } else { 99_700_000 };
+        assert_eq!(read_u64(&svm, &prop_ctx, 16 + j * 16), exp_p, "5-market leg {} hedged price mismatch!", j);
+        assert_eq!(read_u64(&svm, &prop_ctx, 24 + j * 16), 2 * POS_SCALE, "5-market leg {} fillQty mismatch!", j);
+    }
+    assert_eq!(read_u8(&svm, &prop_taker_pfl, 4), 5, "Taker opened ALL 5 mixed long/short legs in ONE ix!");
+    assert_eq!(read_u8(&svm, &prop_lp_pfl, 4), 5, "LP opened ALL 5 offsetting legs in ONE ix!");
+    assert_dex_invariants(&svm, &r_dex, &r_vault, &r_mkts, &[r_trader_pfl, r_mm_pfl, prop_lp_pfl, prop_taker_pfl], "suite14-k5-batch-open");
+
+    // Close ALL 5 legs atomically in ONE k=5 reduce ix!
+    let offers_5_close = [
+        (r_mkts[0], 1u8, true,  2 * POS_SCALE, 101 * POS_SCALE),
+        (r_mkts[1], 1u8, false, 2 * POS_SCALE,  99 * POS_SCALE),
+        (r_mkts[2], 1u8, true,  2 * POS_SCALE, 101 * POS_SCALE),
+        (r_mkts[3], 1u8, false, 2 * POS_SCALE,  99 * POS_SCALE),
+        (r_mkts[4], 1u8, true,  2 * POS_SCALE, 101 * POS_SCALE),
+    ];
+    let cu_pm_batch5_close = send_ok(
+        &mut svm,
+        ix_trade_with_matcher_batch(
+            prog_id, r_dex, prop_taker_pfl, prop_taker_kp.pubkey(), prop_lp_pfl, matcher_prog, prop_ctx,
+            &offers_5_close, None,
+        ),
+        &payer, &[&payer, &prop_taker_kp],
+    );
+    assert_eq!(read_u8(&svm, &prop_taker_pfl, 4), 0, "Taker closed ALL 5 legs in ONE k=5 reduce ix!");
+    assert_eq!(read_u8(&svm, &prop_lp_pfl, 4), 0, "LP closed ALL 5 legs in ONE k=5 reduce ix!");
+    assert_dex_invariants(&svm, &r_dex, &r_vault, &r_mkts, &[r_trader_pfl, r_mm_pfl, prop_lp_pfl, prop_taker_pfl], "suite14-k5-batch-close");
+
+    // 14.6 Adversarial Malicious PropAMM (`evil_matcher.so`) — ALL 8 exploit modes REJECTED by core!
+    let evil_ctx = create_prog_acc(&mut svm, &evil_prog, 64);
+    send_ok(&mut svm, ix_set_portfolio_matcher(prog_id, prop_lp_pfl, prop_lp_kp.pubkey(), Some(evil_ctx)), &payer, &[&payer, &prop_lp_kp]);
+    let evil_cases: [(u8, u64, Option<u32>, &str); 8] = [
+        (0, 101 * POS_SCALE, Some(131), "Evil PropAMM over-fill (fillQty > maxQty)"),
+        (1, 101 * POS_SCALE, Some(130), "Evil PropAMM abusive price violating taker limitPrice"),
+        (2, 101 * POS_SCALE, Some(131), "Evil PropAMM nonzero status"),
+        (3, 101 * POS_SCALE, Some(131), "Evil PropAMM stale seq / noop replay"),
+        (4, 101 * POS_SCALE, Some(131), "Evil PropAMM corrupt magic"),
+        (5, 101 * POS_SCALE, Some(131), "Evil PropAMM zero fill"),
+        (6, 0,               Some(130), "Evil PropAMM exceeds core maxMoveBps clamp (limitPrice=0)"),
+        (7, 101 * POS_SCALE, None,      "Evil PropAMM mutates readonly extraAcc"),
+    ];
+    for (atk_mode, lim_p, exp_code, desc) in evil_cases {
+        let mut acc = svm.get_account(&evil_ctx).unwrap();
+        acc.data[48] = atk_mode;
+        svm.set_account(evil_ctx, acc).unwrap();
+        let ix = ix_trade_with_matcher(
+            prog_id, r_dex, r_mkts[0], prop_taker_pfl, prop_taker_kp.pubkey(), prop_lp_pfl,
+            evil_prog, evil_ctx, Some(dummy_oracle_acc), 0, true, 2 * POS_SCALE, lim_p,
+        );
+        if let Some(code) = exp_code {
+            send_err_custom(&mut svm, ix, &payer, &[&payer, &prop_taker_kp], code, desc);
+        } else {
+            send_err(&mut svm, ix, &payer, &[&payer, &prop_taker_kp], desc);
+        }
+    }
+
+    // Also test a pure `noop.so` matcher (owned account with pre-seeded MRET header): seq stays 0 != 1 -> Custom(131)!
+    let noop_ctx = create_prog_acc(&mut svm, &fake_tok_prog, 64);
+    {
+        let mut acc = svm.get_account(&noop_ctx).unwrap();
+        acc.data[0..4].copy_from_slice(&0x5445524Du32.to_le_bytes()); // "MRET"
+        acc.data[4..8].copy_from_slice(&0u32.to_le_bytes());
+        acc.data[8..16].copy_from_slice(&0u64.to_le_bytes()); // seq = 0 (stale!)
+        acc.data[16..24].copy_from_slice(&(100 * POS_SCALE).to_le_bytes());
+        acc.data[24..32].copy_from_slice(&(2 * POS_SCALE).to_le_bytes());
+        svm.set_account(noop_ctx, acc).unwrap();
+    }
+    send_ok(&mut svm, ix_set_portfolio_matcher(prog_id, prop_lp_pfl, prop_lp_kp.pubkey(), Some(noop_ctx)), &payer, &[&payer, &prop_lp_kp]);
+    send_err_custom(
+        &mut svm,
+        ix_trade_with_matcher(prog_id, r_dex, r_mkts[0], prop_taker_pfl, prop_taker_kp.pubkey(), prop_lp_pfl, fake_tok_prog, noop_ctx, None, 0, true, 2 * POS_SCALE, 101 * POS_SCALE),
+        &payer, &[&payer, &prop_taker_kp], 131, "noop.so stale-buffer replay rejected via seq",
+    );
+
+    // 14.7 LP revokes matcher (`None`) & withdraws 100% of EOA collateral directly (evil PropAMM CANNOT trap LP!)
+    send_ok(&mut svm, ix_set_portfolio_matcher(prog_id, prop_lp_pfl, prop_lp_kp.pubkey(), None), &payer, &[&payer, &prop_lp_kp]);
+    send_err_custom(
+        &mut svm,
+        ix_trade_with_matcher(prog_id, r_dex, r_mkts[0], prop_taker_pfl, prop_taker_kp.pubkey(), prop_lp_pfl, matcher_prog, prop_ctx, None, 0, true, 2 * POS_SCALE, 101 * POS_SCALE),
+        &payer, &[&payer, &prop_taker_kp], 131, "Revoked lpPfl rejects TradeWithMatcher",
+    );
+    let lp_final_cap = read_u64(&svm, &prop_lp_pfl, 88);
+    send_ok(&mut svm, ix_withdraw_collateral(prog_id, r_dex, prop_lp_pfl, prop_lp_kp.pubkey(), prop_lp_tok, mint, r_vault, TOKEN_PROGRAM_ID, lp_final_cap), &payer, &[&payer, &prop_lp_kp]);
+    assert_eq!(read_u64(&svm, &prop_lp_pfl, 88), 0, "LP withdrew 100% EOA collateral directly!");
+    assert_dex_invariants(&svm, &r_dex, &r_vault, &r_mkts, &[r_trader_pfl, r_mm_pfl, prop_lp_pfl, prop_taker_pfl], "suite14-final");
+    println!("[PASS] Suite 14: Unified Single/Multi-Market CPI-Out PropAMM (0 Signer Deleg., 1-CPI k=2 & k=5 Mixed Long/Short Hedged Discount, 12 Attacks Blocked, k=1={}/{} CU, k=2={} CU, k=5 open/close={}/{} CU)", cu_pm_open, cu_pm_close, cu_pm_batch2, cu_pm_batch5, cu_pm_batch5_close);
+
     println!("==================================================================================");
-    println!("  ALL 13 PERCOLATOR-LEAN VERIFICATION + BORING EXCHANGE + 8-LEG + REWARD MODULE SUITES PASSED 100%!");
+    println!("  ALL 14 PERCOLATOR-LEAN VERIFICATION + BORING EXCHANGE + 8-LEG + REWARD + PROPAMM SUITES PASSED 100%!");
     println!("==================================================================================");
 }

@@ -40,6 +40,7 @@ def MAGIC_MARKET     : UInt32 := 0x50544B4D         -- "MKTP"
 def MAGIC_PORTFOLIO  : UInt32 := 0x4F4C4650         -- "PFLO"
 def MAGIC_INSURANCE  : UInt32 := 0x52534E49         -- "INSR"
 def MAGIC_CLOSED     : UInt32 := 0x44454144         -- "DEAD" (permanent tombstone; blocks same-tx revival!)
+def MAGIC_MRET       : UInt32 := 0x5445524D         -- "MRET" (CPI-Out external PropAMM return header)
 
 /-! ### PDA Seed Tag (4-byte little-endian ASCII: "dvlt") -/
 
@@ -92,6 +93,7 @@ namespace PErr
   def invalidVaultState  : UInt64 := 128
   def invalidSysProg       : UInt64 := 129
   def execPriceClamp       : UInt64 := 130
+  def invalidMatcher       : UInt64 := 131
 end PErr
 
 /-! ### Exact Byte Offsets: `Dex` (208 bytes) -/
@@ -135,7 +137,7 @@ namespace MktOff
   def windDownSlot   : UInt64 := 128 -- u64
   def exitWindow     : UInt64 := 136 -- u64
   def maxStaleness   : UInt64 := 144 -- u64
-  def warmupSlots    : UInt64 := 152 -- u64 (0 = instant backed realization!)
+  -- bytes 152..159: reserved zero padding (instant backed realization; legacy warmupSlots removed!)
   def imBps          : UInt64 := 160 -- u64
   def mmBps          : UInt64 := 168 -- u64
   def liqFeeBps      : UInt64 := 176 -- u64
@@ -165,23 +167,23 @@ namespace MktOff
   def rewardRecipient : UInt64 := 368 -- Pubkey (32B immutable reward-module authority PDA; non-zero iff rewardBps > 0)
 end MktOff
 
-/-! ### Exact Byte Offsets: `Portfolio` (952 bytes = 120B header + 8 × 104B `Leg` slots) -/
+/-! ### Exact Byte Offsets: `Portfolio` (912 bytes = 144B header + 8 × 96B `Leg` slots) -/
 
 namespace PflOff
-  def headerSize      : UInt64 := 120
-  def legStride       : UInt64 := 104
-  def size            : UInt64 := 952  -- 120 + 8 * 104
-  def magic           : UInt64 := 0    -- u32 ("PFLO")
-  def legCount        : UInt64 := 4    -- u8 (0..8)
+  def headerSize  : UInt64 := 144
+  def legStride   : UInt64 := 96
+  def size        : UInt64 := 912  -- 144 + 8 * 96 (40B smaller than legacy 952B, WITH 32B matcherCtx!)
+  def magic       : UInt64 := 0    -- u32 ("PFLO")
+  def legCount    : UInt64 := 4    -- u8 (0..8)
   -- bytes 5..7: reserved zero padding (any portfolio can cross up to 8 permissionless markets sharing the DEX quoteMint!)
-  def portfolioId     : UInt64 := 8    -- u64 (monotonic)
-  def episode         : UInt64 := 16   -- u64
-  def dex             : UInt64 := 24   -- Pubkey (32)
-  def owner           : UInt64 := 56   -- Pubkey (32)
-  def capital         : UInt64 := 88   -- u64 (shared cross-margin collateral!)
-  def totalMm         : UInt64 := 96   -- u64 (sum of active legs' cachedMm)
-  def totalIm         : UInt64 := 104  -- u64 (sum of active legs' cachedIm)
-  def totalReservedMm : UInt64 := 112  -- u64 (sum of active legs' reservedMm; ALWAYS <= capital!)
+  def portfolioId : UInt64 := 8    -- u64 (monotonic)
+  -- bytes 16..23: reserved zero padding (legacy `episode` removed!)
+  def dex         : UInt64 := 24   -- Pubkey (32)
+  def owner       : UInt64 := 56   -- Pubkey (32)
+  def capital     : UInt64 := 88   -- u64 (shared cross-margin collateral!)
+  def totalMm     : UInt64 := 96   -- u64 (sum of active legs' cachedMm)
+  def totalIm     : UInt64 := 104  -- u64 (sum of active legs' cachedIm)
+  def matcherCtx  : UInt64 := 112  -- Pubkey (32B optional CPI-Out PropAMM matcher context; 0 = disabled!)
 end PflOff
 
 namespace LegOff
@@ -195,7 +197,6 @@ namespace LegOff
   def cachedMm        : UInt64 := 72  -- u64 (latest MM requirement for this leg)
   def cachedIm        : UInt64 := 80  -- u64 (latest IM requirement for this leg)
   def lastRefreshSlot : UInt64 := 88  -- u64 (same-slot refresh witness!)
-  def reservedMm      : UInt64 := 96  -- u64 (capital-backed MM reservation; prevents shielding!)
 end LegOff
 
 /-! ### Exact Byte Offsets: `InsReceipt` (88 bytes — Per-Market Isolated Insurance LP Shares) -/
@@ -214,37 +215,39 @@ end InsOff
 theorem layout_sizes_valid :
     DexOff.totalRewards + 8 ≤ DexOff.size ∧ DexOff.size % 8 == 0 ∧
     MktOff.rewardRecipient + 32 ≤ MktOff.size ∧ MktOff.size % 8 == 0 ∧
-    PflOff.totalReservedMm + 8 ≤ PflOff.headerSize ∧
-    LegOff.reservedMm + 8 ≤ PflOff.legStride ∧
+    PflOff.matcherCtx + 32 ≤ PflOff.headerSize ∧
+    LegOff.lastRefreshSlot + 8 ≤ PflOff.legStride ∧
     PflOff.headerSize + MAX_LEGS * PflOff.legStride == PflOff.size ∧ PflOff.size % 8 == 0 ∧
     InsOff.shares + 8 ≤ InsOff.size ∧ InsOff.size % 8 == 0 := by
   decide
 
-/-! ### Instruction Opcodes (20 minimal unified instructions) -/
+/-! ### Instruction Opcodes (24 minimal unified instructions) -/
 
 namespace IxOp
-  def initDex            : UInt8 := 0
-  def updateCreateFee    : UInt8 := 1
-  def createMarket       : UInt8 := 2
-  def updateMarketAuth   : UInt8 := 3
-  def updateOracle       : UInt8 := 4
-  def initPortfolio      : UInt8 := 5
-  def depositCollateral  : UInt8 := 6
-  def withdrawCollateral : UInt8 := 7
-  def depositInsurance   : UInt8 := 8
-  def withdrawInsurance  : UInt8 := 9
-  def refreshLeg         : UInt8 := 10
-  def trade              : UInt8 := 11
-  def liquidate          : UInt8 := 12
-  def clearDeadLeg       : UInt8 := 13
-  def startWindDown      : UInt8 := 14
-  def forceClosePair     : UInt8 := 15
-  def resolveMarket      : UInt8 := 16
-  def claimResolved      : UInt8 := 17
-  def tombstoneMarket    : UInt8 := 18
-  def closeAccount       : UInt8 := 19
-  def sweepSurplus       : UInt8 := 20
-  def claimReward        : UInt8 := 21
+  def initDex             : UInt8 := 0
+  def updateCreateFee     : UInt8 := 1
+  def createMarket        : UInt8 := 2
+  def updateMarketAuth    : UInt8 := 3
+  def updateOracle        : UInt8 := 4
+  def initPortfolio       : UInt8 := 5
+  def depositCollateral   : UInt8 := 6
+  def withdrawCollateral  : UInt8 := 7
+  def depositInsurance    : UInt8 := 8
+  def withdrawInsurance   : UInt8 := 9
+  def refreshLeg          : UInt8 := 10
+  def trade               : UInt8 := 11
+  def liquidate           : UInt8 := 12
+  def clearDeadLeg        : UInt8 := 13
+  def startWindDown       : UInt8 := 14
+  def forceClosePair      : UInt8 := 15
+  def resolveMarket       : UInt8 := 16
+  def claimResolved       : UInt8 := 17
+  def tombstoneMarket     : UInt8 := 18
+  def closeAccount        : UInt8 := 19
+  def sweepSurplus        : UInt8 := 20
+  def claimReward         : UInt8 := 21
+  def setPortfolioMatcher : UInt8 := 22
+  def tradeWithMatcher    : UInt8 := 23
 end IxOp
 
 /-! ### Structured `sol_log_64_` Event Tags (0 heap, 0 `.rodata`, ~100 CU)
