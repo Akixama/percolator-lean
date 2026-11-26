@@ -539,7 +539,8 @@ def handleInitAdapter (input : Ptr) : SolanaM Unit := do
   SolanaM.require ((← AccountView.dataLen adp) == AdpOff.size) Err.invalidAccountData
   SolanaM.require ((← loadU32 (AccountView.dataPtr adp) 0) == 0) Err.accountAlreadyInitialized
 
-  SolanaM.require ((← rawLoadU8 percProg) == ABI.nonDupMarker &&
+  SolanaM.require ((← rawLoadU8 admin) == ABI.nonDupMarker &&
+                   (← rawLoadU8 percProg) == ABI.nonDupMarker &&
                    (← rawLoadU8 mkt) == ABI.nonDupMarker &&
                    (← rawLoadU8 feed) == ABI.nonDupMarker) PErr.aliasedAccounts
   -- Pin adapter initialization strictly to the bound market's active `marketAdmin`
@@ -609,6 +610,7 @@ def handleCrank (input : Ptr) : SolanaM Unit := do
 
   SolanaM.require ((← rawLoadU8 mkt) == ABI.nonDupMarker &&
                    (← rawLoadU8 feed) == ABI.nonDupMarker &&
+                   (← rawLoadU8 oracAuthPda) == ABI.nonDupMarker &&
                    (← rawLoadU8 percProg) == ABI.nonDupMarker) PErr.aliasedAccounts
   SolanaM.require (← pubkeyEq (AccountView.ownerPtr adp) progId) Err.illegalOwner
   SolanaM.require ((← AccountView.dataLen adp) == AdpOff.size) Err.invalidAccountData
@@ -727,6 +729,7 @@ def handleInitEwma (input : Ptr) : SolanaM Unit := do
   SolanaM.require (ix.len >= 26) Err.invalidInstructionData
   let admin ← AccountView.nextCursor adp
 
+  SolanaM.require ((← rawLoadU8 admin) == ABI.nonDupMarker) PErr.aliasedAccounts
   SolanaM.require (← AccountView.isSigner admin) Err.missingRequiredSignature
   SolanaM.require (← AccountView.isWritable adp) Err.invalidAccountData
   SolanaM.require (← pubkeyEq (AccountView.ownerPtr adp) progId) Err.illegalOwner
@@ -765,6 +768,7 @@ def handlePushEwmaMark (input : Ptr) : SolanaM Unit := do
   SolanaM.require (ix.len >= 9) Err.invalidInstructionData
   let admin ← AccountView.nextCursor adp
 
+  SolanaM.require ((← rawLoadU8 admin) == ABI.nonDupMarker) PErr.aliasedAccounts
   SolanaM.require (← AccountView.isSigner admin) Err.missingRequiredSignature
   SolanaM.require (← AccountView.isWritable adp) Err.invalidAccountData
   SolanaM.require (← pubkeyEq (AccountView.ownerPtr adp) progId) Err.illegalOwner

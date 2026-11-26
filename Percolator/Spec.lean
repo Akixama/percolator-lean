@@ -44,6 +44,16 @@ def deriveAdl (oi rawBasis : Nat) : Nat :=
 def k4CompoundedBps (maxMoveBps : Nat) : Nat :=
   4 * maxMoveBps + (maxMoveBps * maxMoveBps + 999) / 1000
 
+/-- Exact compounded 5-slot (triggering slot + K = 4 adversarial leader window) upper bound in bps:
+    for EVERY `m ≤ 1500`, `(10000 + m)^5 - 10000^5 ≤ k5CompoundedBps m * 10000^4`! -/
+def k5CompoundedBps (maxMoveBps : Nat) : Nat :=
+  5 * maxMoveBps + (maxMoveBps * maxMoveBps * 12 + 9999) / 10000
+
+/-- Upper bound on liquidation fee bps computed at post-5-step price `p5 = p0 * (1 + k5Move / 10000)`! -/
+def liqFeeAtP5Bps (liqFeeBps maxMoveBps : Nat) : Nat :=
+  let k5 := k5CompoundedBps maxMoveBps
+  liqFeeBps + (liqFeeBps * k5 + 9999) / 10000
+
 /-- Effective position quantity `⌊rawBasis * adlSide / ADL_ONE⌋`. -/
 def effectiveQty (rawBasis adlSide : Nat) : Nat :=
   (rawBasis * adlSide) / adlOneNat
@@ -131,16 +141,18 @@ structure LegState where
   cachedMm        : Nat
   cachedIm        : Nat
   lastRefreshSlot : Nat
+  lockedMm        : Nat := 0     -- isolated per-leg MM firewall; NEVER raidable by other markets!
   deriving DecidableEq, Repr
 
 structure PortfolioState where
-  portfolioId : Nat
-  owner       : Nat
-  capital     : Nat              -- shared senior cross-margin collateral across ALL legs!
-  totalMm     : Nat              -- sum of active legs' `cachedMm`
-  totalIm     : Nat              -- sum of active legs' `cachedIm`
-  legs        : Nat → Option LegState   -- marketId → active LegState
-  legCount    : Nat  := 0
+  portfolioId   : Nat
+  owner         : Nat
+  capital       : Nat            -- free shared cross-margin collateral (deposits + excess + realized PnL!)
+  totalMm       : Nat            -- sum of active legs' `cachedMm`
+  totalIm       : Nat            -- sum of active legs' `cachedIm`
+  legs          : Nat → Option LegState   -- marketId → active LegState
+  legCount      : Nat := 0
+  totalLockedMm : Nat := 0       -- sum of active legs' isolated `lockedMm`!
 
 structure DexState where
   protocolAdmin   : Nat
@@ -206,6 +218,35 @@ def applyContainedLoss (capital totalMm : Nat) (leg : LegState) (loss : Nat) :
   let capDeb    := min rem1 availCap
   let shortfall := rem1 - capDeb
   (capital - capDeb, leg.posPnl - pnlBurned, pnlBurned, capDeb, shortfall)
+
+/-- Exact per-leg `lockedMm` firewall loss settlement (1-to-1 with `Program.settleAndRefreshLeg`!):
+    1. Burns `legPosPnl` first,
+    2. Debits shared `freeCap` second,
+    3. Debits ONLY this leg's isolated `legLock` third — NEVER any other leg's `lockedMm`!
+    Returns `(freeCap', legLock', legPosPnl', freeDeb, lockDeb, shortfall)`. -/
+def applyFirewallLoss (freeCap legLock legPosPnl loss : Nat) :
+    Nat × Nat × Nat × Nat × Nat × Nat :=
+  let pnlBurned := min loss legPosPnl
+  let rem1      := loss - pnlBurned
+  let freeDeb   := min rem1 freeCap
+  let rem2      := rem1 - freeDeb
+  let lockDeb   := min rem2 legLock
+  let shortfall := rem2 - lockDeb
+  (freeCap - freeDeb, legLock - lockDeb, legPosPnl - pnlBurned, freeDeb, lockDeb, shortfall)
+
+/-- Exact zero-sum per-leg `lockedMm` rebalance against `freeCap` (1-to-1 with `Program.syncLegMargins`!):
+    Releases excess immediately back to `freeCap` when `newMm < oldLock` (zero ratchet!),
+    or tops up `min(newMm - oldLock, freeCap)` from `freeCap` when `newMm > oldLock`.
+    Returns `(freeCap', totalLockedMm', legLock')`. -/
+def syncLegLock (freeCap totalLockedMm oldLock newMm : Nat) : Nat × Nat × Nat :=
+  if oldLock > newMm then
+    let rel := oldLock - newMm
+    (freeCap + rel, totalLockedMm - rel, newMm)
+  else if newMm > oldLock then
+    let topUp := min (newMm - oldLock) freeCap
+    (freeCap - topUp, totalLockedMm + topUp, oldLock + topUp)
+  else
+    (freeCap, totalLockedMm, oldLock)
 
 /-- Order-independent resolved payout for one leg in a `Resolved` market. -/
 def resolvedLegPayout (m : MarketState) (legPnl : Nat) : Nat :=

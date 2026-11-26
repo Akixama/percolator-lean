@@ -167,23 +167,23 @@ namespace MktOff
   def rewardRecipient : UInt64 := 368 -- Pubkey (32B immutable reward-module authority PDA; non-zero iff rewardBps > 0)
 end MktOff
 
-/-! ### Exact Byte Offsets: `Portfolio` (912 bytes = 144B header + 8 × 96B `Leg` slots) -/
+/-! ### Exact Byte Offsets: `Portfolio` (976 bytes = 144B header + 8 × 104B `Leg` slots) -/
 
 namespace PflOff
-  def headerSize  : UInt64 := 144
-  def legStride   : UInt64 := 96
-  def size        : UInt64 := 912  -- 144 + 8 * 96 (40B smaller than legacy 952B, WITH 32B matcherCtx!)
-  def magic       : UInt64 := 0    -- u32 ("PFLO")
-  def legCount    : UInt64 := 4    -- u8 (0..8)
+  def headerSize    : UInt64 := 144
+  def legStride     : UInt64 := 104
+  def size          : UInt64 := 976  -- 144 + 8 * 104 (per-leg lockedMm firewall!)
+  def magic         : UInt64 := 0    -- u32 ("PFLO")
+  def legCount      : UInt64 := 4    -- u8 (0..8)
   -- bytes 5..7: reserved zero padding (any portfolio can cross up to 8 permissionless markets sharing the DEX quoteMint!)
-  def portfolioId : UInt64 := 8    -- u64 (monotonic)
-  -- bytes 16..23: reserved zero padding (legacy `episode` removed!)
-  def dex         : UInt64 := 24   -- Pubkey (32)
-  def owner       : UInt64 := 56   -- Pubkey (32)
-  def capital     : UInt64 := 88   -- u64 (shared cross-margin collateral!)
-  def totalMm     : UInt64 := 96   -- u64 (sum of active legs' cachedMm)
-  def totalIm     : UInt64 := 104  -- u64 (sum of active legs' cachedIm)
-  def matcherCtx  : UInt64 := 112  -- Pubkey (32B optional CPI-Out PropAMM matcher context; 0 = disabled!)
+  def portfolioId   : UInt64 := 8    -- u64 (monotonic)
+  def totalLockedMm : UInt64 := 16   -- u64 (sum of active legs' isolated `lockedMm`!)
+  def dex           : UInt64 := 24   -- Pubkey (32)
+  def owner         : UInt64 := 56   -- Pubkey (32)
+  def capital       : UInt64 := 88   -- u64 (free shared cross-margin collateral: deposits + excess + realized PnL!)
+  def totalMm       : UInt64 := 96   -- u64 (sum of active legs' cachedMm)
+  def totalIm       : UInt64 := 104  -- u64 (sum of active legs' cachedIm)
+  def matcherCtx    : UInt64 := 112  -- Pubkey (32B optional CPI-Out PropAMM matcher context; 0 = disabled!)
 end PflOff
 
 namespace LegOff
@@ -197,6 +197,7 @@ namespace LegOff
   def cachedMm        : UInt64 := 72  -- u64 (latest MM requirement for this leg)
   def cachedIm        : UInt64 := 80  -- u64 (latest IM requirement for this leg)
   def lastRefreshSlot : UInt64 := 88  -- u64 (same-slot refresh witness!)
+  def lockedMm        : UInt64 := 96  -- u64 (isolated per-leg MM backing; NEVER raidable by any other market!)
 end LegOff
 
 /-! ### Exact Byte Offsets: `InsReceipt` (88 bytes — Per-Market Isolated Insurance LP Shares) -/
@@ -216,7 +217,7 @@ theorem layout_sizes_valid :
     DexOff.totalRewards + 8 ≤ DexOff.size ∧ DexOff.size % 8 == 0 ∧
     MktOff.rewardRecipient + 32 ≤ MktOff.size ∧ MktOff.size % 8 == 0 ∧
     PflOff.matcherCtx + 32 ≤ PflOff.headerSize ∧
-    LegOff.lastRefreshSlot + 8 ≤ PflOff.legStride ∧
+    LegOff.lockedMm + 8 ≤ PflOff.legStride ∧
     PflOff.headerSize + MAX_LEGS * PflOff.legStride == PflOff.size ∧ PflOff.size % 8 == 0 ∧
     InsOff.shares + 8 ≤ InsOff.size ∧ InsOff.size % 8 == 0 := by
   decide

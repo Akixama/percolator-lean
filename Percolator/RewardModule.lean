@@ -48,6 +48,7 @@ def MAGIC_EPOCH     : UInt32 := 0x48435045 -- "EPCH"
 def MAGIC_BID       : UInt32 := 0x52444942 -- "BIDR"
 def TAG_REW_AUTH    : UInt32 := 0x6D776572 -- "rewm"
 def MAX_RATE_E6     : UInt64 := 1_000_000_000_000 -- 10^6 target-atoms per 1 quote-atom (at E6 scale)
+def MAX_VIRT_BIDS   : UInt64 := 0x3FFFFFFFFFFFFFFF -- 2^62 - 1 (caps virtBids so virtBids + totalBids never bricks StartEpoch!)
 def MIN_EPOCH_SLOTS : UInt64 := 32                -- >= 8x Solana K=4 leader window
 def MAX_EPOCH_SLOTS : UInt64 := 216_000           -- ~24h at 400ms/slot
 def EVT_EPOCH_START  : UInt64 := 41
@@ -281,7 +282,40 @@ theorem feeSplit_exact_conservation (fee2 rewBps : Nat) (hbps : rewBps ≤ 10_00
     rwa [Nat.mul_div_cancel _ (by decide)] at this
   exact ⟨hd, by omega⟩
 
+/-- Pure capped virtual-reserve computation: `min MAX_VIRT_BIDS (ceil(Q * r / 10^6))`. -/
+def virtBidsCappedNat (Q r : Nat) : Nat :=
+  min MAX_VIRT_BIDS.toNat ((Q * r + 1_000_000 - 1) / 1_000_000)
+
+/-- **THEOREM 8 (`virtBidsCapped_in_bounds` — Closes Fix #6: Zero `StartEpoch` Overflow Brick)**:
+    For EVERY `Q ≥ 1` and `r ≥ 1`, `1 ≤ virtBidsCappedNat Q r ≤ MAX_VIRT_BIDS`, so `B_virt` is
+    ALWAYS strictly positive (blocking 1-atom quiet-epoch drain) AND strictly bounded below `2^62`
+    (so `StartEpoch` can NEVER overflow `u64::MAX` even on a 10^6x cheap memecoin!). -/
+theorem virtBidsCapped_in_bounds (Q r : Nat) (hQ : 1 ≤ Q) (hr : 1 ≤ r) :
+    1 ≤ virtBidsCappedNat Q r ∧ virtBidsCappedNat Q r ≤ MAX_VIRT_BIDS.toNat := by
+  unfold virtBidsCappedNat
+  have h1 : 1 ≤ Q * r := Nat.mul_le_mul hQ hr
+  have hceil : 1 ≤ (Q * r + 1_000_000 - 1) / 1_000_000 :=
+    (Nat.le_div_iff_mul_le (by decide : 0 < 1_000_000)).mpr (by omega)
+  have hmax : 1 ≤ MAX_VIRT_BIDS.toNat := by decide
+  exact ⟨Nat.le_min.mpr ⟨hmax, hceil⟩, Nat.min_le_left _ _⟩
+
 /-! ### Runtime Helpers & Outlined CPIs -/
+
+/-- Overflow-free `min MAX_VIRT_BIDS (ceil(totalPot * resRate / POS_SCALE))`: NEVER overflows `UInt64`
+    even if `resRate == MAX_RATE_E6 (10^12)` and `totalPot >= 18.4M` quote units! -/
+def computeVirtBidsU64 (totalPot resRate : UInt64) : SolanaM UInt64 := do
+  if resRate <= POS_SCALE then
+    if totalPot >= MAX_VIRT_BIDS then return MAX_VIRT_BIDS
+    let v ← mulDiv64Ceil totalPot resRate POS_SCALE
+    return if v > MAX_VIRT_BIDS then MAX_VIRT_BIDS else v
+  else
+    let q := totalPot / POS_SCALE
+    if q >= MAX_VIRT_BIDS / resRate then return MAX_VIRT_BIDS
+    let v ← mulDiv64Ceil totalPot resRate POS_SCALE
+    return if v > MAX_VIRT_BIDS then MAX_VIRT_BIDS else v
+
+def requireNonDup (acc : AccountView) : SolanaM Unit := do
+  SolanaM.require ((← rawLoadU8 acc) == ABI.nonDupMarker) PErr.aliasedAccounts
 
 def zeroRewardWords (base off nWords : UInt64) : SolanaM Unit := do
   if h : nWords == 0 then return ()
@@ -445,6 +479,9 @@ def handleInitReward (input : Ptr) : SolanaM Unit := do
   let targetEscrow  ← AccountView.nextCursor targetMint
   let targetTokProg ← AccountView.nextCursor targetEscrow
 
+  requireNonDup mktAdmin; requireNonDup percProg; requireNonDup dex
+  requireNonDup mkt; requireNonDup rewAuthPda; requireNonDup quoteVault
+  requireNonDup targetEscrow
   SolanaM.require (← AccountView.isSigner mktAdmin) Err.missingRequiredSignature
   SolanaM.require (← AccountView.isWritable cfg) Err.invalidAccountData
   SolanaM.require (← pubkeyEq (AccountView.ownerPtr cfg) progId) Err.illegalOwner
@@ -526,6 +563,7 @@ def handleInitReward (input : Ptr) : SolanaM Unit := do
   if burnMode == 1 then
     SolanaM.require (n >= 13) Err.notEnoughAccountKeys
     let burnSinkTok ← AccountView.nextCursor targetTokProg
+    requireNonDup burnSinkTok
     checkInitializedTokAcc burnSinkTok effTargetTokProg effTargetMint rewAuthPda
     SolanaM.require (!(← pubkeyEq (AccountView.keyPtr burnSinkTok) (AccountView.keyPtr targetEscrow))) PErr.aliasedAccounts
     SolanaM.require (!(← pubkeyEq (AccountView.keyPtr burnSinkTok) (AccountView.keyPtr quoteVault))) PErr.aliasedAccounts
@@ -562,7 +600,9 @@ def handleStartEpoch (input : Ptr) : SolanaM Unit := do
   let quoteTokProg ← AccountView.nextCursor quoteVault
   let percProg     ← AccountView.nextCursor quoteTokProg
 
-  SolanaM.require ((← rawLoadU8 epochAcc) == ABI.nonDupMarker) PErr.aliasedAccounts
+  requireNonDup epochAcc; requireNonDup dex; requireNonDup mkt; requireNonDup rewAuthPda
+  requireNonDup quoteMint; requireNonDup dexVault; requireNonDup quoteVault
+  requireNonDup quoteTokProg; requireNonDup percProg
   SolanaM.require (← AccountView.isWritable cfg) Err.invalidAccountData
   SolanaM.require (← AccountView.isWritable epochAcc) Err.invalidAccountData
   checkRewardCfg cfg progId
@@ -603,7 +643,7 @@ def handleStartEpoch (input : Ptr) : SolanaM Unit := do
   SolanaM.require (totalPot >= minBatch) RErr.belowMinBatch
 
   let resRate ← loadU64 cData RewOff.reserveRateE6
-  let virtBids ← mulDiv64Ceil totalPot resRate POS_SCALE
+  let virtBids ← computeVirtBidsU64 totalPot resRate
   let epSlots ← loadU64 cData RewOff.epochSlots
   let curSlot ← getSlot
   let endSlot ← checkedAdd64 curSlot epSlots
@@ -651,8 +691,9 @@ def handleSubmitBid (input : Ptr) : SolanaM Unit := do
   let targetMint      ← AccountView.nextCursor targetEscrow
   let targetTokProg   ← AccountView.nextCursor targetMint
 
-  SolanaM.require ((← rawLoadU8 epochAcc) == ABI.nonDupMarker &&
-                   (← rawLoadU8 bidReceipt) == ABI.nonDupMarker) PErr.aliasedAccounts
+  requireNonDup epochAcc; requireNonDup bidReceipt; requireNonDup bidder
+  requireNonDup bidderTargetTok; requireNonDup targetEscrow
+  requireNonDup targetMint; requireNonDup targetTokProg
   SolanaM.require (← AccountView.isSigner bidder) Err.missingRequiredSignature
   SolanaM.require (← AccountView.isWritable epochAcc) Err.invalidAccountData
   SolanaM.require (← AccountView.isWritable bidReceipt) Err.invalidAccountData
@@ -736,7 +777,8 @@ def handleSettleEpoch (input : Ptr) : SolanaM Unit := do
   let targetMint    ← AccountView.nextCursor targetEscrow
   let targetTokProg ← AccountView.nextCursor targetMint
 
-  SolanaM.require ((← rawLoadU8 epochAcc) == ABI.nonDupMarker) PErr.aliasedAccounts
+  requireNonDup epochAcc; requireNonDup rewAuthPda; requireNonDup targetEscrow
+  requireNonDup targetMint; requireNonDup targetTokProg
   SolanaM.require (← AccountView.isWritable cfg) Err.invalidAccountData
   SolanaM.require (← AccountView.isWritable epochAcc) Err.invalidAccountData
   checkRewardCfg cfg progId
@@ -773,6 +815,7 @@ def handleSettleEpoch (input : Ptr) : SolanaM Unit := do
     else
       SolanaM.require (n >= 7) Err.notEnoughAccountKeys
       let burnSinkTok ← AccountView.nextCursor targetTokProg
+      requireNonDup burnSinkTok
       SolanaM.require (← pubkeyEq (AccountView.keyPtr burnSinkTok) (cData + RewOff.burnSinkTok)) RErr.sinkMismatch
       SolanaM.require (!(← pubkeyEq (AccountView.keyPtr targetEscrow) (AccountView.keyPtr burnSinkTok))) PErr.aliasedAccounts
       let tDec ← loadU8 cData RewOff.targetDecimals
@@ -824,10 +867,10 @@ def handleClaimQuote (input : Ptr) : SolanaM Unit := do
   let quoteMint      ← AccountView.nextCursor bidderQuoteTok
   let quoteTokProg   ← AccountView.nextCursor quoteMint
 
-  SolanaM.require ((← rawLoadU8 epochAcc) == ABI.nonDupMarker &&
-                   (← rawLoadU8 bidReceipt) == ABI.nonDupMarker) PErr.aliasedAccounts
+  requireNonDup epochAcc; requireNonDup bidReceipt; requireNonDup bidder
+  requireNonDup rewAuthPda; requireNonDup quoteVault; requireNonDup bidderQuoteTok
+  requireNonDup quoteMint; requireNonDup quoteTokProg
   SolanaM.require (← AccountView.isSigner bidder) Err.missingRequiredSignature
-  SolanaM.require ((← rawLoadU8 epochAcc) == ABI.nonDupMarker) PErr.aliasedAccounts
   SolanaM.require (← AccountView.isWritable cfg) Err.invalidAccountData
   SolanaM.require (← AccountView.isWritable epochAcc) Err.invalidAccountData
   SolanaM.require (← AccountView.isWritable bidReceipt) Err.invalidAccountData

@@ -43,31 +43,36 @@ def MIN_FIRST_HLP_DEPOSIT : UInt64 := 1_000_000  -- 1.0 quote unit (anti-ERC4626
 def MAX_HLP_LOCKUP        : UInt64 := 216_000    -- ~24h at 400ms/slot
 
 namespace HErr
-  def paused        : UInt64 := 500
-  def lockupActive  : UInt64 := 501
-  def capExceeded   : UInt64 := 502
-  def progMismatch  : UInt64 := 503
-  def pflMismatch   : UInt64 := 504
-  def feeTokBad     : UInt64 := 505
-  def vaultMismatch : UInt64 := 506
+  def paused            : UInt64 := 500
+  def lockupActive      : UInt64 := 501
+  def capExceeded       : UInt64 := 502
+  def progMismatch      : UInt64 := 503
+  def pflMismatch       : UInt64 := 504
+  def feeTokBad         : UInt64 := 505
+  def vaultMismatch     : UInt64 := 506
+  def matcherNotAllowed : UInt64 := 507
+  def marketNotAllowed  : UInt64 := 508
 end HErr
 
-/-! ### Exact Byte Offsets: `HlpVault` (200B), `HlpReceipt` (88B) -/
+/-! ### Exact Byte Offsets: `HlpVault` (296B), `HlpReceipt` (88B) -/
 
 namespace HlpOff
-  def size         : UInt64 := 200
-  def magic        : UInt64 := 0   -- u32 ("HLPV")
-  def pdaBump      : UInt64 := 4   -- u8
-  def paused       : UInt64 := 5   -- u8 (0 = open, 1 = deposits paused; withdraws NEVER paused!)
-  def strategist   : UInt64 := 8   -- Pubkey (32)
-  def percProg     : UInt64 := 40  -- Pubkey (32)
-  def dex          : UInt64 := 72  -- Pubkey (32)
-  def hlpPortfolio : UInt64 := 104 -- Pubkey (32)
-  def hlpFeeTok    : UInt64 := 136 -- Pubkey (32)
-  def lockupSlots  : UInt64 := 168 -- u64
-  def depositCap   : UInt64 := 176 -- u64 (0 = unlimited)
-  def totalShares  : UInt64 := 184 -- u64
-  def minDeposit   : UInt64 := 192 -- u64
+  def size               : UInt64 := 296
+  def magic              : UInt64 := 0   -- u32 ("HLPV")
+  def pdaBump            : UInt64 := 4   -- u8
+  def paused             : UInt64 := 5   -- u8 (0 = open, 1 = deposits paused; withdraws NEVER paused!)
+  def allowedCount       : UInt64 := 6   -- u8 (1..8, IMMUTABLE pinned market allowlist count!)
+  def strategist         : UInt64 := 8   -- Pubkey (32)
+  def percProg           : UInt64 := 40  -- Pubkey (32)
+  def dex                : UInt64 := 72  -- Pubkey (32)
+  def hlpPortfolio       : UInt64 := 104 -- Pubkey (32)
+  def hlpFeeTok          : UInt64 := 136 -- Pubkey (32)
+  def lockupSlots        : UInt64 := 168 -- u64
+  def depositCap         : UInt64 := 176 -- u64 (0 = unlimited)
+  def totalShares        : UInt64 := 184 -- u64
+  def minDeposit         : UInt64 := 192 -- u64
+  def allowedMatcherProg : UInt64 := 200 -- Pubkey (32B IMMUTABLE verified PropAMM program; blocks evil_matcher rug!)
+  def allowedMarkets     : UInt64 := 232 -- 8 × u64 (IMMUTABLE market allowlist for both PropAMM & takeover!)
 end HlpOff
 
 namespace HlpRecOff
@@ -80,7 +85,7 @@ namespace HlpRecOff
 end HlpRecOff
 
 theorem hlp_layout_sizes_valid :
-    HlpOff.minDeposit + 8 ≤ HlpOff.size ∧ HlpOff.size % 8 == 0 ∧
+    HlpOff.allowedMarkets + MAX_LEGS * 8 ≤ HlpOff.size ∧ HlpOff.size % 8 == 0 ∧
     HlpRecOff.lastDepositSlot + 8 ≤ HlpRecOff.size ∧ HlpRecOff.size % 8 == 0 := by
   decide
 
@@ -200,7 +205,64 @@ theorem hlp_sum_withdrawals_solvent (totalShares capital : Nat) (sharesList : Li
       rwa [Nat.mul_div_cancel_left _ hpos] at hd
     omega
 
+/-- **THEOREM 5 (`hlp_strategist_subset_blocks_scam`)**:
+    If `matcherAllowed ⊆ vaultAllowed` (`∀ m ∈ matcherAllowed, m ∈ vaultAllowed`), then any
+    scam market `scamMid ∉ vaultAllowed` is automatically excluded from `matcherAllowed` too —
+    so strategist can NEVER rug depositors via an unwhitelisted `M_scam` market! -/
+theorem hlp_strategist_subset_blocks_scam (vaultAllowed matcherAllowed : List Nat) (scamMid : Nat)
+    (hSub : ∀ m ∈ matcherAllowed, m ∈ vaultAllowed)
+    (hScam : scamMid ∉ vaultAllowed) :
+    scamMid ∉ matcherAllowed :=
+  fun hmem => hScam (hSub scamMid hmem)
+
 /-! ### Runtime Helpers & Outlined CPIs -/
+
+def copyHlpMarketsLoop (dst src : Ptr) (i count : UInt64) : SolanaM Unit := do
+  if h : i < count then
+    let mid ← loadU64 src (i * 8)
+    SolanaM.require (mid > 0) PErr.invalidParams
+    storeU64 dst (i * 8) mid
+    copyHlpMarketsLoop dst src (i + 1) count
+  else
+    return ()
+termination_by (count.toNat - i.toNat)
+decreasing_by
+  have hlt : i.toNat < count.toNat := UInt64.lt_iff_toNat_lt.mp h
+  have h1 : (1 : UInt64).toNat = 1 := rfl
+  have hadd : (i + 1).toNat = i.toNat + 1 := by
+    rw [UInt64.toNat_add, h1, Nat.mod_eq_of_lt (by have := count.toNat_lt; omega)]
+  omega
+
+def checkHlpMarketAllowedLoop (vData : Ptr) (mid i count : UInt64) : SolanaM Unit := do
+  if h : i < count then
+    if (← loadU64 vData (HlpOff.allowedMarkets + i * 8)) == mid then
+      return ()
+    else
+      checkHlpMarketAllowedLoop vData mid (i + 1) count
+  else
+    SolanaM.fail HErr.marketNotAllowed
+termination_by (count.toNat - i.toNat)
+decreasing_by
+  have hlt : i.toNat < count.toNat := UInt64.lt_iff_toNat_lt.mp h
+  have h1 : (1 : UInt64).toNat = 1 := rfl
+  have hadd : (i + 1).toNat = i.toNat + 1 := by
+    rw [UInt64.toNat_add, h1, Nat.mod_eq_of_lt (by have := count.toNat_lt; omega)]
+  omega
+
+def checkSubsetMarketsLoop (vData mcMarketsPtr : Ptr) (vCount i mcCount : UInt64) : SolanaM Unit := do
+  if h : i < mcCount then
+    let mid ← loadU64 mcMarketsPtr (i * 8)
+    checkHlpMarketAllowedLoop vData mid 0 vCount
+    checkSubsetMarketsLoop vData mcMarketsPtr vCount (i + 1) mcCount
+  else
+    return ()
+termination_by (mcCount.toNat - i.toNat)
+decreasing_by
+  have hlt : i.toNat < mcCount.toNat := UInt64.lt_iff_toNat_lt.mp h
+  have h1 : (1 : UInt64).toNat = 1 := rfl
+  have hadd : (i + 1).toNat = i.toNat + 1 := by
+    rw [UInt64.toNat_add, h1, Nat.mod_eq_of_lt (by have := mcCount.toNat_lt; omega)]
+  omega
 
 def zeroHlpWords (base off nWords : UInt64) : SolanaM Unit := do
   if h : nWords == 0 then return ()
@@ -286,7 +348,7 @@ decreasing_by
       rw [UInt64.toNat_add, h1, Nat.mod_eq_of_lt (by omega)]
     omega
 
-/-- Validate `hlpPfl` matches `vault` and return `(capital, navDeposit = capital + Σ posPnl)`. -/
+/-- Validate `hlpPfl` matches `vault` and return `(totalCap = freeCap + totalLockedMm, navDeposit = totalCap + Σ posPnl)`. -/
 def loadFreshHlpNav (vData : Ptr) (hlpPfl percProg : AccountView) (curSlot : UInt64) :
     SolanaM (UInt64 × UInt64) := do
   SolanaM.require (← pubkeyEq (AccountView.keyPtr hlpPfl) (vData + HlpOff.hlpPortfolio)) HErr.pflMismatch
@@ -295,9 +357,11 @@ def loadFreshHlpNav (vData : Ptr) (hlpPfl percProg : AccountView) (curSlot : UIn
   let fData := AccountView.dataPtr hlpPfl
   SolanaM.require ((← loadU32 fData PflOff.magic) == MAGIC_PORTFOLIO) PErr.invalidMagic
   let posPnlSum ← scanHlpPflPosPnlLoop fData curSlot 0 0
-  let cap ← loadU64 fData PflOff.capital
-  let navDep ← checkedAdd64 cap posPnlSum
-  return (cap, navDep)
+  let freeCap   ← loadU64 fData PflOff.capital
+  let lockedMm  ← loadU64 fData PflOff.totalLockedMm
+  let totCap    ← checkedAdd64 freeCap lockedMm
+  let navDep    ← checkedAdd64 totCap posPnlSum
+  return (totCap, navDep)
 
 @[noinline] def cpiInitHlpPortfolio (percProg dex hlpPfl hlpAuthPda : AccountView)
     (vaultKeyPtr : Ptr) (bump : UInt8) : SolanaM Unit := do
@@ -402,23 +466,26 @@ def loadFreshHlpNav (vData : Ptr) (hlpPfl percProg : AccountView) (curSlot : UIn
 
 /-! ### 5 Minimal Permissionless HLP Vault Instructions -/
 
-/-- Op 0 (`InitHlpVault`): Initialize `HlpVault` and CPI `percolator::InitPortfolio` owned by `hlpAuthPda`.
-    Accounts (7): `0. vault (W)`, `1. strategist (S)`, `2. dex (W)`, `3. hlpPfl (W)`,
-    `4. hlpAuthPda`, `5. hlpFeeTok`, `6. percProg`.
-    Ix data (28B): `[0, pdaBump:u8, pad:u16, lockupSlots:u64, depositCap:u64, minDeposit:u64]`. -/
+/-- Op 0 (`InitHlpVault`): Initialize `HlpVault` with IMMUTABLE `(allowedMatcherProg, allowedMarkets)`
+    so strategist can NEVER rug via `evil_matcher.so` or permissionless `M_scam`, and CPI
+    `percolator::InitPortfolio` owned by `hlpAuthPda`.
+    Accounts (8): `0. vault (W)`, `1. strategist (S)`, `2. dex (W)`, `3. hlpPfl (W)`,
+    `4. hlpAuthPda`, `5. hlpFeeTok`, `6. percProg`, `7. allowedMatcherProg`.
+    Ix data (`28 + 8 * nAllowed` B):
+      `[0, pdaBump:u8, nAllowed:u8, pad:u8, lockupSlots:u64, depositCap:u64, minDeposit:u64, mid_0..mid_{n-1}:u64]`. -/
 def handleInitHlpVault (input : Ptr) : SolanaM Unit := do
-  let (vault, strategist, dex, hlpPfl, hlpAuthPda, hlpFeeTok, percProg, ix, progId) ← parse7 input
-  SolanaM.require (ix.len >= 28) Err.invalidInstructionData
+  let (vault, strategist, dex, hlpPfl, hlpAuthPda, hlpFeeTok, percProg, allowedMatcherProg, ix, progId) ← parse8 input
+  SolanaM.require (ix.len >= 36) Err.invalidInstructionData
   SolanaM.require (← AccountView.isSigner strategist) Err.missingRequiredSignature
   SolanaM.require (← AccountView.isWritable vault) Err.invalidAccountData
   SolanaM.require (← pubkeyEq (AccountView.ownerPtr vault) progId) Err.illegalOwner
   SolanaM.require ((← AccountView.dataLen vault) == HlpOff.size) Err.invalidAccountData
   SolanaM.require ((← loadU32 (AccountView.dataPtr vault) 0) == 0) Err.accountAlreadyInitialized
 
-  -- Validate non-duplicate accounts, genuine `dex` owned by `percProg`, and canonical SPL Token
-  -- `hlpFeeTok` (165B initialized, amount == 0, mint == dex.quoteMint, owner == hlpAuthPda, != dexVault)!
-  requireNonDup dex; requireNonDup hlpPfl; requireNonDup hlpAuthPda
-  requireNonDup hlpFeeTok; requireNonDup percProg
+  -- Validate genuine `dex` owned by `percProg`, executable `allowedMatcherProg != percProg`,
+  -- and canonical SPL Token `hlpFeeTok` (165B initialized, amount == 0, mint == dex.quoteMint, owner == hlpAuthPda, != dexVault)!
+  SolanaM.require (← AccountView.isExecutable allowedMatcherProg) HErr.matcherNotAllowed
+  SolanaM.require (!(← pubkeyEq (AccountView.keyPtr allowedMatcherProg) (AccountView.keyPtr percProg))) HErr.matcherNotAllowed
   SolanaM.require (← pubkeyEq (AccountView.ownerPtr dex) (AccountView.keyPtr percProg)) Err.illegalOwner
   SolanaM.require ((← AccountView.dataLen dex) == DexOff.size) Err.invalidAccountData
   let dData := AccountView.dataPtr dex
@@ -432,9 +499,12 @@ def handleInitHlpVault (input : Ptr) : SolanaM Unit := do
   SolanaM.require (!(← pubkeyEq (AccountView.keyPtr hlpFeeTok) (dData + DexOff.vaultPda))) PErr.aliasedAccounts
 
   let pdaBump     ← loadU8  ix.ptr 1
+  let nAllowed8   ← loadU8  ix.ptr 2
+  let nAllowed    := nAllowed8.toUInt64
   let lockupSlots ← loadU64 ix.ptr 4
   let depositCap  ← loadU64 ix.ptr 12
   let minDeposit  ← loadU64 ix.ptr 20
+  SolanaM.require (nAllowed >= 1 && nAllowed <= MAX_LEGS && ix.len >= 28 + nAllowed * 8) PErr.invalidParams
   SolanaM.require (lockupSlots <= MAX_HLP_LOCKUP && minDeposit >= MIN_FIRST_HLP_DEPOSIT) PErr.invalidParams
 
   let vData := AccountView.dataPtr vault
@@ -442,19 +512,23 @@ def handleInitHlpVault (input : Ptr) : SolanaM Unit := do
   storeU32 vData HlpOff.magic MAGIC_HLP
   storeU8  vData HlpOff.pdaBump pdaBump
   storeU8  vData HlpOff.paused 0
-  pubkeyCopy (vData + HlpOff.strategist)   (AccountView.keyPtr strategist)
-  pubkeyCopy (vData + HlpOff.percProg)     (AccountView.keyPtr percProg)
-  pubkeyCopy (vData + HlpOff.dex)          (AccountView.keyPtr dex)
-  pubkeyCopy (vData + HlpOff.hlpPortfolio) (AccountView.keyPtr hlpPfl)
-  pubkeyCopy (vData + HlpOff.hlpFeeTok)    (AccountView.keyPtr hlpFeeTok)
+  storeU8  vData HlpOff.allowedCount nAllowed8
+  pubkeyCopy (vData + HlpOff.strategist)         (AccountView.keyPtr strategist)
+  pubkeyCopy (vData + HlpOff.percProg)           (AccountView.keyPtr percProg)
+  pubkeyCopy (vData + HlpOff.dex)                (AccountView.keyPtr dex)
+  pubkeyCopy (vData + HlpOff.hlpPortfolio)       (AccountView.keyPtr hlpPfl)
+  pubkeyCopy (vData + HlpOff.hlpFeeTok)          (AccountView.keyPtr hlpFeeTok)
+  pubkeyCopy (vData + HlpOff.allowedMatcherProg) (AccountView.keyPtr allowedMatcherProg)
   storeU64 vData HlpOff.lockupSlots lockupSlots
   storeU64 vData HlpOff.depositCap  depositCap
   storeU64 vData HlpOff.minDeposit  minDeposit
+  copyHlpMarketsLoop (vData + HlpOff.allowedMarkets) (ix.ptr + 28) 0 nAllowed
 
   cpiInitHlpPortfolio percProg dex hlpPfl hlpAuthPda (AccountView.keyPtr vault) pdaBump
 
-/-- Op 1 (`SetHlpMatcher`): Strategist binds/revokes a PropAMM `matcherCtx` on `hlpPfl` via
-    `percolator::SetPortfolioMatcher` and optionally toggles `paused` (`ix[1]`, deposits ONLY!).
+/-- Op 1 (`SetHlpMatcher`): Strategist binds/revokes a pinned `allowedMatcherProg` `matcherCtx`
+    (whose immutable market allowlist MUST be a subset of `HlpVault.allowedMarkets`!) on `hlpPfl`,
+    and optionally toggles `paused` (`ix[1]`, deposits ONLY!).
     Accounts (5 or 6): `0. vault (W)`, `1. strategist (S)`, `2. hlpPfl (W)`, `3. hlpAuthPda`,
     `4. percProg`, optional `5. matcherCtx`.
     Ix data (`1` or `2` B): `[1]` or `[1, paused:u8]`. -/
@@ -466,7 +540,7 @@ def handleSetHlpMatcher (input : Ptr) : SolanaM Unit := do
   let hlpAuthPda ← AccountView.nextCursor hlpPfl
   let percProg   ← AccountView.nextCursor hlpAuthPda
 
-  requireNonDup hlpPfl; requireNonDup hlpAuthPda; requireNonDup percProg
+  requireNonDup strategist; requireNonDup hlpPfl; requireNonDup hlpAuthPda; requireNonDup percProg
   SolanaM.require (← AccountView.isSigner strategist) Err.missingRequiredSignature
   SolanaM.require (← AccountView.isWritable vault) Err.invalidAccountData
   checkHlpVault vault progId
@@ -491,6 +565,17 @@ def handleSetHlpMatcher (input : Ptr) : SolanaM Unit := do
   writeAccountInfo (infos + 56) hlpAuthPda
   let nAccs : UInt64 ← if n >= 6 then do
       let mc ← AccountView.nextCursor percProg
+      requireNonDup mc
+      -- True Zero-Strategist-Rug check: pin `mc.owner == allowedMatcherProg`, valid `MAGIC_MRET`,
+      -- and require EVERY market in `mc.allowedMarkets` to be in `HlpVault.allowedMarkets`!
+      SolanaM.require (← pubkeyEq (AccountView.ownerPtr mc) (vData + HlpOff.allowedMatcherProg)) HErr.matcherNotAllowed
+      SolanaM.require ((← AccountView.dataLen mc) >= 272) HErr.matcherNotAllowed
+      let mcData := AccountView.dataPtr mc
+      SolanaM.require ((← loadU32 mcData 0) == MAGIC_MRET) HErr.matcherNotAllowed
+      let mcCount := (← loadU8 mcData 201).toUInt64
+      let vCount  := (← loadU8 vData HlpOff.allowedCount).toUInt64
+      SolanaM.require (mcCount >= 1 && mcCount <= MAX_LEGS && vCount >= 1 && vCount <= MAX_LEGS) HErr.marketNotAllowed
+      checkSubsetMarketsLoop vData (mcData + 208) vCount 0 mcCount
       writeMeta (metas + 32) mc 0 0
       writeAccountInfo (infos + 112) mc
       pure 3
@@ -519,8 +604,9 @@ def handleDepositHlp (input : Ptr) : SolanaM Unit := do
   let tokProg      ← AccountView.nextCursor dexVault
   let percProg     ← AccountView.nextCursor tokProg
 
-  requireNonDup receipt; requireNonDup dex; requireNonDup hlpPfl
-  requireNonDup tokProg; requireNonDup percProg
+  requireNonDup receipt; requireNonDup depositor; requireNonDup depositorTok
+  requireNonDup dex; requireNonDup hlpPfl; requireNonDup mint
+  requireNonDup dexVault; requireNonDup tokProg; requireNonDup percProg
   SolanaM.require (← AccountView.isSigner depositor) Err.missingRequiredSignature
   SolanaM.require (← AccountView.isWritable vault) Err.invalidAccountData
   SolanaM.require (← AccountView.isWritable receipt) Err.invalidAccountData
@@ -603,8 +689,9 @@ def handleWithdrawHlp (input : Ptr) : SolanaM Unit := do
   let tokProg    ← AccountView.nextCursor dexVault
   let percProg   ← AccountView.nextCursor tokProg
 
-  requireNonDup receipt; requireNonDup owner; requireNonDup dex
-  requireNonDup hlpPfl; requireNonDup tokProg; requireNonDup percProg
+  requireNonDup receipt; requireNonDup owner; requireNonDup destTok
+  requireNonDup dex; requireNonDup hlpPfl; requireNonDup hlpAuthPda
+  requireNonDup mint; requireNonDup dexVault; requireNonDup tokProg; requireNonDup percProg
   SolanaM.require (← AccountView.isSigner owner) Err.missingRequiredSignature
   SolanaM.require (← AccountView.isWritable vault) Err.invalidAccountData
   SolanaM.require (← AccountView.isWritable receipt) Err.invalidAccountData
@@ -682,9 +769,9 @@ def handleHlpTakeoverLiquidate (input : Ptr) : SolanaM Unit := do
   let hlpAuthPda ← AccountView.nextCursor hlpPfl
   let percProg   ← AccountView.nextCursor hlpAuthPda
 
-  requireNonDup dex; requireNonDup mkt; requireNonDup victimPfl
-  requireNonDup hlpFeeTok; requireNonDup tokProg; requireNonDup hlpPfl
-  requireNonDup hlpAuthPda; requireNonDup percProg
+  requireNonDup strategist; requireNonDup dex; requireNonDup mkt; requireNonDup victimPfl
+  requireNonDup hlpFeeTok; requireNonDup mint; requireNonDup dexVault
+  requireNonDup tokProg; requireNonDup hlpPfl; requireNonDup hlpAuthPda; requireNonDup percProg
   SolanaM.require (← AccountView.isSigner strategist) Err.missingRequiredSignature
   checkHlpVault vault progId
   let vData := AccountView.dataPtr vault
@@ -694,6 +781,13 @@ def handleHlpTakeoverLiquidate (input : Ptr) : SolanaM Unit := do
   SolanaM.require (← pubkeyEq (AccountView.keyPtr hlpPfl)     (vData + HlpOff.hlpPortfolio)) HErr.pflMismatch
   SolanaM.require (← pubkeyEq (AccountView.keyPtr hlpFeeTok)  (vData + HlpOff.hlpFeeTok))    HErr.feeTokBad
   checkSplTokenProg tokProg
+  -- Zero-Strategist-Rug check: `mkt` MUST be a genuine `percolator` market in `HlpVault.allowedMarkets`!
+  SolanaM.require (← pubkeyEq (AccountView.ownerPtr mkt) (AccountView.keyPtr percProg)) Err.illegalOwner
+  SolanaM.require ((← AccountView.dataLen mkt) == MktOff.size) Err.invalidAccountData
+  let mData := AccountView.dataPtr mkt
+  SolanaM.require ((← loadU32 mData MktOff.magic) == MAGIC_MARKET) PErr.invalidMagic
+  let vCount := (← loadU8 vData HlpOff.allowedCount).toUInt64
+  checkHlpMarketAllowedLoop vData (← loadU64 mData MktOff.marketId) 0 vCount
 
   let reqQty ← loadU64 ix.ptr 1
   let bump   ← loadU8 vData HlpOff.pdaBump
