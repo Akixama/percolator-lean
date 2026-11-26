@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+if [ ! -f ../lean-svm/LeanSVM/CPI.lean ] || ! grep -q "def checkTokenOr2022Prog" ../lean-svm/LeanSVM/CPI.lean; then
+  echo "ERROR: sibling ../lean-svm checkout is missing or outdated (requires LeanSVM.CPI.checkTokenOr2022Prog)." >&2
+  echo "       Please update ../lean-svm to latest main and rebuild it first." >&2
+  exit 1
+fi
+
 echo "=== 1. Build Lean 4 formal model, verify all kernel proofs (0 sorry, 0 axioms) ==="
 lake build
 lake build Percolator.EvilMatcher

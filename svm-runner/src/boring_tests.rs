@@ -1949,7 +1949,158 @@ pub fn test_17_ins_fronting_lp_nav_sweep_and_freeze_flag(elf: &[u8]) {
     assert_eq!(read_u8(&e.svm, &frz_dex, 7), 1, "DexOff.allowFreeze must record 1 immutably");
 }
 
-/// Runs all 17 boring everyday exchange + security regression LiteSVM tests as Suite 12.
+/// Test 18: Mode 4 (`Trade` auto-netted buy/sell & atomic 3-stage flip) clean-room regression:
+///   (a) Adversarial zero-qty & self-trade aliasing (`pflL == pflS`) rejected.
+///   (b) Flat -> Flat `mode=4` reduces identically to `mode=0` fresh open (both sides pay tradeFee).
+///   (c) Mutually offsetting `mode=4` reduces identically to `mode=1` net-close (0 tradeFee, legs freed).
+///   (d) Pure OI-invariant hand-offs via `mode=4` (Stage 2a `mode=2` L->L & Stage 2b `mode=3` S->S).
+///   (e) Single-tx 3-stage atomic flip (`mode=1` + `mode=3` + `mode=0`) with exact OI & leg conservation.
+///   (f) `execPrice` spread direction consistency across all 3 stages + out-of-clamp rejection (`Custom(130)`).
+///   (g) `STATUS_WINDDOWN`: pure reducing `mode=4` succeeds; flipping past flat (`rem2 > 0`) rejected (`Custom(101)`).
+pub fn test_18_mode4_netting_flip_and_adversarial_edge_cases(elf: &[u8]) {
+    let mut e = BoringEnv::new(elf);
+
+    // Helper: inspect a trader's active leg `(side, raw_basis)` for `mkt`, returning `(0, 0)` if absent.
+    let find_leg = |env: &BoringEnv, pfl: Address, mkt: Address| -> (u8, u64) {
+        let mid = read_u64(&env.svm, &mkt, 8);
+        for slot in 0..8usize {
+            let base = 144 + slot * 104;
+            if read_u8(&env.svm, &pfl, base) == 1 && read_u64(&env.svm, &pfl, base + 8) == mid {
+                return (read_u8(&env.svm, &pfl, base + 1), read_u64(&env.svm, &pfl, base + 48));
+            }
+        }
+        (0, 0)
+    };
+
+    // Market 1 (BTC): 20 bps trade fee so open vs close fee accounting is observable, K+1=5 safe maxMoveBps=75.
+    let btc = e.create_market(100 * POS_SCALE, 10, 1000, 500, 100, 20, 75);
+    let alice = e.create_trader(2_000 * POS_SCALE, 500 * POS_SCALE);
+    let bob   = e.create_trader(2_000 * POS_SCALE, 500 * POS_SCALE);
+    let carol = e.create_trader(2_000 * POS_SCALE, 500 * POS_SCALE);
+    let dave  = e.create_trader(2_000 * POS_SCALE, 500 * POS_SCALE);
+
+    // (a) Adversarial rejections: qty == 0 -> InvalidParams(103), self-trade pflL == pflS -> AliasedAccounts(109)
+    send_err_custom(
+        &mut e.svm,
+        ix_trade(e.prog_id, e.dex, btc, alice.pfl, alice.kp.pubkey(), bob.pfl, bob.kp.pubkey(), 4, 0),
+        &e.payer,
+        &[&e.payer, &alice.kp, &bob.kp],
+        103,
+        "mode=4 zero qty rejected",
+    );
+    send_err_custom(
+        &mut e.svm,
+        ix_trade(e.prog_id, e.dex, btc, alice.pfl, alice.kp.pubkey(), alice.pfl, alice.kp.pubkey(), 4, POS_SCALE),
+        &e.payer,
+        &[&e.payer, &alice.kp],
+        109,
+        "mode=4 self-trade aliased portfolios rejected",
+    );
+
+    // (b) Flat -> Flat mode=4 reduces identically to mode=0 fresh open (OI=2, both pay 20 bps on $200 = $0.40)
+    e.trade(btc, &alice, &bob, 4, 2 * POS_SCALE);
+    assert_eq!(e.oi_long(btc), 2 * POS_SCALE);
+    assert_eq!(read_u64(&e.svm, &btc, 264), 2 * POS_SCALE);
+    assert_eq!(find_leg(&e, alice.pfl, btc), (1, 2 * POS_SCALE));
+    assert_eq!(find_leg(&e, bob.pfl, btc), (2, 2 * POS_SCALE));
+    assert_eq!(e.capital(&alice), 500 * POS_SCALE - 400_000);
+    assert_eq!(e.capital(&bob),   500 * POS_SCALE - 400_000);
+    e.check("t18-flat-open");
+
+    // (c) Mutually offsetting mode=4 reduces identically to mode=1 net-close (OI=0, 0 fee, both legs freed)
+    let alice_pre_close = e.capital(&alice);
+    let bob_pre_close   = e.capital(&bob);
+    e.trade(btc, &bob, &alice, 4, 2 * POS_SCALE);
+    assert_eq!(e.oi_long(btc), 0);
+    assert_eq!(read_u64(&e.svm, &btc, 264), 0);
+    assert_eq!(find_leg(&e, alice.pfl, btc), (0, 0));
+    assert_eq!(find_leg(&e, bob.pfl, btc), (0, 0));
+    assert_eq!(e.capital(&alice), alice_pre_close, "Mutual mode=4 close charges 0 trade fee");
+    assert_eq!(e.capital(&bob),   bob_pre_close,   "Mutual mode=4 close charges 0 trade fee");
+    e.check("t18-mutual-close");
+
+    // (d) Pure OI-invariant hand-offs via mode=4:
+    //     Re-open Alice Long 2 vs Bob Short 2 -> OI = 2
+    e.trade(btc, &alice, &bob, 4, 2 * POS_SCALE);
+    //     Stage 2a (mode=2 L->L): flat Carol buys 1 BTC from Long Alice -> OI stays 2, Alice Long 1, Carol Long 1
+    e.trade(btc, &carol, &alice, 4, 1 * POS_SCALE);
+    assert_eq!(e.oi_long(btc), 2 * POS_SCALE, "mode=4 Stage 2a L->L hand-off must preserve OI");
+    assert_eq!(find_leg(&e, alice.pfl, btc), (1, 1 * POS_SCALE));
+    assert_eq!(find_leg(&e, carol.pfl, btc), (1, 1 * POS_SCALE));
+    //     Stage 2b (mode=3 S->S): Short Bob buys 1 BTC from flat Dave -> OI stays 2, Bob Short 1, Dave Short 1
+    e.trade(btc, &bob, &dave, 4, 1 * POS_SCALE);
+    assert_eq!(e.oi_long(btc), 2 * POS_SCALE, "mode=4 Stage 2b S->S hand-off must preserve OI");
+    assert_eq!(find_leg(&e, bob.pfl, btc),  (2, 1 * POS_SCALE));
+    assert_eq!(find_leg(&e, dave.pfl, btc), (2, 1 * POS_SCALE));
+    e.check("t18-handoffs");
+
+    // (e) Single-tx 3-stage atomic position flip (Stage 1 mode=1 + Stage 2 mode=3 + Stage 3 mode=0):
+    //     Fresh 0-fee ETH market at $100 (maxMoveBps=75 -> clamp = $0.75).
+    let eth = e.create_market(100 * POS_SCALE, 10, 1000, 500, 100, 0, 75);
+    //     Alice Short 2 vs Carol Long 2; Bob Long 1 vs Dave Short 1 -> total OI = 3 ETH
+    e.trade(eth, &carol, &alice, 0, 2 * POS_SCALE);
+    e.trade(eth, &bob,   &dave,  0, 1 * POS_SCALE);
+    assert_eq!(e.oi_long(eth), 3 * POS_SCALE);
+    //     ONE atomic mode=4 tx: Alice buys qty=5 ETH from Bob!
+    //       Stage 1 (mode=1, cBoth=1): Alice Short 2->1, Bob Long 1->0, OI 3->2
+    //       Stage 2 (mode=3, cHo=1):   Alice Short 1->0, Bob Short 0->1, OI 2->2
+    //       Stage 3 (mode=0, rem2=3):  Alice Long  0->3, Bob Short 1->4, OI 2->5
+    e.trade(eth, &alice, &bob, 4, 5 * POS_SCALE);
+    assert_eq!(e.oi_long(eth), 5 * POS_SCALE, "3-stage atomic flip net OI must be 3 - 1 + 3 = 5");
+    assert_eq!(read_u64(&e.svm, &eth, 264), 5 * POS_SCALE);
+    assert_eq!(find_leg(&e, alice.pfl, eth), (1, 3 * POS_SCALE), "Alice flipped Short 2 -> Long 3");
+    assert_eq!(find_leg(&e, bob.pfl,   eth), (2, 4 * POS_SCALE), "Bob flipped Long 1 -> Short 4");
+    assert_eq!(find_leg(&e, carol.pfl, eth), (1, 2 * POS_SCALE), "Carol Long 2 untouched");
+    assert_eq!(find_leg(&e, dave.pfl,  eth), (2, 1 * POS_SCALE), "Dave Short 1 untouched");
+    e.check("t18-3stage-atomic-flip");
+
+    // (f) mode=4 execPrice spread direction consistency across ALL 3 stages + out-of-clamp rejection:
+    //     Out-of-clamp execPrice ($105 vs $100 mark, max spread $0.75) rejected with ExecPriceClamp(130)
+    send_err_custom(
+        &mut e.svm,
+        ix_trade_ext(e.prog_id, e.dex, eth, bob.pfl, bob.kp.pubkey(), alice.pfl, alice.kp.pubkey(), 4, 5 * POS_SCALE, 105 * POS_SCALE),
+        &e.payer,
+        &[&e.payer, &bob.kp, &alice.kp],
+        130,
+        "mode=4 out-of-clamp execPrice rejected",
+    );
+    //     Valid Ask spread (+$0.50 -> execPrice = $100.50) across a reverse 3-stage flip:
+    //       Bob (Short 4) buys qty=5 ETH from Alice (Long 3):
+    //       Stage 1 (mode=1, cBoth=3) + Stage 2 (mode=3, cHo=1) + Stage 3 (mode=0, rem2=1) = 5 ETH total!
+    //       Buyer (Bob) MUST pay Seller (Alice) exact $0.50 * 5 = $2.50 (2_500_000) across all 3 stages!
+    let alice_pre_sp = e.capital(&alice);
+    let bob_pre_sp   = e.capital(&bob);
+    e.trade_ext(eth, &bob, &alice, 4, 5 * POS_SCALE, 100_500_000);
+    assert_eq!(e.oi_long(eth), 3 * POS_SCALE, "Reverse 3-stage flip net OI must be 5 - 3 + 1 = 3");
+    assert_eq!(find_leg(&e, bob.pfl,   eth), (1, 1 * POS_SCALE), "Bob flipped Short 4 -> Long 1");
+    assert_eq!(find_leg(&e, alice.pfl, eth), (2, 2 * POS_SCALE), "Alice flipped Long 3 -> Short 2");
+    assert_eq!(e.capital(&alice), alice_pre_sp + 2_500_000, "Seller must receive exact +$2.50 spread across all 3 stages");
+    assert_eq!(e.capital(&bob),   bob_pre_sp   - 2_500_000, "Buyer must pay exact -$2.50 spread across all 3 stages");
+    e.check("t18-mode4-spread");
+
+    // (g) mode=4 under STATUS_WINDDOWN:
+    //     Start WindDown on ETH (current: Bob Long 1, Alice Short 2, Carol Long 2, Dave Short 1, OI = 3).
+    send_ok(&mut e.svm, ix_start_wind_down(e.prog_id, eth, e.admin.pubkey()), &e.payer, &[&e.payer, &e.admin]);
+    //     Flipping past flat (Alice Short 2 buys qty=3 from Bob Long 1 -> rem2=1 > 0 -> Stage 3 mode=0)
+    //     MUST be rejected with InvalidStatus(101) and roll back atomically!
+    send_err_custom(
+        &mut e.svm,
+        ix_trade(e.prog_id, e.dex, eth, alice.pfl, alice.kp.pubkey(), bob.pfl, bob.kp.pubkey(), 4, 3 * POS_SCALE),
+        &e.payer,
+        &[&e.payer, &alice.kp, &bob.kp],
+        101,
+        "mode=4 flipping into fresh OI during WindDown must be rejected",
+    );
+    assert_eq!(e.oi_long(eth), 3 * POS_SCALE, "Rejected WindDown mode=4 flip must roll back OI atomically");
+    //     Pure reducing mode=4 (Alice Short 2 buys qty=1 from Bob Long 1 -> cBoth=1, rem2=0) SUCCEEDS!
+    e.trade(eth, &alice, &bob, 4, 1 * POS_SCALE);
+    assert_eq!(e.oi_long(eth), 2 * POS_SCALE, "Pure reducing mode=4 must succeed during WindDown");
+    assert_eq!(find_leg(&e, bob.pfl,   eth), (0, 0));
+    assert_eq!(find_leg(&e, alice.pfl, eth), (2, 1 * POS_SCALE));
+    e.check("t18-winddown-mode4");
+}
+
+/// Runs all 18 boring everyday exchange + security regression LiteSVM tests as Suite 12.
 pub fn run_all_boring_tests(elf: &[u8], matcher_elf: &[u8]) {
     test_boring_deposit_withdraw_roundtrip(elf);
     test_boring_simple_long_short_profit_and_loss(elf);
@@ -1968,10 +2119,11 @@ pub fn run_all_boring_tests(elf: &[u8], matcher_elf: &[u8]) {
     test_security_revival_and_dirty_init_regressions(elf);
     test_audited_security_regressions(elf, matcher_elf);
     test_17_ins_fronting_lp_nav_sweep_and_freeze_flag(elf);
-    println!("[PASS] Suite 12: 17 Boring Exchange & Audited Security Regression LiteSVM Tests (Deposits, Scale-In/Out,");
+    test_18_mode4_netting_flip_and_adversarial_edge_cases(elf);
+    println!("[PASS] Suite 12: 18 Boring Exchange & Audited Security Regression LiteSVM Tests (Deposits, Scale-In/Out,");
     println!("       Flips, Spreads, Funding, 3 Exit-Order Permutations, Partial+Full Liq, HLP Takeover, Cross-Margin Reuse,");
     println!("       AMM Matcher, LP Yield, WindDown, Revival/Dirty-Init, ForceHaircut, FreezeMint, SharePool, Self-Transfer,");
-    println!("       I_m-Contained Cross-PnL Fronting, Optimistic LP NAV Anti-Arb, SweepSurplus & AllowFreeze Opt-In!)");
+    println!("       I_m-Contained Cross-PnL Fronting, Optimistic LP NAV Anti-Arb, SweepSurplus, AllowFreeze & Mode-4 Flips!)");
 }
 
 #[cfg(test)]
@@ -2004,4 +2156,5 @@ mod tests {
     #[test] fn boring_15_security_revival_and_dirty_init_regressions() { let (e, _) = load_elfs(); test_security_revival_and_dirty_init_regressions(&e); }
     #[test] fn boring_16_audited_security_regressions() { let (e, m) = load_elfs(); test_audited_security_regressions(&e, &m); }
     #[test] fn boring_17_ins_fronting_lp_nav_sweep_and_freeze_flag() { let (e, _) = load_elfs(); test_17_ins_fronting_lp_nav_sweep_and_freeze_flag(&e); }
+    #[test] fn boring_18_mode4_netting_flip_and_adversarial_edge_cases() { let (e, _) = load_elfs(); test_18_mode4_netting_flip_and_adversarial_edge_cases(&e); }
 }
