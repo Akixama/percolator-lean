@@ -1,3 +1,5 @@
+mod boring_tests;
+
 use litesvm::LiteSVM;
 use solana_account::Account;
 use solana_address::Address;
@@ -2594,7 +2596,12 @@ fn main() {
     println!("       Keeper 16-leg Liq(m1)[14xRef + Takeover(ADL)] : {:>6} CU | {:>4} B / 1232 B", cu_liq16_takeover, wire_liq16_takeover);
     println!("       Crank 8-mkt Batch    [8x UpdateOracle 1 tx]   : {:>6} CU | {:>4} B / 1232 B", cu_crank_8orc, wire_8orc);
     println!("       Crank 8-mkt CPI/Sweep[OracleAdapter max/8x]   : {:>6} / {:>5} CU | ForceClose max={} CU, Resolve max={} CU", cpi_crank_max_cu, cpi_crank_total_cu, max_fc_cu, max_res_cu);
+    // =========================================================================
+    // SUITE 12: 14 Boring Everyday Exchange LiteSVM Functional Tests
+    // =========================================================================
+    boring_tests::run_all_boring_tests(&elf, &matcher_elf);
+
     println!("==================================================================================");
-    println!("  ALL 11 PERCOLATOR-LEAN VERIFICATION + 8-LEG STRESS + A1/A2/B4 + FUZZ SUITES PASSED 100%!");
+    println!("  ALL 12 PERCOLATOR-LEAN VERIFICATION + BORING EXCHANGE + 8-LEG STRESS + FUZZ SUITES PASSED 100%!");
     println!("==================================================================================");
 }

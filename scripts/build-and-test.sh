@@ -13,6 +13,6 @@ LEAN_PATH=../lean-svm/.lake/build/lib/lean:.lake/build/lib/lean \
 LEAN_PATH=../lean-svm/.lake/build/lib/lean:.lake/build/lib/lean \
   ../lean-svm/.lake/build/bin/lean-svm build Percolator.OracleAdapter Percolator.OracleAdapter.entrypoint -o build/oracle_adapter.so
 
-echo "=== 3. Execute all 11 LiteSVM verification, 8-leg CU stress, CPI & fuzz suites (Agave 3.1.3) ==="
+echo "=== 3. Execute all 12 LiteSVM verification, boring exchange, 8-leg CU stress, CPI & fuzz suites (Agave 3.1.3) ==="
 cargo run --manifest-path svm-runner/Cargo.toml --release -- \
   build/percolator.so build/matcher.so build/oracle_adapter.so

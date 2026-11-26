@@ -1,0 +1,1321 @@
+//! Boring, everyday exchange LiteSVM functional tests for `percolator-lean`!
+//!
+//! Covers all the normal, unexciting flows traders & LPs expect to "just work"
+//! identically to Binance / Hyperliquid:
+//!  1. Deposit / partial withdraw / re-deposit / full withdraw / close empty portfolio
+//!  2. Simple bilateral Long vs Short profit & loss with trading fees & full SPL exit
+//!  3. Scale-in (adding to position) & multi-step partial closes across price moves
+//!  4. Position flip (Long -> flat -> Short) on the same market
+//!  5. Bid/ask `execPrice` spread fills & clamp rejections
+//!  6. Positive & negative funding rate accruals (Longs->Shorts and Shorts->Longs)
+//!  7. Multi-trader exit order permutations (winners-first, reverse, & L->L / S->S hand-offs)
+//!  8. Partial liquidation restoring health, followed by full liquidation (0 bad debt, 0 ADL)
+//!  9. HLP-style liquidation takeover (`mode=1`, OI & ADL bit-for-bit invariant, Bob untouched)
+//! 10. Multi-market cross-margin offsetting (BTC + ETH) & instant profit reuse without closing
+//! 11. Withdrawal margin guards (`totalIm`), stale-leg rejection, & flat-portfolio withdraw
+//! 12. External `matcher.so` AMM single-signer fills (two takers, spread & LP withdrawal)
+//! 13. Insurance LP deposits, pro-rata trading-fee yield, OI-gated withdraw, & exact redemption
+//! 14. Market wind-down lifecycle: block opens, voluntary close, force-close, resolve, claim, tombstone
+
+use super::*;
+
+/// Isolated fresh DEX + USDC mint + optional markets/traders harness for boring tests.
+struct BoringEnv {
+    svm: LiteSVM,
+    prog_id: Address,
+    payer: Keypair,
+    admin: Keypair,
+    oracle: Keypair,
+    mint: Address,
+    fee_vault: Address,
+    dex: Address,
+    dex_vault: Address,
+    slot: u64,
+    markets: Vec<Address>,
+    portfolios: Vec<Address>,
+}
+
+struct Trader {
+    kp: Keypair,
+    tok: Address,
+    pfl: Address,
+    init_spl: u64,
+}
+
+impl BoringEnv {
+    fn new(elf: &[u8]) -> Self {
+        let mut svm = LiteSVM::new();
+        let prog_id = Keypair::new().pubkey();
+        svm.add_program(prog_id, elf).expect("ELF load failed");
+        let slot = 100u64;
+        set_slot(&mut svm, slot);
+
+        let payer = Keypair::new();
+        let admin = Keypair::new();
+        let oracle = Keypair::new();
+        for kp in [&payer, &admin, &oracle] {
+            svm.airdrop(&kp.pubkey(), 10_000_000_000).unwrap();
+        }
+
+        let mint = Keypair::new().pubkey();
+        svm.set_account(
+            mint,
+            Account {
+                lamports: 10_000_000,
+                data: make_spl_mint(6, 100_000_000_000_000, &admin.pubkey()),
+                owner: TOKEN_PROGRAM_ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+
+        let fee_vault = create_tok_acc(&mut svm, &mint, &admin.pubkey(), 0);
+        let dex = create_prog_acc(&mut svm, &prog_id, DEX_SIZE);
+        let (dex_vault, bump) = derive_dex_vault(&prog_id, &dex);
+
+        send_ok(
+            &mut svm,
+            ix_init_dex(
+                prog_id,
+                dex,
+                admin.pubkey(),
+                mint,
+                dex_vault,
+                fee_vault,
+                TOKEN_PROGRAM_ID,
+                SYSTEM_PROGRAM_ID,
+                bump,
+                6,
+                0,
+                SPL_TOKEN_RENT_MIN,
+            ),
+            &payer,
+            &[&payer, &admin],
+        );
+
+        Self {
+            svm,
+            prog_id,
+            payer,
+            admin,
+            oracle,
+            mint,
+            fee_vault,
+            dex,
+            dex_vault,
+            slot,
+            markets: Vec::new(),
+            portfolios: Vec::new(),
+        }
+    }
+
+    fn advance_slot(&mut self, delta: u64) {
+        self.slot += delta;
+        set_slot(&mut self.svm, self.slot);
+    }
+
+    fn create_market(
+        &mut self,
+        init_price: u64,
+        exit_window: u64,
+        im_bps: u64,
+        mm_bps: u64,
+        liq_fee_bps: u64,
+        trade_fee_bps: u64,
+        max_move_bps: u64,
+    ) -> Address {
+        let mkt = create_prog_acc(&mut self.svm, &self.prog_id, MKT_SIZE);
+        let creator_tok = create_tok_acc(&mut self.svm, &self.mint, &self.admin.pubkey(), 0);
+        send_ok(
+            &mut self.svm,
+            ix_create_market(
+                self.prog_id,
+                self.dex,
+                mkt,
+                self.mint,
+                self.oracle.pubkey(),
+                self.admin.pubkey(),
+                creator_tok,
+                self.fee_vault,
+                init_price,
+                exit_window,
+                50, // max_staleness
+                0,  // warmup_slots (instant realization)
+                im_bps,
+                mm_bps,
+                liq_fee_bps,
+                trade_fee_bps,
+                max_move_bps,
+                2500, // max_ins_draw_bps
+                1_000_000 * POS_SCALE,
+            ),
+            &self.payer,
+            &[&self.payer, &self.admin],
+        );
+        self.markets.push(mkt);
+        mkt
+    }
+
+    fn create_trader(&mut self, init_spl: u64, deposit_amt: u64) -> Trader {
+        let kp = Keypair::new();
+        self.svm.airdrop(&kp.pubkey(), 10_000_000_000).unwrap();
+        let tok = create_tok_acc(&mut self.svm, &self.mint, &kp.pubkey(), init_spl);
+        let pfl = create_prog_acc(&mut self.svm, &self.prog_id, PFL_SIZE);
+        send_ok(
+            &mut self.svm,
+            ix_init_portfolio(self.prog_id, self.dex, pfl, kp.pubkey()),
+            &self.payer,
+            &[&self.payer, &kp],
+        );
+        if deposit_amt > 0 {
+            send_ok(
+                &mut self.svm,
+                ix_deposit_collateral(
+                    self.prog_id,
+                    self.dex,
+                    pfl,
+                    kp.pubkey(),
+                    tok,
+                    self.mint,
+                    self.dex_vault,
+                    TOKEN_PROGRAM_ID,
+                    deposit_amt,
+                ),
+                &self.payer,
+                &[&self.payer, &kp],
+            );
+        }
+        self.portfolios.push(pfl);
+        Trader {
+            kp,
+            tok,
+            pfl,
+            init_spl,
+        }
+    }
+
+    fn deposit(&mut self, t: &Trader, amount: u64) {
+        send_ok(
+            &mut self.svm,
+            ix_deposit_collateral(
+                self.prog_id,
+                self.dex,
+                t.pfl,
+                t.kp.pubkey(),
+                t.tok,
+                self.mint,
+                self.dex_vault,
+                TOKEN_PROGRAM_ID,
+                amount,
+            ),
+            &self.payer,
+            &[&self.payer, &t.kp],
+        );
+    }
+
+    fn withdraw(&mut self, t: &Trader, amount: u64) {
+        send_ok(
+            &mut self.svm,
+            ix_withdraw_collateral(
+                self.prog_id,
+                self.dex,
+                t.pfl,
+                t.kp.pubkey(),
+                t.tok,
+                self.mint,
+                self.dex_vault,
+                TOKEN_PROGRAM_ID,
+                amount,
+            ),
+            &self.payer,
+            &[&self.payer, &t.kp],
+        );
+    }
+
+    fn withdraw_all(&mut self, t: &Trader) -> u64 {
+        let cap = self.capital(t);
+        if cap > 0 {
+            self.withdraw(t, cap);
+        }
+        cap
+    }
+
+    fn update_oracle(&mut self, mkt: Address, new_price: u64, fund_sign: u8, fund_e6: u64) {
+        self.advance_slot(1);
+        send_ok(
+            &mut self.svm,
+            ix_update_oracle(
+                self.prog_id,
+                mkt,
+                self.oracle.pubkey(),
+                new_price,
+                fund_sign,
+                fund_e6,
+            ),
+            &self.payer,
+            &[&self.payer, &self.oracle],
+        );
+    }
+
+    fn refresh(&mut self, mkt: Address, t: &Trader) {
+        send_ok(
+            &mut self.svm,
+            ix_refresh_leg(self.prog_id, self.dex, mkt, t.pfl, false),
+            &self.payer,
+            &[&self.payer],
+        );
+    }
+
+    fn trade(&mut self, mkt: Address, long_t: &Trader, short_t: &Trader, mode: u8, qty: u64) {
+        self.trade_ext(mkt, long_t, short_t, mode, qty, 0);
+    }
+
+    fn trade_ext(
+        &mut self,
+        mkt: Address,
+        long_t: &Trader,
+        short_t: &Trader,
+        mode: u8,
+        qty: u64,
+        exec_price: u64,
+    ) {
+        send_ok(
+            &mut self.svm,
+            ix_trade_ext(
+                self.prog_id,
+                self.dex,
+                mkt,
+                long_t.pfl,
+                long_t.kp.pubkey(),
+                short_t.pfl,
+                short_t.kp.pubkey(),
+                mode,
+                qty,
+                exec_price,
+            ),
+            &self.payer,
+            &[&self.payer, &long_t.kp, &short_t.kp],
+        );
+    }
+
+    fn capital(&self, t: &Trader) -> u64 {
+        read_u64(&self.svm, &t.pfl, 88)
+    }
+
+    fn spl(&self, t: &Trader) -> u64 {
+        token_amount(&self.svm, &t.tok)
+    }
+
+    fn oi_long(&self, mkt: Address) -> u64 {
+        read_u64(&self.svm, &mkt, 256)
+    }
+
+    fn check(&self, label: &str) {
+        assert_dex_invariants(
+            &self.svm,
+            &self.dex,
+            &self.dex_vault,
+            &self.markets,
+            &self.portfolios,
+            label,
+        );
+    }
+}
+
+/// 1. Boring deposit, partial withdraw, re-deposit, full withdraw, and CloseAccount rent reclaim.
+pub fn test_boring_deposit_withdraw_roundtrip(elf: &[u8]) {
+    let mut e = BoringEnv::new(elf);
+    let alice = e.create_trader(1_000 * POS_SCALE, 0);
+    e.check("t1-init");
+
+    // Zero deposit and zero withdraw rejected with InvalidParams (103)
+    send_err_custom(
+        &mut e.svm,
+        ix_deposit_collateral(
+            e.prog_id, e.dex, alice.pfl, alice.kp.pubkey(), alice.tok, e.mint, e.dex_vault, TOKEN_PROGRAM_ID, 0,
+        ),
+        &e.payer,
+        &[&e.payer, &alice.kp],
+        103,
+        "zero deposit",
+    );
+    send_err_custom(
+        &mut e.svm,
+        ix_withdraw_collateral(
+            e.prog_id, e.dex, alice.pfl, alice.kp.pubkey(), alice.tok, e.mint, e.dex_vault, TOKEN_PROGRAM_ID, 0,
+        ),
+        &e.payer,
+        &[&e.payer, &alice.kp],
+        103,
+        "zero withdraw",
+    );
+
+    // Deposit $100
+    e.deposit(&alice, 100 * POS_SCALE);
+    assert_eq!(e.capital(&alice), 100 * POS_SCALE);
+    assert_eq!(e.spl(&alice), 900 * POS_SCALE);
+    e.check("t1-dep100");
+
+    // Over-withdraw $101 rejected with InsufficientFunds (108)
+    send_err_custom(
+        &mut e.svm,
+        ix_withdraw_collateral(
+            e.prog_id, e.dex, alice.pfl, alice.kp.pubkey(), alice.tok, e.mint, e.dex_vault, TOKEN_PROGRAM_ID, 101 * POS_SCALE,
+        ),
+        &e.payer,
+        &[&e.payer, &alice.kp],
+        108,
+        "over-withdraw",
+    );
+
+    // Partial withdraw $40 -> $60 left
+    e.withdraw(&alice, 40 * POS_SCALE);
+    assert_eq!(e.capital(&alice), 60 * POS_SCALE);
+    assert_eq!(e.spl(&alice), 940 * POS_SCALE);
+    e.check("t1-wdr40");
+
+    // Re-deposit $25 -> $85
+    e.deposit(&alice, 25 * POS_SCALE);
+    assert_eq!(e.capital(&alice), 85 * POS_SCALE);
+    assert_eq!(e.spl(&alice), 915 * POS_SCALE);
+    e.check("t1-redep25");
+
+    // Full withdraw $85 -> back to exact initial SPL balance
+    e.withdraw_all(&alice);
+    assert_eq!(e.capital(&alice), 0);
+    assert_eq!(e.spl(&alice), alice.init_spl);
+    assert_eq!(token_amount(&e.svm, &e.dex_vault), 0);
+    e.check("t1-wdr-all");
+
+    // Close empty portfolio and reclaim lamports
+    let dest = Keypair::new().pubkey();
+    let lam_before = e.svm.get_account(&alice.pfl).unwrap().lamports;
+    send_ok(
+        &mut e.svm,
+        ix_close_account(e.prog_id, alice.pfl, alice.kp.pubkey(), dest),
+        &e.payer,
+        &[&e.payer, &alice.kp],
+    );
+    assert_eq!(e.svm.get_account(&dest).unwrap().lamports, lam_before);
+}
+
+/// 2. Boring Long vs Short profit & loss with 10 bps trading fee and full SPL withdrawal.
+pub fn test_boring_simple_long_short_profit_and_loss(elf: &[u8]) {
+    let mut e = BoringEnv::new(elf);
+    let btc = e.create_market(100 * POS_SCALE, 10, 1000, 500, 100, 10, 400);
+    let alice = e.create_trader(1_000 * POS_SCALE, 100 * POS_SCALE);
+    let bob = e.create_trader(1_000 * POS_SCALE, 100 * POS_SCALE);
+
+    // Open 2 BTC @ $100 -> notional $200, 10 bps fee = $0.20 each ($0.40 total routed to market insurance!)
+    e.trade(btc, &alice, &bob, 0, 2 * POS_SCALE);
+    assert_eq!(e.oi_long(btc), 2 * POS_SCALE);
+    assert_eq!(e.capital(&alice), 99_800_000);
+    assert_eq!(e.capital(&bob), 99_800_000);
+    assert_eq!(read_u64(&e.svm, &btc, 224), 400_000); // market insurance = $0.40
+    e.check("t2-open");
+
+    // Rally $100 -> $103 (+$6 Long, -$6 Short)
+    e.update_oracle(btc, 103 * POS_SCALE, 0, 0);
+
+    // Close 2 BTC @ $103 (risk-reducing closes are fee-free!)
+    e.trade(btc, &alice, &bob, 1, 2 * POS_SCALE);
+    assert_eq!(e.oi_long(btc), 0);
+    let _ = send_ixs_try(&mut e.svm, &[ix_refresh_leg(e.prog_id, e.dex, btc, alice.pfl, false)], &e.payer, &[&e.payer]);
+    e.check("t2-close");
+
+    // Exact micro-USDC accounting:
+    // Alice: $100 - $0.20 (open fee) + $6.00 = $105.80
+    // Bob:   $100 - $0.20 (open fee) - $6.00 = $93.80
+    // Insurance: $0.40
+    assert_eq!(e.capital(&alice), 105_800_000);
+    assert_eq!(e.capital(&bob), 93_800_000);
+    assert_eq!(read_u64(&e.svm, &btc, 224), 400_000);
+
+    e.withdraw_all(&alice);
+    e.withdraw_all(&bob);
+    assert_eq!(e.spl(&alice), alice.init_spl + 5_800_000);
+    assert_eq!(e.spl(&bob), bob.init_spl - 6_200_000);
+    assert_eq!(token_amount(&e.svm, &e.dex_vault), 400_000); // exact retained insurance
+    e.check("t2-final");
+}
+
+/// 3. Boring scale-in (+1 -> +3 BTC) and multi-step partial closes (3 -> 2 -> 1 -> 0 BTC).
+pub fn test_boring_scale_in_and_partial_closes(elf: &[u8]) {
+    let mut e = BoringEnv::new(elf);
+    let btc = e.create_market(100 * POS_SCALE, 10, 1000, 500, 100, 0, 400);
+    let alice = e.create_trader(1_000 * POS_SCALE, 200 * POS_SCALE);
+    let bob = e.create_trader(1_000 * POS_SCALE, 200 * POS_SCALE);
+
+    // Open 1 BTC @ $100
+    e.trade(btc, &alice, &bob, 0, 1 * POS_SCALE);
+    assert_eq!(e.oi_long(btc), 1 * POS_SCALE);
+
+    // $100 -> $102 (+$2 on 1 BTC), scale in +2 BTC (now 3 BTC)
+    e.update_oracle(btc, 102 * POS_SCALE, 0, 0);
+    e.trade(btc, &alice, &bob, 0, 2 * POS_SCALE);
+    assert_eq!(e.oi_long(btc), 3 * POS_SCALE);
+    e.check("t3-scale-in");
+
+    // $102 -> $105 (+$3 * 3 = +$9), partial close 1 BTC (now 2 BTC)
+    e.update_oracle(btc, 105 * POS_SCALE, 0, 0);
+    e.trade(btc, &alice, &bob, 1, 1 * POS_SCALE);
+    assert_eq!(e.oi_long(btc), 2 * POS_SCALE);
+    e.check("t3-close1");
+
+    // $105 -> $101 (-$4 * 2 = -$8), partial close 1 BTC (now 1 BTC)
+    e.update_oracle(btc, 101 * POS_SCALE, 0, 0);
+    e.trade(btc, &alice, &bob, 1, 1 * POS_SCALE);
+    assert_eq!(e.oi_long(btc), 1 * POS_SCALE);
+    e.check("t3-close2");
+
+    // $101 -> $104 (+$3 * 1 = +$3), close final 1 BTC (now 0 BTC)
+    e.update_oracle(btc, 104 * POS_SCALE, 0, 0);
+    e.trade(btc, &alice, &bob, 1, 1 * POS_SCALE);
+    assert_eq!(e.oi_long(btc), 0);
+
+    // Refresh both to sweep any remaining realized posPnl into capital
+    let _ = send_ixs_try(&mut e.svm, &[ix_refresh_leg(e.prog_id, e.dex, btc, alice.pfl, false)], &e.payer, &[&e.payer]);
+    let _ = send_ixs_try(&mut e.svm, &[ix_refresh_leg(e.prog_id, e.dex, btc, bob.pfl, false)], &e.payer, &[&e.payer]);
+    e.check("t3-flat");
+
+    // Net PnL = +2 + 9 - 8 + 3 = +$6.00 exact!
+    assert_eq!(e.capital(&alice), 206 * POS_SCALE);
+    assert_eq!(e.capital(&bob), 194 * POS_SCALE);
+
+    e.withdraw_all(&alice);
+    e.withdraw_all(&bob);
+    assert_eq!(e.spl(&alice), alice.init_spl + 6 * POS_SCALE);
+    assert_eq!(e.spl(&bob), bob.init_spl - 6 * POS_SCALE);
+    assert_eq!(token_amount(&e.svm, &e.dex_vault), 0);
+    e.check("t3-final");
+}
+
+/// 4. Boring position flip: Alice Long 2 BTC (+$8) -> flat -> Short 3 BTC (+$12) = +$20 exact.
+pub fn test_boring_position_flip_long_to_short(elf: &[u8]) {
+    let mut e = BoringEnv::new(elf);
+    let btc = e.create_market(100 * POS_SCALE, 10, 1000, 500, 100, 0, 400);
+    let alice = e.create_trader(1_000 * POS_SCALE, 200 * POS_SCALE);
+    let bob = e.create_trader(1_000 * POS_SCALE, 200 * POS_SCALE);
+
+    // Phase 1: Alice Long 2 BTC @ $100 -> close @ $104 (+$8)
+    e.trade(btc, &alice, &bob, 0, 2 * POS_SCALE);
+    e.update_oracle(btc, 104 * POS_SCALE, 0, 0);
+    e.trade(btc, &alice, &bob, 1, 2 * POS_SCALE);
+    let _ = send_ixs_try(&mut e.svm, &[ix_refresh_leg(e.prog_id, e.dex, btc, alice.pfl, false)], &e.payer, &[&e.payer]);
+    assert_eq!(e.capital(&alice), 208 * POS_SCALE);
+    assert_eq!(e.capital(&bob), 192 * POS_SCALE);
+    e.check("t4-phase1");
+
+    // Phase 2: Flip! Bob Long 3 BTC / Alice Short 3 BTC @ $104 -> close @ $100 (+$12 for Alice)
+    e.trade(btc, &bob, &alice, 0, 3 * POS_SCALE);
+    e.update_oracle(btc, 100 * POS_SCALE, 0, 0);
+    e.trade(btc, &bob, &alice, 1, 3 * POS_SCALE);
+    let _ = send_ixs_try(&mut e.svm, &[ix_refresh_leg(e.prog_id, e.dex, btc, alice.pfl, false)], &e.payer, &[&e.payer]);
+    assert_eq!(e.oi_long(btc), 0);
+    assert_eq!(e.capital(&alice), 220 * POS_SCALE);
+    assert_eq!(e.capital(&bob), 180 * POS_SCALE);
+    e.check("t4-phase2");
+
+    e.withdraw_all(&alice);
+    e.withdraw_all(&bob);
+    assert_eq!(e.spl(&alice), alice.init_spl + 20 * POS_SCALE);
+    assert_eq!(e.spl(&bob), bob.init_spl - 20 * POS_SCALE);
+    assert_eq!(token_amount(&e.svm, &e.dex_vault), 0);
+    e.check("t4-final");
+}
+
+/// 5. Boring bid/ask `execPrice` spread fills & clamp rejections (`Custom(130)`).
+pub fn test_boring_exec_price_bid_ask_spread(elf: &[u8]) {
+    let mut e = BoringEnv::new(elf);
+    // maxMoveBps = 200 (2% -> [$98, $102] valid execPrice band at $100 mark)
+    let btc = e.create_market(100 * POS_SCALE, 10, 1000, 500, 100, 0, 200);
+    let taker = e.create_trader(1_000 * POS_SCALE, 100 * POS_SCALE);
+    let maker = e.create_trader(1_000 * POS_SCALE, 100 * POS_SCALE);
+
+    // Out-of-clamp execPrice ($102.50 > $102, $97.50 < $98) rejected with ExecPriceClamp (130)
+    send_err_custom(
+        &mut e.svm,
+        ix_trade_ext(e.prog_id, e.dex, btc, taker.pfl, taker.kp.pubkey(), maker.pfl, maker.kp.pubkey(), 0, 2 * POS_SCALE, 102_500_000),
+        &e.payer,
+        &[&e.payer, &taker.kp, &maker.kp],
+        130,
+        "execPrice above clamp",
+    );
+    send_err_custom(
+        &mut e.svm,
+        ix_trade_ext(e.prog_id, e.dex, btc, taker.pfl, taker.kp.pubkey(), maker.pfl, maker.kp.pubkey(), 0, 2 * POS_SCALE, 97_500_000),
+        &e.payer,
+        &[&e.payer, &taker.kp, &maker.kp],
+        130,
+        "execPrice below clamp",
+    );
+
+    // Taker buys 2 BTC at ask $100.50 (+$0.50 spread -> Taker pays $1.00 directly to Maker)
+    e.trade_ext(btc, &taker, &maker, 0, 2 * POS_SCALE, 100_500_000);
+    assert_eq!(e.capital(&taker), 99 * POS_SCALE);
+    assert_eq!(e.capital(&maker), 101 * POS_SCALE);
+    e.check("t5-open-spread");
+
+    // Taker closes 2 BTC crossing spread at $100.50 (paying $1.00 to Maker again; or at $99.50 Maker pays Taker $1.00)
+    e.trade_ext(btc, &taker, &maker, 1, 2 * POS_SCALE, 100_500_000);
+    assert_eq!(e.capital(&taker), 98 * POS_SCALE);
+    assert_eq!(e.capital(&maker), 102 * POS_SCALE);
+    assert_eq!(e.oi_long(btc), 0);
+    e.check("t5-close-spread");
+
+    // Also verify execPrice < markP ($99.50) pays Short -> Long ($1.00)
+    e.trade_ext(btc, &taker, &maker, 0, 2 * POS_SCALE, 99_500_000);
+    assert_eq!(e.capital(&taker), 99 * POS_SCALE);
+    assert_eq!(e.capital(&maker), 101 * POS_SCALE);
+    e.trade_ext(btc, &taker, &maker, 1, 2 * POS_SCALE, 100 * POS_SCALE);
+    e.check("t5-final");
+}
+
+/// 6. Boring funding rates: 3 slots positive (longs pay shorts) + 2 slots negative (shorts pay longs).
+pub fn test_boring_funding_rate_longs_pay_shorts_and_reverse(elf: &[u8]) {
+    let mut e = BoringEnv::new(elf);
+    let btc = e.create_market(100 * POS_SCALE, 10, 1000, 500, 100, 0, 400);
+    let alice = e.create_trader(1_000 * POS_SCALE, 100 * POS_SCALE);
+    let bob = e.create_trader(1_000 * POS_SCALE, 100 * POS_SCALE);
+
+    e.trade(btc, &alice, &bob, 0, 2 * POS_SCALE);
+
+    // 3 slots positive funding: $0.25/BTC/slot (fundSign=0 -> Long pays Short): 3 * 0.25 * 2 = $1.50
+    for _ in 0..3 {
+        e.update_oracle(btc, 100 * POS_SCALE, 0, 250_000);
+    }
+    // 2 slots negative funding: $0.20/BTC/slot (fundSign=1 -> Short pays Long): 2 * 0.20 * 2 = $0.80
+    for _ in 0..2 {
+        e.update_oracle(btc, 100 * POS_SCALE, 1, 200_000);
+    }
+
+    // Close 2 BTC and refresh both -> net transfer = $1.50 - $0.80 = $0.70 from Alice to Bob!
+    e.trade(btc, &alice, &bob, 1, 2 * POS_SCALE);
+    let _ = send_ixs_try(&mut e.svm, &[ix_refresh_leg(e.prog_id, e.dex, btc, alice.pfl, false)], &e.payer, &[&e.payer]);
+    let _ = send_ixs_try(&mut e.svm, &[ix_refresh_leg(e.prog_id, e.dex, btc, bob.pfl, false)], &e.payer, &[&e.payer]);
+    e.check("t6-closed");
+
+    assert_eq!(e.capital(&alice), 99_300_000);
+    assert_eq!(e.capital(&bob), 100_700_000);
+
+    e.withdraw_all(&alice);
+    e.withdraw_all(&bob);
+    assert_eq!(e.spl(&alice), alice.init_spl - 700_000);
+    assert_eq!(e.spl(&bob), bob.init_spl + 700_000);
+    assert_eq!(token_amount(&e.svm, &e.dex_vault), 0);
+    e.check("t6-final");
+}
+
+/// 7. Boring multi-trader exit order permutations:
+///    5 traders (Longs: Alice 2, Carol 3, Eve 1 vs Shorts: Bob 4, Dave 2) @ $100 -> $104.
+///    Runs 3 distinct exit orderings (winners-first, reverse/smallest-first, and L->L / S->S hand-offs)
+///    and asserts ALL 5 traders receive IDENTICAL final micro-USDC SPL balances across every ordering!
+pub fn test_boring_exit_orders_permutations(elf: &[u8]) {
+    let run_order = |order_kind: u8| -> [u64; 5] {
+        let mut e = BoringEnv::new(elf);
+        let btc = e.create_market(100 * POS_SCALE, 10, 1000, 500, 100, 0, 400);
+        let alice = e.create_trader(1_000 * POS_SCALE, 100 * POS_SCALE);
+        let carol = e.create_trader(1_000 * POS_SCALE, 100 * POS_SCALE);
+        let eve   = e.create_trader(1_000 * POS_SCALE, 100 * POS_SCALE);
+        let bob   = e.create_trader(1_000 * POS_SCALE, 100 * POS_SCALE);
+        let dave  = e.create_trader(1_000 * POS_SCALE, 100 * POS_SCALE);
+
+        // Open identical positions: Longs (Alice 2, Carol 3, Eve 1) vs Shorts (Bob 4, Dave 2)
+        e.trade(btc, &alice, &bob,  0, 2 * POS_SCALE);
+        e.trade(btc, &carol, &bob,  0, 2 * POS_SCALE);
+        e.trade(btc, &carol, &dave, 0, 1 * POS_SCALE);
+        e.trade(btc, &eve,   &dave, 0, 1 * POS_SCALE);
+        assert_eq!(e.oi_long(btc), 6 * POS_SCALE);
+        e.check("t7-opened");
+
+        // Price moves $100 -> $104 (+$4/BTC)
+        e.update_oracle(btc, 104 * POS_SCALE, 0, 0);
+
+        match order_kind {
+            0 => {
+                // Order A: Biggest winners exit first (Carol 3 -> Alice 2 -> Eve 1)
+                e.trade(btc, &carol, &bob,  1, 3 * POS_SCALE);
+                e.check("t7-A-1");
+                e.trade(btc, &alice, &dave, 1, 2 * POS_SCALE);
+                e.check("t7-A-2");
+                e.trade(btc, &eve,   &bob,  1, 1 * POS_SCALE);
+                e.check("t7-A-3");
+            }
+            1 => {
+                // Order B: Reverse / smallest-first fragmented closes
+                e.trade(btc, &eve,   &dave, 1, 1 * POS_SCALE);
+                e.check("t7-B-1");
+                e.trade(btc, &alice, &dave, 1, 1 * POS_SCALE);
+                e.check("t7-B-2");
+                e.trade(btc, &alice, &bob,  1, 1 * POS_SCALE);
+                e.check("t7-B-3");
+                e.trade(btc, &carol, &bob,  1, 3 * POS_SCALE);
+                e.check("t7-B-4");
+            }
+            _ => {
+                // Order C: Same-side hand-offs (`mode=2` L->L & `mode=3` S->S) before closing!
+                // Eve hands off Long(1) to Alice (mode=2: exiting=Eve, incoming=Alice)
+                e.trade(btc, &eve, &alice, 2, 1 * POS_SCALE);
+                assert_eq!(e.oi_long(btc), 6 * POS_SCALE, "L->L handoff preserves OI");
+                e.check("t7-C-handoff-L");
+                // Dave hands off Short(2) to Bob (mode=3: exiting=Dave, incoming=Bob)
+                e.trade(btc, &dave, &bob, 3, 2 * POS_SCALE);
+                assert_eq!(e.oi_long(btc), 6 * POS_SCALE, "S->S handoff preserves OI");
+                e.check("t7-C-handoff-S");
+                // Now Alice holds Long(3), Carol holds Long(3), Bob holds Short(6)
+                e.trade(btc, &alice, &bob, 1, 3 * POS_SCALE);
+                e.check("t7-C-close1");
+                e.trade(btc, &carol, &bob, 1, 3 * POS_SCALE);
+                e.check("t7-C-close2");
+            }
+        }
+
+        assert_eq!(e.oi_long(btc), 0);
+        // Settle any remaining posPnl on all 5 portfolios (order-independent!)
+        for t in [&alice, &carol, &eve, &bob, &dave] {
+            let _ = send_ixs_try(&mut e.svm, &[ix_refresh_leg(e.prog_id, e.dex, btc, t.pfl, false)], &e.payer, &[&e.payer]);
+        }
+        e.check("t7-settled");
+
+        // Withdraw 100% of every trader's capital to SPL
+        for t in [&alice, &carol, &eve, &bob, &dave] {
+            e.withdraw_all(t);
+        }
+        assert_eq!(token_amount(&e.svm, &e.dex_vault), 0, "Vault must drain to exact 0");
+        e.check("t7-drained");
+
+        [e.spl(&alice), e.spl(&carol), e.spl(&eve), e.spl(&bob), e.spl(&dave)]
+    };
+
+    let res_a = run_order(0);
+    let res_b = run_order(1);
+    let res_c = run_order(2);
+
+    let expected = [
+        1_008 * POS_SCALE, // Alice (+$8)
+        1_012 * POS_SCALE, // Carol (+$12)
+        1_004 * POS_SCALE, // Eve   (+$4)
+        984 * POS_SCALE,   // Bob   (-$16)
+        992 * POS_SCALE,   // Dave  (-$8)
+    ];
+    assert_eq!(res_a, expected, "Order A exact SPL balances");
+    assert_eq!(res_b, expected, "Order B must match Order A bit-for-bit!");
+    assert_eq!(res_c, expected, "Order C (with L->L & S->S handoffs) must match Order A bit-for-bit!");
+}
+
+/// 8. Boring partial liquidation (restores health) followed by full liquidation (0 bad debt, 0 ADL).
+pub fn test_boring_partial_and_full_liquidation_normal(elf: &[u8]) {
+    let mut e = BoringEnv::new(elf);
+    // im = 10%, mm = 5%, liqFee = 1%, maxMove = 4%
+    let btc = e.create_market(100 * POS_SCALE, 10, 1000, 500, 100, 0, 400);
+    let alice = e.create_trader(1_000 * POS_SCALE, 15 * POS_SCALE);
+    let bob = e.create_trader(1_000 * POS_SCALE, 200 * POS_SCALE);
+    let keeper_tok = create_tok_acc(&mut e.svm, &e.mint, &e.payer.pubkey(), 0);
+
+    // Open 1 BTC @ $100 (IM = $10, MM = $5; Alice has $15)
+    e.trade(btc, &alice, &bob, 0, 1 * POS_SCALE);
+
+    // Healthy position cannot be liquidated -> PositionHealthy (116)
+    send_err_custom(
+        &mut e.svm,
+        ix_liquidate_ext(e.prog_id, e.dex, btc, alice.pfl, keeper_tok, e.mint, e.dex_vault, TOKEN_PROGRAM_ID, 0, 0, None),
+        &e.payer,
+        &[&e.payer],
+        116,
+        "healthy position liquidation rejected",
+    );
+
+    // Price drops $100 -> $96 -> $93 -> $90 -> $89 (each step <= 4% maxMoveBps; equity = $4.00 < MM $4.45!)
+    e.update_oracle(btc, 96 * POS_SCALE, 0, 0);
+    e.update_oracle(btc, 93 * POS_SCALE, 0, 0);
+    e.update_oracle(btc, 90 * POS_SCALE, 0, 0);
+    e.update_oracle(btc, 89 * POS_SCALE, 0, 0);
+
+    // Partial liquidation of 0.5 BTC (`mode=0, req_qty=500_000`)
+    send_ok(
+        &mut e.svm,
+        ix_liquidate_ext(e.prog_id, e.dex, btc, alice.pfl, keeper_tok, e.mint, e.dex_vault, TOKEN_PROGRAM_ID, 0, 500_000, None),
+        &e.payer,
+        &[&e.payer],
+    );
+    assert_eq!(e.oi_long(btc), 500_000, "Partial liquidation leaves 0.5 BTC open");
+    // Keeper earned exact 1% fee on 0.5 BTC @ $89 = ceil(44.50 * 100 / 10000) = $0.445
+    assert_eq!(token_amount(&e.svm, &keeper_tok), 445_000);
+    // Alice remaining capital = $4.00 - $0.445 = $3.555 > new MM (0.5 * $89 * 5% = $2.225)!
+    assert_eq!(e.capital(&alice), 3_555_000);
+    // In fallback mode=0 (no takeover counterparty), Bob's effective Short scales cleanly 1.0 -> 0.5 at $89 with 0 bad debt!
+    assert_eq!(read_u64(&e.svm, &btc, 296), 500_000_000);
+    e.check("t8-partial-liq");
+
+    // Partial liquidation restored health -> another liquidation at $89 is REJECTED (116)!
+    send_err_custom(
+        &mut e.svm,
+        ix_liquidate_ext(e.prog_id, e.dex, btc, alice.pfl, keeper_tok, e.mint, e.dex_vault, TOKEN_PROGRAM_ID, 0, 0, None),
+        &e.payer,
+        &[&e.payer],
+        116,
+        "healthy after partial liquidation",
+    );
+
+    // Further drop $89 -> $86 -> $85: Alice equity = $3.555 - (0.5 * $4) = $1.555 < MM (0.5 * $85 * 5% = $2.125)!
+    e.update_oracle(btc, 86 * POS_SCALE, 0, 0);
+    e.update_oracle(btc, 85 * POS_SCALE, 0, 0);
+
+    // Full liquidation (`req_qty = 0`)
+    send_ok(
+        &mut e.svm,
+        ix_liquidate_ext(e.prog_id, e.dex, btc, alice.pfl, keeper_tok, e.mint, e.dex_vault, TOKEN_PROGRAM_ID, 0, 0, None),
+        &e.payer,
+        &[&e.payer],
+    );
+    assert_eq!(e.oi_long(btc), 0, "Full liquidation closes remaining 0.5 BTC");
+
+    // Bob clears dead leg and collects 100% of his profit ($11 on 1 BTC + $2 on 0.5 BTC = $13 total, 0 bad debt!)
+    send_ok(&mut e.svm, ix_clear_dead_leg(e.prog_id, e.dex, btc, bob.pfl), &e.payer, &[&e.payer]);
+    assert_eq!(e.capital(&bob), 213 * POS_SCALE, "Bob collects 100% of profit ($13)");
+    // Alice withdraws leftover margin ($1.555 - $0.425 liq fee = $1.130)
+    assert_eq!(e.capital(&alice), 1_130_000);
+    e.withdraw_all(&alice);
+    e.withdraw_all(&bob);
+    assert_eq!(token_amount(&e.svm, &e.dex_vault), 0);
+    e.check("t8-final");
+}
+
+/// 9. Boring HLP-style liquidation takeover (`mode=1`):
+///    HLP takes over Alice's underwater Long 2 BTC; OI/rawBasis/ADL are bit-for-bit invariant,
+///    Bob's Short is 100% untouched, HLP collects bonus and exits cleanly on rebound!
+pub fn test_boring_liquidation_takeover_hlp_style(elf: &[u8]) {
+    let mut e = BoringEnv::new(elf);
+    let btc = e.create_market(100 * POS_SCALE, 10, 1000, 500, 100, 0, 400);
+    let alice = e.create_trader(1_000 * POS_SCALE, 25 * POS_SCALE);
+    let bob   = e.create_trader(1_000 * POS_SCALE, 200 * POS_SCALE);
+    let hlp   = e.create_trader(1_000 * POS_SCALE, 500 * POS_SCALE);
+    let liq_tok = create_tok_acc(&mut e.svm, &e.mint, &hlp.kp.pubkey(), 0);
+
+    // Alice Long 2 BTC vs Bob Short 2 BTC @ $100
+    e.trade(btc, &alice, &bob, 0, 2 * POS_SCALE);
+    // Drop $100 -> $96 -> $93 -> $92 (each step <= 4%): Alice equity = $25 - $16 = $9.00 < MM (2 * $92 * 5% = $9.20)
+    e.update_oracle(btc, 96 * POS_SCALE, 0, 0);
+    e.update_oracle(btc, 93 * POS_SCALE, 0, 0);
+    e.update_oracle(btc, 92 * POS_SCALE, 0, 0);
+
+    let oi_l_pre = read_u64(&e.svm, &btc, 256);
+    let oi_s_pre = read_u64(&e.svm, &btc, 264);
+    let rl_pre   = read_u64(&e.svm, &btc, 272);
+    let rs_pre   = read_u64(&e.svm, &btc, 280);
+    let adll_pre = read_u64(&e.svm, &btc, 288);
+    let adls_pre = read_u64(&e.svm, &btc, 296);
+
+    // HLP executes full takeover (`mode=1, req_qty=0`) — fair gradual fee charges only feeFloor = maxFee/4 = $0.46!
+    send_ok(
+        &mut e.svm,
+        ix_liquidate_ext(
+            e.prog_id, e.dex, btc, alice.pfl, liq_tok, e.mint, e.dex_vault, TOKEN_PROGRAM_ID,
+            1, 0, Some((hlp.pfl, hlp.kp.pubkey())),
+        ),
+        &e.payer,
+        &[&e.payer, &hlp.kp],
+    );
+
+    // ALL market OI / rawBasis / ADL fields must be BIT-FOR-BIT INVARIANT!
+    assert_eq!(read_u64(&e.svm, &btc, 256), oi_l_pre);
+    assert_eq!(read_u64(&e.svm, &btc, 264), oi_s_pre);
+    assert_eq!(read_u64(&e.svm, &btc, 272), rl_pre);
+    assert_eq!(read_u64(&e.svm, &btc, 280), rs_pre);
+    assert_eq!(read_u64(&e.svm, &btc, 288), adll_pre);
+    assert_eq!(read_u64(&e.svm, &btc, 296), adls_pre);
+    // Gradual deficit-scaled liq fee: deficit=$0.20 < feeFloor=maxFee/4=$0.46 -> HLP gets $0.46, Alice keeps $8.54!
+    assert_eq!(token_amount(&e.svm, &liq_tok), 460_000);
+    assert_eq!(e.capital(&alice), 9_000_000 - 460_000);
+    e.check("t9-takeover");
+
+    // Price rebounds $92 -> $95 (+$6 for HLP, -$6 for Bob): HLP closes full 2 BTC vs Bob!
+    e.update_oracle(btc, 95 * POS_SCALE, 0, 0);
+    e.trade(btc, &hlp, &bob, 1, 2 * POS_SCALE);
+    let _ = send_ixs_try(&mut e.svm, &[ix_refresh_leg(e.prog_id, e.dex, btc, hlp.pfl, false)], &e.payer, &[&e.payer]);
+    let _ = send_ixs_try(&mut e.svm, &[ix_refresh_leg(e.prog_id, e.dex, btc, bob.pfl, false)], &e.payer, &[&e.payer]);
+    assert_eq!(e.oi_long(btc), 0);
+    assert_eq!(e.capital(&hlp), 506 * POS_SCALE, "HLP earns +$6 rebound PnL on full 2 BTC takeover");
+    assert_eq!(e.capital(&bob), 210 * POS_SCALE, "Bob earns net +$10 ($100 -> $95 on 2 BTC Short)");
+    e.withdraw_all(&alice);
+    e.withdraw_all(&bob);
+    e.withdraw_all(&hlp);
+    assert_eq!(token_amount(&e.svm, &e.dex_vault), 0);
+    e.check("t9-final");
+}
+
+/// 10. Boring cross-margin multi-market offsetting (BTC + ETH) & instant realized-profit reuse!
+pub fn test_boring_cross_margin_btc_eth_offset_and_profit_reuse(elf: &[u8]) {
+    let mut e = BoringEnv::new(elf);
+    let btc = e.create_market(100 * POS_SCALE, 10, 1000, 500, 100, 0, 400);
+    let eth = e.create_market(100 * POS_SCALE, 10, 1000, 500, 100, 0, 400);
+    let sol = e.create_market(100 * POS_SCALE, 10, 1000, 500, 100, 0, 400);
+    let alice = e.create_trader(1_000 * POS_SCALE, 50 * POS_SCALE);
+    let bob   = e.create_trader(1_000 * POS_SCALE, 500 * POS_SCALE);
+
+    // Alice opens Long 1 BTC @ $100 AND Short 1 ETH @ $100 in ONE shared portfolio
+    e.trade(btc, &alice, &bob, 0, 1 * POS_SCALE);
+    e.trade(eth, &bob, &alice, 0, 1 * POS_SCALE);
+    assert_eq!(read_u64(&e.svm, &alice.pfl, 104), 20 * POS_SCALE); // totalIm = $20
+    e.check("t10-opened");
+
+    // Correlated move: BTC -> $104 (+$4), ETH -> $104 (-$4)
+    e.update_oracle(btc, 104 * POS_SCALE, 0, 0);
+    e.update_oracle(eth, 104 * POS_SCALE, 0, 0);
+    // Refresh Bob on BTC (funds realizedPool with $4) and Alice on both legs
+    e.refresh(btc, &bob);
+    e.refresh(btc, &alice);
+    e.refresh(eth, &alice);
+    assert_eq!(e.capital(&alice), 50 * POS_SCALE, "Correlated BTC (+$4) & ETH (-$4) net to exact $50");
+    e.check("t10-offset");
+
+    // BTC rallies further $104 -> $108 -> $112 -> $116 (+$12 more!) while ETH stays $104
+    for p in [108, 112, 116] {
+        e.update_oracle(btc, p * POS_SCALE, 0, 0);
+    }
+    e.refresh(btc, &bob);
+    e.refresh(btc, &alice);
+    // Alice's +$12 BTC profit auto-realized into shared capital WITHOUT closing BTC!
+    assert_eq!(e.capital(&alice), 62 * POS_SCALE, "BTC profit auto-realized straight into shared capital");
+
+    // Alice immediately reuses her realized profit to open a 3rd leg (Long 1 SOL @ $100) in ONE atomic bundle!
+    let open_sol_ixs = vec![
+        ix_refresh_leg(e.prog_id, e.dex, btc, alice.pfl, false),
+        ix_refresh_leg(e.prog_id, e.dex, eth, alice.pfl, false),
+        ix_refresh_leg(e.prog_id, e.dex, btc, bob.pfl, false),
+        ix_refresh_leg(e.prog_id, e.dex, eth, bob.pfl, false),
+        ix_trade(e.prog_id, e.dex, sol, alice.pfl, alice.kp.pubkey(), bob.pfl, bob.kp.pubkey(), 0, 1 * POS_SCALE),
+    ];
+    send_ixs_ok(&mut e.svm, &open_sol_ixs, &e.payer, &[&e.payer, &alice.kp, &bob.kp]);
+    assert_eq!(read_u8(&e.svm, &alice.pfl, 4), 3, "Alice now holds 3 active legs");
+    // totalIm = 10%*(116 + 104 + 100) = $32.00; capital = $62.00 -> Alice can withdraw $30.00 excess right now!
+    let wdr_ixs = vec![
+        ix_refresh_leg(e.prog_id, e.dex, btc, alice.pfl, false),
+        ix_refresh_leg(e.prog_id, e.dex, eth, alice.pfl, false),
+        ix_refresh_leg(e.prog_id, e.dex, sol, alice.pfl, false),
+        ix_withdraw_collateral(
+            e.prog_id, e.dex, alice.pfl, alice.kp.pubkey(), alice.tok, e.mint, e.dex_vault, TOKEN_PROGRAM_ID, 30 * POS_SCALE,
+        ),
+    ];
+    send_ixs_ok(&mut e.svm, &wdr_ixs, &e.payer, &[&e.payer, &alice.kp]);
+    assert_eq!(e.capital(&alice), 32 * POS_SCALE);
+    assert_eq!(e.spl(&alice), alice.init_spl - 20 * POS_SCALE); // deposited $50, withdrew $30 while keeping all 3 positions!
+    e.check("t10-final");
+}
+
+/// 11. Boring withdrawal margin checks (`totalIm`), same-slot freshness (`Custom(122)`), & flat withdraw.
+pub fn test_boring_withdraw_margin_checks_and_freshness(elf: &[u8]) {
+    let mut e = BoringEnv::new(elf);
+    let btc = e.create_market(100 * POS_SCALE, 10, 1000, 500, 100, 0, 400);
+    let alice = e.create_trader(1_000 * POS_SCALE, 100 * POS_SCALE);
+    let bob   = e.create_trader(1_000 * POS_SCALE, 100 * POS_SCALE);
+
+    // Open Long 1 BTC @ $100 -> totalIm = $10
+    e.trade(btc, &alice, &bob, 0, 1 * POS_SCALE);
+
+    // Trying to withdraw $91 (leaving $9 < $10 totalIm) -> REJECTED InsufficientMargin (107)
+    send_err_custom(
+        &mut e.svm,
+        ix_withdraw_collateral(
+            e.prog_id, e.dex, alice.pfl, alice.kp.pubkey(), alice.tok, e.mint, e.dex_vault, TOKEN_PROGRAM_ID, 91 * POS_SCALE,
+        ),
+        &e.payer,
+        &[&e.payer, &alice.kp],
+        107,
+        "withdraw below totalIm rejected",
+    );
+
+    // Withdrawing $90 (leaving exact $10 == totalIm) in same slot -> SUCCEEDS!
+    e.withdraw(&alice, 90 * POS_SCALE);
+    assert_eq!(e.capital(&alice), 10 * POS_SCALE);
+    e.check("t11-wdr-at-im");
+
+    // Re-deposit $5 and advance 1 slot -> leg is now stale
+    e.deposit(&alice, 5 * POS_SCALE);
+    e.advance_slot(1);
+
+    // Bare Withdraw without RefreshLeg -> REJECTED StalePortfolioLeg (122)
+    send_err_custom(
+        &mut e.svm,
+        ix_withdraw_collateral(
+            e.prog_id, e.dex, alice.pfl, alice.kp.pubkey(), alice.tok, e.mint, e.dex_vault, TOKEN_PROGRAM_ID, 5 * POS_SCALE,
+        ),
+        &e.payer,
+        &[&e.payer, &alice.kp],
+        122,
+        "stale withdraw rejected",
+    );
+
+    // Atomic [RefreshLeg, Withdraw] -> SUCCEEDS!
+    send_ixs_ok(
+        &mut e.svm,
+        &[
+            ix_refresh_leg(e.prog_id, e.dex, btc, alice.pfl, false),
+            ix_withdraw_collateral(
+                e.prog_id, e.dex, alice.pfl, alice.kp.pubkey(), alice.tok, e.mint, e.dex_vault, TOKEN_PROGRAM_ID, 5 * POS_SCALE,
+            ),
+        ],
+        &e.payer,
+        &[&e.payer, &alice.kp],
+    );
+    assert_eq!(e.capital(&alice), 10 * POS_SCALE);
+
+    // Close position (flat, legCount == 0), advance 5 slots -> bare Withdraw works with NO RefreshLeg!
+    e.trade(btc, &alice, &bob, 1, 1 * POS_SCALE);
+    e.advance_slot(5);
+    e.withdraw_all(&alice);
+    assert_eq!(e.capital(&alice), 0);
+    assert_eq!(e.spl(&alice), alice.init_spl);
+    e.check("t11-final");
+}
+
+/// 12. Boring external `matcher.so` AMM single-signer fills (two takers + LP withdrawal).
+pub fn test_boring_matcher_amm_single_signer_fills(elf: &[u8], matcher_elf: &[u8]) {
+    let mut e = BoringEnv::new(elf);
+    let matcher_prog = Keypair::new().pubkey();
+    e.svm.add_program(matcher_prog, matcher_elf).expect("matcher ELF load failed");
+
+    let btc = e.create_market(100 * POS_SCALE, 10, 1000, 500, 100, 0, 400);
+    let lp_owner = Keypair::new();
+    e.svm.airdrop(&lp_owner.pubkey(), 10_000_000_000).unwrap();
+    let lp_tok = create_tok_acc(&mut e.svm, &e.mint, &lp_owner.pubkey(), 2_000 * POS_SCALE);
+
+    let mtch_cfg = create_prog_acc(&mut e.svm, &matcher_prog, 128);
+    let (lp_auth_pda, lp_bump) = Address::find_program_address(&[b"lpau", mtch_cfg.as_ref()], &matcher_prog);
+    let lp_pfl = create_prog_acc(&mut e.svm, &e.prog_id, PFL_SIZE);
+    e.portfolios.push(lp_pfl);
+
+    // InitMatcher: halfSpread=50bps, impact=10bps/unit, maxFill=10 BTC
+    let mut init_d = vec![0u8; 28];
+    init_d[0] = 0;
+    init_d[1] = lp_bump;
+    init_d[4..12].copy_from_slice(&50u64.to_le_bytes());
+    init_d[12..20].copy_from_slice(&10u64.to_le_bytes());
+    init_d[20..28].copy_from_slice(&(10 * POS_SCALE).to_le_bytes());
+    send_ok(
+        &mut e.svm,
+        Instruction {
+            program_id: matcher_prog,
+            accounts: vec![
+                AccountMeta::new(mtch_cfg, false),
+                AccountMeta::new_readonly(lp_owner.pubkey(), true),
+                AccountMeta::new(e.dex, false),
+                AccountMeta::new(lp_pfl, false),
+                AccountMeta::new_readonly(lp_auth_pda, false),
+                AccountMeta::new_readonly(e.prog_id, false),
+            ],
+            data: init_d,
+        },
+        &e.payer,
+        &[&e.payer, &lp_owner],
+    );
+    // Fund LP portfolio ($1,000) via permissionless DepositCollateral
+    send_ok(
+        &mut e.svm,
+        ix_deposit_collateral(e.prog_id, e.dex, lp_pfl, lp_owner.pubkey(), lp_tok, e.mint, e.dex_vault, TOKEN_PROGRAM_ID, 1_000 * POS_SCALE),
+        &e.payer,
+        &[&e.payer, &lp_owner],
+    );
+
+    let alice = e.create_trader(1_000 * POS_SCALE, 200 * POS_SCALE);
+    let carol = e.create_trader(1_000 * POS_SCALE, 200 * POS_SCALE);
+
+    let (dex_addr, prog_id) = (e.dex, e.prog_id);
+    let mk_fill = |t: &Trader, mode: u8, taker_is_long: u8, qty: u64, limit_p: u64| {
+        let mut d = vec![0u8; 19];
+        d[0] = 2;
+        d[1] = mode;
+        d[2] = taker_is_long;
+        d[3..11].copy_from_slice(&qty.to_le_bytes());
+        d[11..19].copy_from_slice(&limit_p.to_le_bytes());
+        Instruction {
+            program_id: matcher_prog,
+            accounts: vec![
+                AccountMeta::new_readonly(mtch_cfg, false),
+                AccountMeta::new(dex_addr, false),
+                AccountMeta::new(btc, false),
+                AccountMeta::new(lp_pfl, false),
+                AccountMeta::new_readonly(lp_auth_pda, false),
+                AccountMeta::new(t.pfl, false),
+                AccountMeta::new_readonly(t.kp.pubkey(), true),
+                AccountMeta::new_readonly(prog_id, false),
+            ],
+            data: d,
+        }
+    };
+
+    // Single-signer Alice opens Long 1 BTC vs passive LP (60 bps spread = $0.60!)
+    send_ok(&mut e.svm, mk_fill(&alice, 0, 1, 1 * POS_SCALE, 101 * POS_SCALE), &e.payer, &[&e.payer, &alice.kp]);
+    assert_eq!(read_u64(&e.svm, &lp_pfl, 88), 1_000_600_000);
+    assert_eq!(e.capital(&alice), 199_400_000);
+    e.check("t12-alice-open");
+
+    // Price moves $100 -> $102 (+$2 Alice, -$2 LP)
+    e.update_oracle(btc, 102 * POS_SCALE, 0, 0);
+
+    // Single-signer Alice closes Long 1 BTC vs passive LP (60 bps of $102 = $0.612)
+    send_ok(&mut e.svm, mk_fill(&alice, 1, 1, 1 * POS_SCALE, 103 * POS_SCALE), &e.payer, &[&e.payer, &alice.kp]);
+    // Single-signer Carol opens Short 1 BTC vs passive LP (60 bps of $102 = $0.612) and closes it
+    send_ok(&mut e.svm, mk_fill(&carol, 0, 0, 1 * POS_SCALE, 101 * POS_SCALE), &e.payer, &[&e.payer, &carol.kp]);
+    send_ok(&mut e.svm, mk_fill(&carol, 1, 0, 1 * POS_SCALE, 101 * POS_SCALE), &e.payer, &[&e.payer, &carol.kp]);
+    assert_eq!(e.oi_long(btc), 0);
+
+    // LP withdraws $500 via Matcher::WithdrawLp (op=3)
+    let mut wdr_d = vec![0u8; 9];
+    wdr_d[0] = 3;
+    wdr_d[1..9].copy_from_slice(&(500 * POS_SCALE).to_le_bytes());
+    let lp_tok_pre = token_amount(&e.svm, &lp_tok);
+    send_ok(
+        &mut e.svm,
+        Instruction {
+            program_id: matcher_prog,
+            accounts: vec![
+                AccountMeta::new_readonly(mtch_cfg, false),
+                AccountMeta::new_readonly(lp_owner.pubkey(), true),
+                AccountMeta::new(e.dex, false),
+                AccountMeta::new(lp_pfl, false),
+                AccountMeta::new_readonly(lp_auth_pda, false),
+                AccountMeta::new(lp_tok, false),
+                AccountMeta::new_readonly(e.mint, false),
+                AccountMeta::new(e.dex_vault, false),
+                AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),
+                AccountMeta::new_readonly(e.prog_id, false),
+            ],
+            data: wdr_d,
+        },
+        &e.payer,
+        &[&e.payer, &lp_owner],
+    );
+    assert_eq!(token_amount(&e.svm, &lp_tok) - lp_tok_pre, 500 * POS_SCALE);
+    e.check("t12-final");
+}
+
+/// 13. Boring Insurance LP lifecycle: LP1 deposits, earns trading fees, LP2 joins at higher NAV,
+///     OI-gated withdraw rejection (`Custom(118)`), then pro-rata redemption to the exact micro-USDC!
+pub fn test_boring_insurance_lp_deposit_fee_yield_withdraw(elf: &[u8]) {
+    let mut e = BoringEnv::new(elf);
+    // 50 bps per side = 1.00% total notional fee -> routed to market insurance while totalInsShares > 0!
+    let btc = e.create_market(100 * POS_SCALE, 10, 1000, 500, 100, 50, 400);
+
+    let lp1 = Keypair::new();
+    let lp2 = Keypair::new();
+    e.svm.airdrop(&lp1.pubkey(), 10_000_000_000).unwrap();
+    e.svm.airdrop(&lp2.pubkey(), 10_000_000_000).unwrap();
+    let lp1_tok = create_tok_acc(&mut e.svm, &e.mint, &lp1.pubkey(), 1_000 * POS_SCALE);
+    let lp2_tok = create_tok_acc(&mut e.svm, &e.mint, &lp2.pubkey(), 1_000 * POS_SCALE);
+    let r1 = create_prog_acc(&mut e.svm, &e.prog_id, INS_SIZE);
+    let r2 = create_prog_acc(&mut e.svm, &e.prog_id, INS_SIZE);
+
+    // LP1 deposits $100 -> 100_000_000 shares
+    send_ok(
+        &mut e.svm,
+        ix_deposit_insurance(e.prog_id, e.dex, btc, r1, lp1.pubkey(), lp1_tok, e.mint, e.dex_vault, TOKEN_PROGRAM_ID, 100 * POS_SCALE),
+        &e.payer,
+        &[&e.payer, &lp1],
+    );
+    assert_eq!(read_u64(&e.svm, &btc, 224), 100 * POS_SCALE);
+    assert_eq!(read_u64(&e.svm, &r1, 80), 100 * POS_SCALE);
+
+    // Alice & Bob open 20 BTC @ $100 ($2,000 notional -> $10 fee each = $20 total fee into insurance!)
+    let alice = e.create_trader(2_000 * POS_SCALE, 500 * POS_SCALE);
+    let bob   = e.create_trader(2_000 * POS_SCALE, 500 * POS_SCALE);
+    e.trade(btc, &alice, &bob, 0, 20 * POS_SCALE);
+    assert_eq!(read_u64(&e.svm, &btc, 224), 120 * POS_SCALE, "Insurance grew $100 -> $120 from open fees");
+    e.check("t13-open-fees");
+
+    // LP1 cannot withdraw while OI > 0 -> NonzeroOi (118)
+    send_err_custom(
+        &mut e.svm,
+        ix_withdraw_insurance(e.prog_id, e.dex, btc, r1, lp1.pubkey(), lp1_tok, e.mint, e.dex_vault, TOKEN_PROGRAM_ID, 50 * POS_SCALE),
+        &e.payer,
+        &[&e.payer, &lp1],
+        118,
+        "insurance withdraw blocked while OI > 0",
+    );
+
+    // LP2 deposits $60 at NAV $1.20/share -> mints exact 50 shares (totalShares = 150, ins = $180)
+    send_ok(
+        &mut e.svm,
+        ix_deposit_insurance(e.prog_id, e.dex, btc, r2, lp2.pubkey(), lp2_tok, e.mint, e.dex_vault, TOKEN_PROGRAM_ID, 60 * POS_SCALE),
+        &e.payer,
+        &[&e.payer, &lp2],
+    );
+    assert_eq!(read_u64(&e.svm, &r2, 80), 50 * POS_SCALE);
+    assert_eq!(read_u64(&e.svm, &btc, 224), 180 * POS_SCALE);
+    e.check("t13-lp2-join");
+
+    // Open another 10 BTC @ $100 -> +$10 fee ($5 each) -> ins = $190, then close all 30 BTC (fee-free closes) -> OI = 0!
+    e.trade(btc, &alice, &bob, 0, 10 * POS_SCALE);
+    assert_eq!(read_u64(&e.svm, &btc, 224), 190 * POS_SCALE);
+    e.trade(btc, &alice, &bob, 1, 30 * POS_SCALE);
+    assert_eq!(e.oi_long(btc), 0);
+    assert_eq!(read_u64(&e.svm, &btc, 224), 190 * POS_SCALE);
+
+    // LP1 burns 100/150 shares -> floor(100 * 190 / 150) = $126.666666 (principal $100 + $26.666666 yield!)
+    send_ok(
+        &mut e.svm,
+        ix_withdraw_insurance(e.prog_id, e.dex, btc, r1, lp1.pubkey(), lp1_tok, e.mint, e.dex_vault, TOKEN_PROGRAM_ID, 100 * POS_SCALE),
+        &e.payer,
+        &[&e.payer, &lp1],
+    );
+    // LP2 burns remaining 50/50 shares -> exact $63.333334 (principal $60 + $3.333334 yield!)
+    send_ok(
+        &mut e.svm,
+        ix_withdraw_insurance(e.prog_id, e.dex, btc, r2, lp2.pubkey(), lp2_tok, e.mint, e.dex_vault, TOKEN_PROGRAM_ID, 50 * POS_SCALE),
+        &e.payer,
+        &[&e.payer, &lp2],
+    );
+    assert_eq!(read_u64(&e.svm, &btc, 224), 0);
+    assert_eq!(token_amount(&e.svm, &lp1_tok), 1_000 * POS_SCALE + 26_666_666);
+    assert_eq!(token_amount(&e.svm, &lp2_tok), 1_000 * POS_SCALE + 3_333_334);
+
+    e.withdraw_all(&alice);
+    e.withdraw_all(&bob);
+    assert_eq!(token_amount(&e.svm, &e.dex_vault), 0);
+    e.check("t13-final");
+}
+
+/// 14. Boring full market wind-down lifecycle:
+///     StartWindDown blocks opens -> voluntary close works during window -> ForceClosePair after window ->
+///     ResolveMarket -> reverse-order ClaimResolved -> LP withdraws -> TombstoneMarket + CloseAccount!
+pub fn test_boring_market_winddown_exit_orders_and_tombstone(elf: &[u8]) {
+    let mut e = BoringEnv::new(elf);
+    let btc = e.create_market(100 * POS_SCALE, 10, 1000, 500, 100, 0, 400);
+
+    let lp = Keypair::new();
+    e.svm.airdrop(&lp.pubkey(), 10_000_000_000).unwrap();
+    let lp_tok = create_tok_acc(&mut e.svm, &e.mint, &lp.pubkey(), 1_000 * POS_SCALE);
+    let receipt = create_prog_acc(&mut e.svm, &e.prog_id, INS_SIZE);
+    send_ok(
+        &mut e.svm,
+        ix_deposit_insurance(e.prog_id, e.dex, btc, receipt, lp.pubkey(), lp_tok, e.mint, e.dex_vault, TOKEN_PROGRAM_ID, 50 * POS_SCALE),
+        &e.payer,
+        &[&e.payer, &lp],
+    );
+
+    let alice = e.create_trader(1_000 * POS_SCALE, 100 * POS_SCALE);
+    let carol = e.create_trader(1_000 * POS_SCALE, 100 * POS_SCALE);
+    let bob   = e.create_trader(1_000 * POS_SCALE, 200 * POS_SCALE);
+
+    // Open: Alice Long 2, Carol Long 1, Bob Short 3 @ $100 -> rally to $103 (+$3/BTC)
+    e.trade(btc, &alice, &bob, 0, 2 * POS_SCALE);
+    e.trade(btc, &carol, &bob, 0, 1 * POS_SCALE);
+    e.update_oracle(btc, 103 * POS_SCALE, 0, 0);
+
+    // Market admin initiates WindDown (exitWindow = 10 slots)
+    send_ok(&mut e.svm, ix_start_wind_down(e.prog_id, btc, e.admin.pubkey()), &e.payer, &[&e.payer, &e.admin]);
+
+    // New opens are blocked during WindDown!
+    send_err(
+        &mut e.svm,
+        ix_trade(e.prog_id, e.dex, btc, alice.pfl, alice.kp.pubkey(), bob.pfl, bob.kp.pubkey(), 0, 1 * POS_SCALE),
+        &e.payer,
+        &[&e.payer, &alice.kp, &bob.kp],
+        "new opens blocked in wind-down",
+    );
+
+    // ForceClosePair BEFORE exitWindow expires is rejected!
+    send_err(
+        &mut e.svm,
+        ix_force_close_pair(e.prog_id, e.dex, btc, alice.pfl, bob.pfl),
+        &e.payer,
+        &[&e.payer],
+        "force-close before exitWindow expires",
+    );
+
+    // Voluntary close (mode=1) WORKS during exitWindow: Alice voluntarily closes 1 of her 2 BTC vs Bob
+    e.trade(btc, &alice, &bob, 1, 1 * POS_SCALE);
+    assert_eq!(e.oi_long(btc), 2 * POS_SCALE);
+    e.check("t14-voluntary-close");
+
+    // Advance past exitWindow (+12 slots) -> permissionless ForceClosePair closes remaining 2 BTC!
+    e.advance_slot(12);
+    send_ok(&mut e.svm, ix_force_close_pair(e.prog_id, e.dex, btc, alice.pfl, bob.pfl), &e.payer, &[&e.payer]);
+    send_ok(&mut e.svm, ix_force_close_pair(e.prog_id, e.dex, btc, carol.pfl, bob.pfl), &e.payer, &[&e.payer]);
+    assert_eq!(e.oi_long(btc), 0);
+    e.check("t14-force-closed");
+
+    // Permissionless ResolveMarket
+    send_ok(&mut e.svm, ix_resolve_market(e.prog_id, e.dex, btc), &e.payer, &[&e.payer]);
+
+    // Reverse-order ClaimResolved (Carol claims first, then Alice!)
+    let _ = send_ixs_try(&mut e.svm, &[ix_claim_resolved(e.prog_id, e.dex, btc, carol.pfl)], &e.payer, &[&e.payer]);
+    let _ = send_ixs_try(&mut e.svm, &[ix_claim_resolved(e.prog_id, e.dex, btc, alice.pfl)], &e.payer, &[&e.payer]);
+    e.check("t14-claimed");
+
+    assert_eq!(e.capital(&alice), 106 * POS_SCALE); // +$6 on 2 BTC
+    assert_eq!(e.capital(&carol), 103 * POS_SCALE); // +$3 on 1 BTC
+    assert_eq!(e.capital(&bob),   191 * POS_SCALE); // -$9 on 3 BTC
+
+    // Everyone exits 100% cleanly (LP + all 3 traders)
+    send_ok(
+        &mut e.svm,
+        ix_withdraw_insurance(e.prog_id, e.dex, btc, receipt, lp.pubkey(), lp_tok, e.mint, e.dex_vault, TOKEN_PROGRAM_ID, 50 * POS_SCALE),
+        &e.payer,
+        &[&e.payer, &lp],
+    );
+    assert_eq!(token_amount(&e.svm, &lp_tok), 1_000 * POS_SCALE);
+    e.withdraw_all(&alice);
+    e.withdraw_all(&carol);
+    e.withdraw_all(&bob);
+    assert_eq!(token_amount(&e.svm, &e.dex_vault), 0);
+    e.check("t14-drained");
+
+    // TombstoneMarket + CloseAccount reclaims rent!
+    send_ok(&mut e.svm, ix_tombstone_market(e.prog_id, btc), &e.payer, &[&e.payer]);
+    let dest = Keypair::new().pubkey();
+    send_ok(&mut e.svm, ix_close_account(e.prog_id, btc, e.admin.pubkey(), dest), &e.payer, &[&e.payer, &e.admin]);
+    send_ok(&mut e.svm, ix_close_account(e.prog_id, receipt, lp.pubkey(), dest), &e.payer, &[&e.payer, &lp]);
+    send_ok(&mut e.svm, ix_close_account(e.prog_id, alice.pfl, alice.kp.pubkey(), dest), &e.payer, &[&e.payer, &alice.kp]);
+    assert_eq!(e.svm.get_account(&dest).unwrap().lamports, 30_000_000);
+}
+
+/// Runs all 14 boring everyday exchange LiteSVM tests as Suite 12.
+pub fn run_all_boring_tests(elf: &[u8], matcher_elf: &[u8]) {
+    test_boring_deposit_withdraw_roundtrip(elf);
+    test_boring_simple_long_short_profit_and_loss(elf);
+    test_boring_scale_in_and_partial_closes(elf);
+    test_boring_position_flip_long_to_short(elf);
+    test_boring_exec_price_bid_ask_spread(elf);
+    test_boring_funding_rate_longs_pay_shorts_and_reverse(elf);
+    test_boring_exit_orders_permutations(elf);
+    test_boring_partial_and_full_liquidation_normal(elf);
+    test_boring_liquidation_takeover_hlp_style(elf);
+    test_boring_cross_margin_btc_eth_offset_and_profit_reuse(elf);
+    test_boring_withdraw_margin_checks_and_freshness(elf);
+    test_boring_matcher_amm_single_signer_fills(elf, matcher_elf);
+    test_boring_insurance_lp_deposit_fee_yield_withdraw(elf);
+    test_boring_market_winddown_exit_orders_and_tombstone(elf);
+    println!("[PASS] Suite 12: 14 Boring Everyday Exchange LiteSVM Tests (Deposits, Scale-In/Out, Flips, Spreads, Funding,");
+    println!("       3 Exit-Order Permutations, Partial+Full Liq, HLP Takeover, Cross-Margin Reuse, AMM Matcher, LP Yield, WindDown)");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn load_elfs() -> (Vec<u8>, Vec<u8>) {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let elf = std::fs::read(root.join("build/percolator.so"))
+            .expect("build/percolator.so missing — run ./scripts/build-and-test.sh first");
+        let matcher_elf = std::fs::read(root.join("build/matcher.so"))
+            .expect("build/matcher.so missing — run ./scripts/build-and-test.sh first");
+        (elf, matcher_elf)
+    }
+
+    #[test] fn boring_01_deposit_withdraw_roundtrip() { let (e, _) = load_elfs(); test_boring_deposit_withdraw_roundtrip(&e); }
+    #[test] fn boring_02_simple_long_short_pnl() { let (e, _) = load_elfs(); test_boring_simple_long_short_profit_and_loss(&e); }
+    #[test] fn boring_03_scale_in_and_partial_closes() { let (e, _) = load_elfs(); test_boring_scale_in_and_partial_closes(&e); }
+    #[test] fn boring_04_position_flip_long_to_short() { let (e, _) = load_elfs(); test_boring_position_flip_long_to_short(&e); }
+    #[test] fn boring_05_exec_price_bid_ask_spread() { let (e, _) = load_elfs(); test_boring_exec_price_bid_ask_spread(&e); }
+    #[test] fn boring_06_funding_rate_both_directions() { let (e, _) = load_elfs(); test_boring_funding_rate_longs_pay_shorts_and_reverse(&e); }
+    #[test] fn boring_07_exit_orders_permutations() { let (e, _) = load_elfs(); test_boring_exit_orders_permutations(&e); }
+    #[test] fn boring_08_partial_and_full_liquidation() { let (e, _) = load_elfs(); test_boring_partial_and_full_liquidation_normal(&e); }
+    #[test] fn boring_09_liquidation_takeover_hlp_style() { let (e, _) = load_elfs(); test_boring_liquidation_takeover_hlp_style(&e); }
+    #[test] fn boring_10_cross_margin_offset_and_profit_reuse() { let (e, _) = load_elfs(); test_boring_cross_margin_btc_eth_offset_and_profit_reuse(&e); }
+    #[test] fn boring_11_withdraw_margin_checks_and_freshness() { let (e, _) = load_elfs(); test_boring_withdraw_margin_checks_and_freshness(&e); }
+    #[test] fn boring_12_matcher_amm_single_signer_fills() { let (e, m) = load_elfs(); test_boring_matcher_amm_single_signer_fills(&e, &m); }
+    #[test] fn boring_13_insurance_lp_deposit_yield_withdraw() { let (e, _) = load_elfs(); test_boring_insurance_lp_deposit_fee_yield_withdraw(&e); }
+    #[test] fn boring_14_market_winddown_exit_and_tombstone() { let (e, _) = load_elfs(); test_boring_market_winddown_exit_orders_and_tombstone(&e); }
+}

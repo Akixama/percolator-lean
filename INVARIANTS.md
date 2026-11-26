@@ -1,6 +1,6 @@
 # `percolator-lean` Formal Invariants & Proof Catalog
 
-Every economic, solvency, and risk-isolation invariant of `percolator-lean` is formalized in [`Percolator/Spec.lean`](Percolator/Spec.lean) and machine-checked in Lean 4's kernel in [`Percolator/Proofs.lean`](Percolator/Proofs.lean), [`Percolator/TraceProofs.lean`](Percolator/TraceProofs.lean), [`Percolator/Matcher.lean`](Percolator/Matcher.lean), and [`Percolator/OracleAdapter.lean`](Percolator/OracleAdapter.lean) (**77 theorems total**, **0 `sorry`**, **0 custom axioms**, and **0 external Lean dependencies**).
+Every economic, solvency, and risk-isolation invariant of `percolator-lean` is formalized in [`Percolator/Spec.lean`](Percolator/Spec.lean) and machine-checked in Lean 4's kernel in [`Percolator/Proofs.lean`](Percolator/Proofs.lean), [`Percolator/TraceProofs.lean`](Percolator/TraceProofs.lean), [`Percolator/Refinement.lean`](Percolator/Refinement.lean), [`Percolator/Matcher.lean`](Percolator/Matcher.lean), and [`Percolator/OracleAdapter.lean`](Percolator/OracleAdapter.lean) (**89 theorems total**, **0 `sorry`**, **0 custom axioms**, and **0 external Lean dependencies**).
 
 ---
 
@@ -74,7 +74,28 @@ Every economic, solvency, and risk-isolation invariant of `percolator-lean` is f
 
 ---
 
-## 7. Runtime Boundary Checks Enforced On-Chain (`Percolator/Program.lean`)
+## 7. Program-to-Spec Implementation Refinement (`Percolator/Refinement.lean`)
+
+Directly links the compiled `SolanaM` bytecode functions in [`Percolator/Program.lean`](Percolator/Program.lean) and [`Percolator/OracleAdapter.lean`](Percolator/OracleAdapter.lean) executing over byte-addressed `SvmState.mem` (and exact 128-bit `mulDiv64` / `mulDiv64Ceil` from `LeanSVM.Math`) to the pure mathematical definitions in [`Percolator/Spec.lean`](Percolator/Spec.lean) (**12 theorems, 0 `sorry`, 0 custom axioms**):
+
+| Compiled `SolanaM` Function | Refinement Theorem | Direct `SvmState.mem` Guarantee |
+|---|---|---|
+| `Program.deriveAdlU64` | `deriveAdlU64_refines_spec` | Exact match with `Spec.deriveAdl` + `memEqAbove` frame. |
+| `Program.haircutPayoutU64` | `haircutPayoutU64_refines_spec` | Exact match with `Spec.haircutPayout` + `memEqAbove` frame. |
+| `Program.postAdlRawAddU64` | `postAdlRawAddU64_refines_spec` | Exact match with `Spec.postAdlRawAdd` (rejects wiped-out `oiSide = 0 ∧ rawSide > 0`) + `memEqAbove` frame. |
+| `Program.proportionalRawRedU64` | `proportionalRawRedU64_refines_spec` | Exact match with `Spec.proportionalRawReduction` + `memEqAbove` frame. |
+| `Program.proportionalOiForRawU64` | `proportionalOiForRawU64_refines_spec` | Exact match with `Spec.proportionalOiForRaw` + `memEqAbove` frame. |
+| `OracleAdapter.ewmaBlendU64` | `ewmaBlendU64_refines_spec` | Exact match with `OracleAdapter.ewmaBlendNat` + `memEqAbove` frame. |
+| `Program.computeMarginReq` | `computeMarginReq_refines_spec` | Exact match with `Spec.marginReq` (nested ceiling 128-bit division) + `memEqAbove` frame. |
+| `Program.checkTokenProg` | `checkTokenProg_sound` | Succeeds iff all 32 bytes at `tokProg`'s key equal canonical `TOKEN_PROGRAM_ID` (`TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA`), with `s' = s`. |
+| `Program.applyExecSpread` | `applyExecSpread_conserves_capital` | Conserves exact `pflL.capital + pflS.capital` on `SvmState.mem` while enforcing `execPriceClamp` and leaving all other bytes untouched. |
+| `Program.sweepResolvedDust` | `sweepResolvedDust_preserves_dex_stock` | Preserves exact `dexStockExact` ($C + I + R + S = V$) and `vaultBalance` across all branches (dust→insurance, dust→surplus, orphan resolved insurance→surplus). |
+| `Program.syncLegMargins` | `syncLegMargins_refines_syncReservedMm` | Written `leg.reservedMm'` and `pfl.totalReservedMm'` equal `Spec.syncReservedMm` exactly, preserving `totalReservedMm' ≤ capital'` while leaving `capital`, `mData`, and all other legs `j ≠ slotIdx` bit-for-bit unchanged. |
+| `Program.settleAndRefreshLeg` | `settleAndRefreshLeg_preserves_stock_and_containment` | End-to-end across all branches (flat, gain, contained loss, shortfall, instant/haircut realization, and `syncLegMargins`): preserves exact `dexStockExact`, `vaultBalance`, per-leg loss containment (`capital' ≥ otherRes`), and inductive firewall (`totalReservedMm' ≤ capital'`). |
+
+---
+
+## 8. Runtime Boundary Checks Enforced On-Chain (`Percolator/Program.lean`)
 
 Beyond the pure mathematical transitions, the compiled sBPF program enforces the Solana execution boundary:
 
