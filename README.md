@@ -1,5 +1,9 @@
 # `percolator-lean` — Formally Verified Realizable Cross-Margin Perpetuals DEX on Solana
 
+> **⚠️ Educational & Research Purposes Only — Not Audited for Production Use**
+>
+> This repository, on-chain programs, and formal proofs are provided **strictly for educational and research purposes**. This code has **not** undergone an independent third-party security audit and is **not** intended for production deployment or handling real user funds. Formal proofs apply only to the explicitly modeled specifications and invariants and do not guarantee the absence of bugs across unverified handlers, external integrations, or the compiler/runtime boundary. Use at your own risk — provided **"AS IS"** without warranty of any kind under the [Apache License 2.0](LICENSE).
+
 `percolator-lean` is a minimal, composable, formally verified Solana perpetuals DEX written in **Lean 4** and compiled directly to zero-heap Solana sBPF bytecode via [`lean-svm`](https://github.com/aeyakovenko/lean-svm).
 
 It achieves **full cross-margin capital efficiency on healthy markets** (hedged spreads net 1:1 with zero warmup drag) while maintaining **machine-checked per-market risk isolation**: permissionlessly created or adversarial markets cannot drain other markets, untouched users, or other markets' insurance pools.
@@ -219,3 +223,11 @@ Every worst-case actor path (users, cranks, and liquidation keepers) executes in
 # Run all 15 boring exchange & security regression LiteSVM tests individually:
 cargo test --manifest-path svm-runner/Cargo.toml --release
 ```
+
+---
+
+## 9. License & Disclaimer
+
+Licensed under the [Apache License, Version 2.0](LICENSE).
+
+This repository is experimental and provided **for educational and research purposes only**. Do not deploy these programs to mainnet with real funds without thorough independent auditing and end-to-end verification.
