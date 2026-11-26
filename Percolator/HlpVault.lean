@@ -474,7 +474,7 @@ def loadFreshHlpNav (vData : Ptr) (hlpPfl percProg : AccountView) (curSlot : UIn
     Ix data (`28 + 8 * nAllowed` B):
       `[0, pdaBump:u8, nAllowed:u8, pad:u8, lockupSlots:u64, depositCap:u64, minDeposit:u64, mid_0..mid_{n-1}:u64]`. -/
 def handleInitHlpVault (input : Ptr) : SolanaM Unit := do
-  let (vault, strategist, dex, hlpPfl, hlpAuthPda, hlpFeeTok, percProg, allowedMatcherProg, ix, progId) ← parse8 input
+  let (vault, strategist, dex, hlpPfl, hlpAuthPda, hlpFeeTok, percProg, allowedMatcherProg, ix, progId) ← parseStrict8 input PErr.aliasedAccounts
   SolanaM.require (ix.len >= 36) Err.invalidInstructionData
   SolanaM.require (← AccountView.isSigner strategist) Err.missingRequiredSignature
   SolanaM.require (← AccountView.isWritable vault) Err.invalidAccountData
@@ -540,7 +540,7 @@ def handleSetHlpMatcher (input : Ptr) : SolanaM Unit := do
   let hlpAuthPda ← AccountView.nextCursor hlpPfl
   let percProg   ← AccountView.nextCursor hlpAuthPda
 
-  requireNonDup strategist; requireNonDup hlpPfl; requireNonDup hlpAuthPda; requireNonDup percProg
+  requireNonDup vault; requireNonDup strategist; requireNonDup hlpPfl; requireNonDup hlpAuthPda; requireNonDup percProg
   SolanaM.require (← AccountView.isSigner strategist) Err.missingRequiredSignature
   SolanaM.require (← AccountView.isWritable vault) Err.invalidAccountData
   checkHlpVault vault progId
@@ -604,7 +604,7 @@ def handleDepositHlp (input : Ptr) : SolanaM Unit := do
   let tokProg      ← AccountView.nextCursor dexVault
   let percProg     ← AccountView.nextCursor tokProg
 
-  requireNonDup receipt; requireNonDup depositor; requireNonDup depositorTok
+  requireNonDup vault; requireNonDup receipt; requireNonDup depositor; requireNonDup depositorTok
   requireNonDup dex; requireNonDup hlpPfl; requireNonDup mint
   requireNonDup dexVault; requireNonDup tokProg; requireNonDup percProg
   SolanaM.require (← AccountView.isSigner depositor) Err.missingRequiredSignature
@@ -689,7 +689,7 @@ def handleWithdrawHlp (input : Ptr) : SolanaM Unit := do
   let tokProg    ← AccountView.nextCursor dexVault
   let percProg   ← AccountView.nextCursor tokProg
 
-  requireNonDup receipt; requireNonDup owner; requireNonDup destTok
+  requireNonDup vault; requireNonDup receipt; requireNonDup owner; requireNonDup destTok
   requireNonDup dex; requireNonDup hlpPfl; requireNonDup hlpAuthPda
   requireNonDup mint; requireNonDup dexVault; requireNonDup tokProg; requireNonDup percProg
   SolanaM.require (← AccountView.isSigner owner) Err.missingRequiredSignature
@@ -769,7 +769,7 @@ def handleHlpTakeoverLiquidate (input : Ptr) : SolanaM Unit := do
   let hlpAuthPda ← AccountView.nextCursor hlpPfl
   let percProg   ← AccountView.nextCursor hlpAuthPda
 
-  requireNonDup strategist; requireNonDup dex; requireNonDup mkt; requireNonDup victimPfl
+  requireNonDup vault; requireNonDup strategist; requireNonDup dex; requireNonDup mkt; requireNonDup victimPfl
   requireNonDup hlpFeeTok; requireNonDup mint; requireNonDup dexVault
   requireNonDup tokProg; requireNonDup hlpPfl; requireNonDup hlpAuthPda; requireNonDup percProg
   SolanaM.require (← AccountView.isSigner strategist) Err.missingRequiredSignature

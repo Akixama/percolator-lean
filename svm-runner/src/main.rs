@@ -4507,7 +4507,419 @@ fn main() {
     }
     println!("[PASS] Suite 16: Full Red-Team + HL-UX Capital Efficiency Regressions (16A M_atk->I_BTC Defeated, 16B PropAMM Allowlist, 16C HLP Rugs Blocked, 16D Mode 2/3 Fee, 16E -20% Hedged Survival & 3rd-Leg Cross Reuse!)");
 
+    // =========================================================================
+    // SUITE 17: STRICT ABI DUP-STUB ATTACK REGRESSIONS (17A) +
+    //           5,000-STEP MULTI-PROGRAM ADVERSARIAL STATEFUL FUZZER (17B)
+    //   Drives ALL 5 production .so binaries (`percolator.so`, `matcher.so`,
+    //   `hlp_vault.so`, `reward_module.so`, `oracle_adapter.so`) + `evil_matcher.so`
+    //   simultaneously under randomized adversarial sequences, asserting:
+    //     - Exact 5-bucket stock equality `V == C + I + R + S + F` + `real_vault >= V`
+    //     - `p.totalLockedMm == Σ_j p.leg[j].lockedMm` for EVERY portfolio
+    //     - Honest `I_BTC` NEVER loses 1 atom despite `M_atk` pumps & K+1=5 bursts!
+    //     - `HlpVault` share conservation & zero strategist rug!
+    //     - `RewardModule` 3-bucket quote escrow conservation (`vault >= active + rollover + pending`)!
+    // =========================================================================
+    {
+        // --- 17A: Strict ABI Dup-Stub Attack Regressions across core & external programs ---
+        let a_dex = create_prog_acc(&mut svm, &prog_id, DEX_SIZE);
+        let (a_vault, a_vbump) = derive_dex_vault(&prog_id, &a_dex);
+        // 17A-1: `InitDex` with `feeVault == admin` (duplicate stub!) -> REJECTED Custom(109) (`PErr.aliasedAccounts`)!
+        send_err_custom(&mut svm, ix_init_dex(prog_id, a_dex, dex_admin.pubkey(), mint, a_vault, dex_admin.pubkey(), TOKEN_PROGRAM_ID, SYSTEM_PROGRAM_ID, a_vbump, 6, 0, SPL_TOKEN_RENT_MIN), &payer, &[&payer, &dex_admin], 109, "17A-1: InitDex rejects dup feeVault==admin");
+        // Valid InitDex succeeds:
+        send_ok(&mut svm, ix_init_dex(prog_id, a_dex, dex_admin.pubkey(), mint, a_vault, fee_vault, TOKEN_PROGRAM_ID, SYSTEM_PROGRAM_ID, a_vbump, 6, 0, SPL_TOKEN_RENT_MIN), &payer, &[&payer, &dex_admin]);
+        let a_sl = get_slot(&svm) + 10;
+        set_slot(&mut svm, a_sl);
+
+        // 17A-2: `CreateMarket` with unauthorized dup `feeVaultTok == dex` (dup idx 0!) -> REJECTED Custom(109)!
+        let a_mkt_bad = create_prog_acc(&mut svm, &prog_id, MKT_SIZE);
+        send_err_custom(&mut svm, ix_create_market(prog_id, a_dex, a_mkt_bad, mint, dex_admin.pubkey(), dex_admin.pubkey(), admin_tok, a_dex, 100 * POS_SCALE, 20, 500, 0, 1000, 500, 100, 10, 75, 2500, 1_000_000 * POS_SCALE), &payer, &[&payer, &dex_admin], 109, "17A-2: CreateMarket rejects dup feeVaultTok==dex");
+        // 17A-3: `CreateMarket` with legitimate `creator == oracleAuth` (idx 3) AND `feeVaultTok == creatorTok` (idx 5) via `resolveDup` -> SUCCEEDS!
+        let a_mkt_alias = create_prog_acc(&mut svm, &prog_id, MKT_SIZE);
+        send_ok(&mut svm, ix_create_market(prog_id, a_dex, a_mkt_alias, mint, dex_admin.pubkey(), dex_admin.pubkey(), admin_tok, admin_tok, 100 * POS_SCALE, 20, 500, 0, 1000, 500, 100, 10, 75, 2500, 1_000_000 * POS_SCALE), &payer, &[&payer, &dex_admin]);
+
+        // 17A-4: `DepositCollateral` with dup `ownerTok == dex` -> REJECTED Custom(109)!
+        let a_u = Keypair::new();
+        svm.airdrop(&a_u.pubkey(), 10_000_000_000).unwrap();
+        let a_pfl = create_prog_acc(&mut svm, &prog_id, PFL_SIZE);
+        send_ok(&mut svm, ix_init_portfolio(prog_id, a_dex, a_pfl, a_u.pubkey()), &payer, &[&payer, &a_u]);
+        send_err_custom(&mut svm, ix_deposit_collateral(prog_id, a_dex, a_pfl, a_u.pubkey(), a_dex, mint, a_vault, TOKEN_PROGRAM_ID, POS_SCALE), &payer, &[&payer, &a_u], 109, "17A-4: DepositCollateral rejects dup ownerTok==dex");
+
+        // 17A-5: `CloseAccount([acc, owner, acc])` (dup idx 0!) -> REJECTED Custom(109)!
+        //        `CloseAccount([acc, owner, owner])` (legitimate self-refund dup idx 1 via `resolveDup`!) -> SUCCEEDS!
+        send_err_custom(&mut svm, ix_close_account(prog_id, a_pfl, a_u.pubkey(), a_pfl), &payer, &[&payer, &a_u], 109, "17A-5a: CloseAccount rejects dest==acc");
+        let lam_pre = svm.get_account(&a_u.pubkey()).unwrap().lamports;
+        send_ok(&mut svm, ix_close_account(prog_id, a_pfl, a_u.pubkey(), a_u.pubkey()), &payer, &[&payer, &a_u]);
+        assert!(svm.get_account(&a_u.pubkey()).unwrap().lamports > lam_pre, "17A-5b: CloseAccount self-refund refunded rent!");
+
+        // 17A-6: `Matcher::InitPropAmm` with dup `owner == ctx` -> REJECTED Custom(109)!
+        let a_prop_kp = Keypair::new();
+        svm.set_account(a_prop_kp.pubkey(), Account { lamports: 10_000_000, data: vec![0u8; PROP_AMM_SIZE], owner: matcher_prog, executable: false, rent_epoch: 0 }).unwrap();
+        send_err_custom(&mut svm, ix_init_prop_amm(matcher_prog, a_prop_kp.pubkey(), a_prop_kp.pubkey(), 0, 20, 10, POS_SCALE, &[1]), &payer, &[&payer, &a_prop_kp], 109, "17A-6: InitPropAmm rejects dup owner==ctx");
+
+        // --- 17B: 5,000-Step Multi-Program Adversarial Stateful Fuzzer ---
+        let f_dex = create_prog_acc(&mut svm, &prog_id, DEX_SIZE);
+        let (f_vault, f_vbump) = derive_dex_vault(&prog_id, &f_dex);
+        send_ok(&mut svm, ix_init_dex(prog_id, f_dex, dex_admin.pubkey(), mint, f_vault, fee_vault, TOKEN_PROGRAM_ID, SYSTEM_PROGRAM_ID, f_vbump, 6, 0, SPL_TOKEN_RENT_MIN), &payer, &[&payer, &dex_admin]);
+        let mut f_slot = get_slot(&svm) + 10;
+        let mut f_ts: i64 = 1_760_000_000;
+        {
+            let mut clk: Clock = svm.get_sysvar();
+            clk.slot = f_slot; clk.unix_timestamp = f_ts;
+            svm.set_sysvar(&clk);
+        }
+
+        // 3 markets:
+        //   0: Honest BTC (driven by `oracle_adapter.so` + wired to `reward_module.so` 50% fee buy-and-burn!)
+        //   1: Honest ETH (direct oracle, allowlisted in HLP + Matcher)
+        //   2: Adversarial permissionless `M_atk` (NOT allowlisted in HLP or Matcher!)
+        let f_rew_cfg = create_prog_acc(&mut svm, &rew_prog, REW_SIZE);
+        let (f_rew_pda, f_rew_bump) = derive_rew_auth(&rew_prog, &f_rew_cfg);
+        let f_btc_adp = create_prog_acc(&mut svm, &adapter_prog, 352);
+        let (f_btc_orac_pda, f_btc_orac_bump) = Address::find_program_address(&[b"orac", f_btc_adp.as_ref()], &adapter_prog);
+        let f_btc_feed = Keypair::new().pubkey();
+        let f_btc_mkt = create_prog_acc(&mut svm, &prog_id, MKT_SIZE);
+        let f_eth_mkt = create_prog_acc(&mut svm, &prog_id, MKT_SIZE);
+        let f_atk_mkt = create_prog_acc(&mut svm, &prog_id, MKT_SIZE);
+        let f_eth_orc = Keypair::new();
+        let f_atk_orc = Keypair::new();
+
+        // Create BTC market with 50% reward split (`rewardBps = 5000`, `tradeFeeBps = 20`) & `oracle_adapter` PDA!
+        send_ok(&mut svm, ix_create_market_with_reward(
+            prog_id, f_dex, f_btc_mkt, mint, f_btc_orac_pda, dex_admin.pubkey(), admin_tok, fee_vault,
+            100 * POS_SCALE, 20, 500, 0, 1000, 500, 100, 20, 75, 2500, 1_000_000 * POS_SCALE, 0, 5000, f_rew_pda,
+        ), &payer, &[&payer, &dex_admin]);
+        // Init `oracle_adapter.so` (Chainlink OCR2 feed) for BTC!
+        let mut f_btc_spot_e8: i128 = 10_000_000_000; // $100.00 at 8 decimals
+        svm.set_account(f_btc_feed, Account { lamports: 10_000_000, data: make_chainlink_ocr2(8, 4, 0, f_slot, f_btc_spot_e8), owner: cl_prog_id, executable: false, rent_epoch: 0 }).unwrap();
+        let mut f_adp_ix = vec![0u8; 28];
+        f_adp_ix[0] = 0; f_adp_ix[1] = f_btc_orac_bump; f_adp_ix[2] = 2; // FEED_CHAINLINK
+        f_adp_ix[4..12].copy_from_slice(&50u64.to_le_bytes());
+        f_adp_ix[12..20].copy_from_slice(&100u64.to_le_bytes());
+        send_ok(&mut svm, Instruction { program_id: adapter_prog, accounts: vec![
+            AccountMeta::new(f_btc_adp, false), AccountMeta::new_readonly(dex_admin.pubkey(), true),
+            AccountMeta::new_readonly(prog_id, false), AccountMeta::new_readonly(f_btc_mkt, false),
+            AccountMeta::new_readonly(f_btc_feed, false),
+        ], data: f_adp_ix }, &payer, &[&payer, &dex_admin]);
+
+        // Create ETH & adversarial `M_atk`
+        send_ok(&mut svm, ix_create_market(prog_id, f_dex, f_eth_mkt, mint, f_eth_orc.pubkey(), dex_admin.pubkey(), admin_tok, fee_vault, 100 * POS_SCALE, 20, 500, 0, 1000, 500, 100, 15, 75, 2500, 1_000_000 * POS_SCALE), &payer, &[&payer, &dex_admin]);
+        send_ok(&mut svm, ix_create_market(prog_id, f_dex, f_atk_mkt, mint, f_atk_orc.pubkey(), attacker.pubkey(), attacker_tok, fee_vault, 100 * POS_SCALE, 20, 500, 0, 1000, 500, 100, 10, 75, 2500, 1_000_000 * POS_SCALE), &payer, &[&payer, &attacker]);
+
+        let f_btc_mid = read_u64(&svm, &f_btc_mkt, 8);
+        let f_eth_mid = read_u64(&svm, &f_eth_mkt, 8);
+        let _f_atk_mid = read_u64(&svm, &f_atk_mkt, 8);
+
+        // Seed honest BTC & ETH insurance (`I_BTC = $1,000`) — MUST NEVER DECREASE BY 1 ATOM!
+        let f_lp_tok = create_tok_acc(&mut svm, &mint, &lp.pubkey(), 10_000 * POS_SCALE);
+        let f_btc_ins = create_prog_acc(&mut svm, &prog_id, INS_SIZE);
+        let f_eth_ins = create_prog_acc(&mut svm, &prog_id, INS_SIZE);
+        send_ok(&mut svm, ix_deposit_insurance(prog_id, f_dex, f_btc_mkt, f_btc_ins, lp.pubkey(), f_lp_tok, mint, f_vault, TOKEN_PROGRAM_ID, 1_000 * POS_SCALE), &payer, &[&payer, &lp]);
+        send_ok(&mut svm, ix_deposit_insurance(prog_id, f_dex, f_eth_mkt, f_eth_ins, lp.pubkey(), f_lp_tok, mint, f_vault, TOKEN_PROGRAM_ID, 1_000 * POS_SCALE), &payer, &[&payer, &lp]);
+        let mut f_min_ibtc = read_u64(&svm, &f_btc_mkt, 224);
+
+        // Wire `reward_module.so` to BTC market (`targetMint` = burnable SPL token!)
+        let f_t_mint = Keypair::new().pubkey();
+        svm.set_account(f_t_mint, Account {
+            lamports: 10_000_000,
+            data: make_spl_mint(6, 10_000_000_000_000, &dex_admin.pubkey()),
+            owner: TOKEN_PROGRAM_ID, executable: false, rent_epoch: 0,
+        }).unwrap();
+        let f_rew_qvault = create_tok_acc(&mut svm, &mint, &f_rew_pda, 0);
+        let f_rew_tescrow = create_tok_acc(&mut svm, &f_t_mint, &f_rew_pda, 0);
+        send_ok(&mut svm, ix_init_reward(
+            rew_prog, f_rew_cfg, dex_admin.pubkey(), prog_id, f_dex, f_btc_mkt, f_rew_pda,
+            mint, f_rew_qvault, TOKEN_PROGRAM_ID, f_t_mint, f_rew_tescrow, TOKEN_PROGRAM_ID,
+            None, f_rew_bump, 0, 32, 10_000, POS_SCALE,
+        ), &payer, &[&payer, &dex_admin]);
+
+        // Wire `hlp_vault.so` + `matcher.so` allowing ONLY `[BTC, ETH]` (NEVER `M_atk`!) + `evil_matcher.so` ctx
+        let f_hlp_vault = create_prog_acc(&mut svm, &hlp_prog, HLP_SIZE);
+        let (f_hlp_pda, f_hlp_bump) = Address::find_program_address(&[b"hlpv", f_hlp_vault.as_ref()], &hlp_prog);
+        let f_hlp_pfl = create_prog_acc(&mut svm, &prog_id, PFL_SIZE);
+        let f_hlp_fee_tok = create_tok_acc(&mut svm, &mint, &f_hlp_pda, 0);
+        send_ok(&mut svm, ix_init_hlp_vault(
+            hlp_prog, f_hlp_vault, h_strat.pubkey(), f_dex, f_hlp_pfl, f_hlp_pda, f_hlp_fee_tok, prog_id,
+            matcher_prog, f_hlp_bump, 2, 0, POS_SCALE, &[f_btc_mid, f_eth_mid],
+        ), &payer, &[&payer, &h_strat]);
+        let f_prop_ctx = create_prog_acc(&mut svm, &matcher_prog, PROP_AMM_SIZE);
+        send_ok(&mut svm, ix_init_prop_amm(matcher_prog, f_prop_ctx, h_strat.pubkey(), 0, 20, 10, 20 * POS_SCALE, &[f_btc_mid, f_eth_mid]), &payer, &[&payer, &h_strat]);
+        send_ok(&mut svm, ix_set_hlp_matcher(hlp_prog, f_hlp_vault, h_strat.pubkey(), f_hlp_pfl, f_hlp_pda, prog_id, Some(f_prop_ctx), None), &payer, &[&payer, &h_strat]);
+        let f_evil_ctx = create_prog_acc(&mut svm, &evil_prog, PROP_AMM_SIZE);
+        let f_hlp_lps = [Keypair::new(), Keypair::new()];
+        let mut f_hlp_recs = Vec::new();
+        let mut f_hlp_toks = Vec::new();
+        for lpk in &f_hlp_lps {
+            svm.airdrop(&lpk.pubkey(), 10_000_000_000).unwrap();
+            let rec = create_prog_acc(&mut svm, &hlp_prog, HLP_REC_SIZE);
+            let tok = create_tok_acc(&mut svm, &mint, &lpk.pubkey(), 50_000 * POS_SCALE);
+            send_ok(&mut svm, ix_deposit_hlp(hlp_prog, f_hlp_vault, rec, lpk.pubkey(), tok, f_dex, f_hlp_pfl, mint, f_vault, TOKEN_PROGRAM_ID, prog_id, 5_000 * POS_SCALE), &payer, &[&payer, lpk]);
+            f_hlp_recs.push(rec);
+            f_hlp_toks.push(tok);
+        }
+
+        // 4 Traders with USDC + target tokens for RewardModule bidding!
+        let f_traders: Vec<Keypair> = (0..4).map(|_| Keypair::new()).collect();
+        let mut f_pfls = Vec::new();
+        let mut f_toks = Vec::new();
+        let mut f_btoks = Vec::new();
+        for tkp in &f_traders {
+            svm.airdrop(&tkp.pubkey(), 10_000_000_000).unwrap();
+            let p = create_prog_acc(&mut svm, &prog_id, PFL_SIZE);
+            let t = create_tok_acc(&mut svm, &mint, &tkp.pubkey(), 50_000 * POS_SCALE);
+            let bt = create_tok_acc(&mut svm, &f_t_mint, &tkp.pubkey(), 50_000 * POS_SCALE);
+            send_ok(&mut svm, ix_init_portfolio(prog_id, f_dex, p, tkp.pubkey()), &payer, &[&payer, tkp]);
+            send_ok(&mut svm, ix_deposit_collateral(prog_id, f_dex, p, tkp.pubkey(), t, mint, f_vault, TOKEN_PROGRAM_ID, 2_000 * POS_SCALE), &payer, &[&payer, tkp]);
+            f_pfls.push(p);
+            f_toks.push(t);
+            f_btoks.push(bt);
+        }
+
+        let mut f_all_pfls = f_pfls.clone();
+        f_all_pfls.push(f_hlp_pfl);
+        let f_all_mkts = [f_btc_mkt, f_eth_mkt, f_atk_mkt];
+
+        // Deterministic xorshift64 PRNG for 100% reproducible 5,000-step multi-program fuzzing!
+        let mut rng: u64 = 0xDEAD_BEEF_CAFE_2026;
+        let mut next_u64 = || -> u64 {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+
+        let mut f_ok = 0u64;
+        let mut f_cranks = 0u64;
+        let mut f_matcher_trades = 0u64;
+        let mut f_hlp_ops = 0u64;
+        let mut f_rew_ops = 0u64;
+        let mut f_liqs = 0u64;
+        let mut f_adv_blocked = 0u64;
+        let mut cur_epoch_acc: Option<(Address, Vec<(usize, Address)>)> = None;
+
+        for step in 0..5_000u64 {
+            let r = next_u64();
+            let act = r % 20;
+            match act {
+                // 0..2: Advance slot + crank BTC via `oracle_adapter.so` + step ETH & `M_atk`!
+                0..=2 => {
+                    f_slot += 1;
+                    f_ts += 1;
+                    let mut clk: Clock = svm.get_sysvar();
+                    clk.slot = f_slot; clk.unix_timestamp = f_ts;
+                    svm.set_sysvar(&clk);
+                    let dir = (next_u64() % 3) as i128 - 1; // -1, 0, +1
+                    let delta_bps = (next_u64() % 75) as i128; // up to 0.74% (inside K+1=5 clamp!)
+                    f_btc_spot_e8 = (f_btc_spot_e8 + (f_btc_spot_e8 * dir * delta_bps) / 10_000)
+                        .clamp(5_000_000_000, 20_000_000_000);
+                    svm.set_account(f_btc_feed, Account { lamports: 10_000_000, data: make_chainlink_ocr2(8, 4, (step % 4) as u32, f_slot, f_btc_spot_e8), owner: cl_prog_id, executable: false, rent_epoch: 0 }).unwrap();
+                    let crank_ix = Instruction { program_id: adapter_prog, accounts: vec![
+                        AccountMeta::new_readonly(f_btc_adp, false), AccountMeta::new(f_btc_mkt, false),
+                        AccountMeta::new_readonly(f_btc_feed, false), AccountMeta::new_readonly(f_btc_orac_pda, false),
+                        AccountMeta::new_readonly(prog_id, false),
+                    ], data: vec![1] };
+                    if send_ixs_try(&mut svm, &[crank_ix], &payer, &[&payer]).is_ok() {
+                        f_ok += 1; f_cranks += 1;
+                    }
+                    // Step ETH
+                    let eth_p = read_u64(&svm, &f_eth_mkt, 112);
+                    let eth_d = (eth_p * (next_u64() % 70)) / 10_000;
+                    let eth_np = if next_u64() % 2 == 0 { (eth_p + eth_d).min(200 * POS_SCALE) } else { eth_p.saturating_sub(eth_d).max(50 * POS_SCALE) };
+                    if send_ixs_try(&mut svm, &[ix_update_oracle(prog_id, f_eth_mkt, f_eth_orc.pubkey(), eth_np, 0, 0)], &payer, &[&payer, &f_eth_orc]).is_ok() {
+                        f_ok += 1;
+                    }
+                    // Step adversarial `M_atk` (extreme max-clamp swings!)
+                    let atk_p = read_u64(&svm, &f_atk_mkt, 112);
+                    let atk_d = (atk_p * 75) / 10_000;
+                    let atk_np = if (step / 25) % 2 == 0 { (atk_p + atk_d).min(250 * POS_SCALE) } else { atk_p.saturating_sub(atk_d).max(20 * POS_SCALE) };
+                    if send_ixs_try(&mut svm, &[ix_update_oracle(prog_id, f_atk_mkt, f_atk_orc.pubkey(), atk_np, 0, 0)], &payer, &[&payer, &f_atk_orc]).is_ok() {
+                        f_ok += 1;
+                    }
+                }
+                // 3..6: TradeWithMatcher against `hlp_vault.so` + `matcher.so` (single OR 2-market hedged basket, mode=0/1/4!)
+                3..=6 => {
+                    let ti = (next_u64() % 4) as usize;
+                    let mut ixs: Vec<Instruction> = Vec::new();
+                    for &m in &f_all_mkts {
+                        let mid = read_u64(&svm, &m, 8);
+                        if leg_locked_mm_for_mkt(&svm, &f_pfls[ti], mid) > 0 || read_u8(&svm, &f_pfls[ti], 4) > 0 {
+                            ixs.push(ix_refresh_leg(prog_id, f_dex, m, f_pfls[ti], false));
+                        }
+                        if leg_locked_mm_for_mkt(&svm, &f_hlp_pfl, mid) > 0 {
+                            ixs.push(ix_refresh_leg(prog_id, f_dex, m, f_hlp_pfl, false));
+                        }
+                    }
+                    // Only include refreshes for actually present legs so bundle doesn't fail on legNotFound:
+                    ixs.clear();
+                    for &m in &f_all_mkts {
+                        let mid = read_u64(&svm, &m, 8);
+                        let _ = send_ixs_try(&mut svm, &[ix_refresh_leg(prog_id, f_dex, m, f_pfls[ti], false)], &payer, &[&payer]);
+                        let _ = send_ixs_try(&mut svm, &[ix_refresh_leg(prog_id, f_dex, m, f_hlp_pfl, false)], &payer, &[&payer]);
+                        let _ = mid;
+                    }
+                    let m_idx = (next_u64() % 2) as usize;
+                    let m_addr = if m_idx == 0 { f_btc_mkt } else { f_eth_mkt };
+                    let mp = read_u64(&svm, &m_addr, 112);
+                    let mode = [0u8, 1u8, 4u8][(next_u64() % 3) as usize];
+                    let is_long = next_u64() % 2 == 0;
+                    let qty = ((next_u64() % 4) + 1) * POS_SCALE;
+                    let lim = if (mode != 1 && is_long) || (mode == 1 && !is_long) { mp + mp / 50 } else { mp.saturating_sub(mp / 50).max(1) };
+                    if send_ixs_try(&mut svm, &[ix_trade_with_matcher(prog_id, f_dex, m_addr, f_pfls[ti], f_traders[ti].pubkey(), f_hlp_pfl, matcher_prog, f_prop_ctx, None, mode, is_long, qty, lim)], &payer, &[&payer, &f_traders[ti]]).is_ok() {
+                        f_ok += 1; f_matcher_trades += 1;
+                    }
+                }
+                // 7..9: Direct P2P trade across BTC, ETH, or adversarial `M_atk` (mode=0/1/4)
+                7..=9 => {
+                    let a = (next_u64() % 4) as usize;
+                    let b = (a + 1 + (next_u64() % 3) as usize) % 4;
+                    let m = f_all_mkts[(next_u64() % 3) as usize];
+                    for &mk in &f_all_mkts {
+                        let _ = send_ixs_try(&mut svm, &[ix_refresh_leg(prog_id, f_dex, mk, f_pfls[a], false)], &payer, &[&payer]);
+                        let _ = send_ixs_try(&mut svm, &[ix_refresh_leg(prog_id, f_dex, mk, f_pfls[b], false)], &payer, &[&payer]);
+                    }
+                    let mode = [0u8, 1u8, 4u8][(next_u64() % 3) as usize];
+                    let qty = ((next_u64() % 5) + 1) * POS_SCALE;
+                    if send_ixs_try(&mut svm, &[ix_trade(prog_id, f_dex, m, f_pfls[a], f_traders[a].pubkey(), f_pfls[b], f_traders[b].pubkey(), mode, qty)], &payer, &[&payer, &f_traders[a], &f_traders[b]]).is_ok() {
+                        f_ok += 1;
+                    }
+                }
+                // 10..11: Deposit / Withdraw collateral on traders
+                10..=11 => {
+                    let ti = (next_u64() % 4) as usize;
+                    let amt = ((next_u64() % 200) + 1) * POS_SCALE;
+                    if act == 10 {
+                        if send_ixs_try(&mut svm, &[ix_deposit_collateral(prog_id, f_dex, f_pfls[ti], f_traders[ti].pubkey(), f_toks[ti], mint, f_vault, TOKEN_PROGRAM_ID, amt)], &payer, &[&payer, &f_traders[ti]]).is_ok() {
+                            f_ok += 1;
+                        }
+                    } else {
+                        for &mk in &f_all_mkts {
+                            let _ = send_ixs_try(&mut svm, &[ix_refresh_leg(prog_id, f_dex, mk, f_pfls[ti], false)], &payer, &[&payer]);
+                        }
+                        if send_ixs_try(&mut svm, &[ix_withdraw_collateral(prog_id, f_dex, f_pfls[ti], f_traders[ti].pubkey(), f_toks[ti], mint, f_vault, TOKEN_PROGRAM_ID, amt)], &payer, &[&payer, &f_traders[ti]]).is_ok() {
+                            f_ok += 1;
+                        }
+                    }
+                }
+                // 12..13: Liquidations (HLP takeover on BTC/ETH OR fallback on any market!) + ClearDeadLeg
+                12..=13 => {
+                    let ti = (next_u64() % 4) as usize;
+                    let m = f_all_mkts[(next_u64() % 3) as usize];
+                    for &mk in &f_all_mkts {
+                        let _ = send_ixs_try(&mut svm, &[ix_refresh_leg(prog_id, f_dex, mk, f_pfls[ti], false)], &payer, &[&payer]);
+                    }
+                    if act == 12 && m != f_atk_mkt {
+                        if send_ixs_try(&mut svm, &[ix_hlp_takeover_liquidate(hlp_prog, f_hlp_vault, h_strat.pubkey(), f_dex, m, f_pfls[ti], f_hlp_fee_tok, mint, f_vault, TOKEN_PROGRAM_ID, f_hlp_pfl, f_hlp_pda, prog_id, 0)], &payer, &[&payer, &h_strat]).is_ok() {
+                            f_ok += 1; f_liqs += 1; f_hlp_ops += 1;
+                        }
+                    } else if send_ixs_try(&mut svm, &[ix_liquidate(prog_id, f_dex, m, f_pfls[ti], keeper_tok, mint, f_vault, TOKEN_PROGRAM_ID)], &payer, &[&payer]).is_ok() {
+                        f_ok += 1; f_liqs += 1;
+                    }
+                    let _ = send_ixs_try(&mut svm, &[ix_clear_dead_leg(prog_id, f_dex, m, f_pfls[ti])], &payer, &[&payer]);
+                }
+                // 14..15: `hlp_vault.so` passive LP deposit & withdraw!
+                14..=15 => {
+                    let li = (next_u64() % 2) as usize;
+                    for &mk in &[f_btc_mkt, f_eth_mkt] {
+                        let _ = send_ixs_try(&mut svm, &[ix_refresh_leg(prog_id, f_dex, mk, f_hlp_pfl, false)], &payer, &[&payer]);
+                    }
+                    if act == 14 {
+                        let amt = ((next_u64() % 100) + 1) * POS_SCALE;
+                        if send_ixs_try(&mut svm, &[ix_deposit_hlp(hlp_prog, f_hlp_vault, f_hlp_recs[li], f_hlp_lps[li].pubkey(), f_hlp_toks[li], f_dex, f_hlp_pfl, mint, f_vault, TOKEN_PROGRAM_ID, prog_id, amt)], &payer, &[&payer, &f_hlp_lps[li]]).is_ok() {
+                            f_ok += 1; f_hlp_ops += 1;
+                        }
+                    } else {
+                        let cur_sh = read_u64(&svm, &f_hlp_recs[li], 72);
+                        if cur_sh > 10 * POS_SCALE {
+                            let burn = (cur_sh / 10).max(1);
+                            if send_ixs_try(&mut svm, &[ix_withdraw_hlp(hlp_prog, f_hlp_vault, f_hlp_recs[li], f_hlp_lps[li].pubkey(), f_hlp_toks[li], f_dex, f_hlp_pfl, f_hlp_pda, mint, f_vault, TOKEN_PROGRAM_ID, prog_id, burn)], &payer, &[&payer, &f_hlp_lps[li]]).is_ok() {
+                                f_ok += 1; f_hlp_ops += 1;
+                            }
+                        }
+                    }
+                }
+                // 16..17: `reward_module.so` full lifecycle (`StartEpoch -> SubmitBid -> SettleEpoch -> ClaimQuote`)!
+                16..=17 => {
+                    if let Some((ep_acc, ref mut bids)) = cur_epoch_acc {
+                        let settled = read_u8(&svm, &ep_acc, 4);
+                        let end_slot = read_u64(&svm, &ep_acc, 88);
+                        if settled == 0 && f_slot < end_slot {
+                            let bi = (next_u64() % 4) as usize;
+                            let rec = if let Some((_, r)) = bids.iter().find(|(idx, _)| *idx == bi) {
+                                *r
+                            } else {
+                                let r = create_prog_acc(&mut svm, &rew_prog, BID_SIZE);
+                                bids.push((bi, r));
+                                r
+                            };
+                            let b_amt = ((next_u64() % 50) + 1) * POS_SCALE;
+                            if send_ixs_try(&mut svm, &[ix_submit_bid(rew_prog, f_rew_cfg, ep_acc, rec, f_traders[bi].pubkey(), f_btoks[bi], f_rew_tescrow, f_t_mint, TOKEN_PROGRAM_ID, b_amt)], &payer, &[&payer, &f_traders[bi]]).is_ok() {
+                                f_ok += 1; f_rew_ops += 1;
+                            }
+                        } else if settled == 0 && f_slot >= end_slot {
+                            if send_ixs_try(&mut svm, &[ix_settle_epoch(rew_prog, f_rew_cfg, ep_acc, f_rew_pda, f_rew_tescrow, f_t_mint, TOKEN_PROGRAM_ID, None)], &payer, &[&payer]).is_ok() {
+                                f_ok += 1; f_rew_ops += 1;
+                            }
+                        } else {
+                            // Claim all bids from settled epoch, then clear for next epoch!
+                            for &(bi, rec) in bids.iter() {
+                                if send_ixs_try(&mut svm, &[ix_claim_quote(rew_prog, f_rew_cfg, ep_acc, rec, f_traders[bi].pubkey(), f_rew_pda, f_rew_qvault, f_toks[bi], mint, TOKEN_PROGRAM_ID)], &payer, &[&payer, &f_traders[bi]]).is_ok() {
+                                    f_ok += 1; f_rew_ops += 1;
+                                }
+                            }
+                            cur_epoch_acc = None;
+                        }
+                    } else {
+                        let new_ep = create_prog_acc(&mut svm, &rew_prog, EPOCH_SIZE);
+                        if send_ixs_try(&mut svm, &[ix_start_epoch(rew_prog, f_rew_cfg, new_ep, f_dex, f_btc_mkt, f_rew_pda, mint, f_vault, f_rew_qvault, TOKEN_PROGRAM_ID, prog_id)], &payer, &[&payer]).is_ok() {
+                            cur_epoch_acc = Some((new_ep, Vec::new()));
+                            f_ok += 1; f_rew_ops += 1;
+                        }
+                    }
+                }
+                // 18..19: Adversarial attack probes (MUST ALL BE REJECTED!)
+                _ => {
+                    let probe = next_u64() % 4;
+                    let ti = (next_u64() % 4) as usize;
+                    let res = match probe {
+                        0 => // Unlisted `M_atk` through `matcher.so` -> MUST FAIL!
+                            send_ixs_try(&mut svm, &[ix_trade_with_matcher(prog_id, f_dex, f_atk_mkt, f_pfls[ti], f_traders[ti].pubkey(), f_hlp_pfl, matcher_prog, f_prop_ctx, None, 0, true, POS_SCALE, 300 * POS_SCALE)], &payer, &[&payer, &f_traders[ti]]),
+                        1 => // Strategist binds `evil_matcher.so` -> MUST FAIL!
+                            send_ixs_try(&mut svm, &[ix_set_hlp_matcher(hlp_prog, f_hlp_vault, h_strat.pubkey(), f_hlp_pfl, f_hlp_pda, prog_id, Some(f_evil_ctx), None)], &payer, &[&payer, &h_strat]),
+                        2 => // Strategist HLP takeover on unlisted `M_atk` -> MUST FAIL!
+                            send_ixs_try(&mut svm, &[ix_hlp_takeover_liquidate(hlp_prog, f_hlp_vault, h_strat.pubkey(), f_dex, f_atk_mkt, f_pfls[ti], f_hlp_fee_tok, mint, f_vault, TOKEN_PROGRAM_ID, f_hlp_pfl, f_hlp_pda, prog_id, 0)], &payer, &[&payer, &h_strat]),
+                        _ => // Dup-stub attack `DepositCollateral(ownerTok == dex)` -> MUST FAIL!
+                            send_ixs_try(&mut svm, &[ix_deposit_collateral(prog_id, f_dex, f_pfls[ti], f_traders[ti].pubkey(), f_dex, mint, f_vault, TOKEN_PROGRAM_ID, POS_SCALE)], &payer, &[&payer, &f_traders[ti]]),
+                    };
+                    assert!(res.is_err(), "Suite 17B adversarial probe {} MUST ALWAYS BE REJECTED at step {}!", probe, step);
+                    f_adv_blocked += 1;
+                }
+            }
+
+            // === CONTINUOUS MULTI-PROGRAM INVARIANT CHECKS AFTER EVERY STEP ===
+            // 1. Core DEX 5-bucket stock equality + per-leg `lockedMm` firewall sum + vault SPL backing!
+            assert_dex_invariants(&svm, &f_dex, &f_vault, &f_all_mkts, &f_all_pfls, "suite17B-fuzz");
+            // 2. Honest `I_BTC` NEVER suffers bad debt or cross-market contagion!
+            let cur_ibtc = read_u64(&svm, &f_btc_mkt, 224);
+            let cur_ibtc_front = read_u64(&svm, &f_btc_mkt, 232);
+            assert!(cur_ibtc + cur_ibtc_front >= f_min_ibtc, "Suite 17B: Honest BTC insurance NAV dropped below initial $1,000! cur={} front={} min={}", cur_ibtc, cur_ibtc_front, f_min_ibtc);
+            f_min_ibtc = f_min_ibtc.max(cur_ibtc + cur_ibtc_front).min(cur_ibtc + cur_ibtc_front);
+            // 3. `HlpVault` share conservation: sum of LP receipt shares <= totalShares!
+            let hlp_tot_sh = read_u64(&svm, &f_hlp_vault, 200);
+            let hlp_sum_sh: u64 = f_hlp_recs.iter().map(|r| read_u64(&svm, r, 72)).sum();
+            assert!(hlp_sum_sh <= hlp_tot_sh, "Suite 17B: HLP share sum {} > totalShares {}!", hlp_sum_sh, hlp_tot_sh);
+            // 4. `RewardModule` 3-bucket quote escrow conservation (`quoteVault >= active + rollover + pending`)!
+            let rew_act = read_u64(&svm, &f_rew_cfg, 360);
+            let rew_roll = read_u64(&svm, &f_rew_cfg, 368);
+            let rew_pend = read_u64(&svm, &f_rew_cfg, 376);
+            let rew_qbal = token_amount(&svm, &f_rew_qvault);
+            assert!(rew_qbal >= rew_act + rew_roll + rew_pend, "Suite 17B: RewardModule quoteVault {} < active({}) + rollover({}) + pending({})!", rew_qbal, rew_act, rew_roll, rew_pend);
+        }
+        println!(
+            "[PASS] Suite 17: Strict ABI Dup-Stub Regressions (17A) + 5,000-Step Multi-Program Adversarial Fuzzer (17B: {} valid txs across ALL 5 .so binaries — cranks={}, matcher={}, hlp={}, reward={}, liqs={}, adv_blocked={}, 0 invariant violations!)",
+            f_ok, f_cranks, f_matcher_trades, f_hlp_ops, f_rew_ops, f_liqs, f_adv_blocked
+        );
+    }
+
     println!("==================================================================================");
-    println!("  ALL 16 PERCOLATOR-LEAN VERIFICATION + BORING EXCHANGE + 8-LEG + REWARD + PROPAMM + FLIP + HLP + RED-TEAM SUITES PASSED 100%!");
+    println!("  ALL 17 PERCOLATOR-LEAN VERIFICATION + BORING EXCHANGE + 8-LEG + REWARD + PROPAMM + FLIP + HLP + RED-TEAM + MULTI-PROGRAM FUZZ SUITES PASSED 100%!");
     println!("==================================================================================");
 }

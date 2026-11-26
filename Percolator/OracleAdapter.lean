@@ -533,16 +533,16 @@ def handleInitAdapter (input : Ptr) : SolanaM Unit := do
   let mkt      ← AccountView.nextCursor percProg
   let feed     ← AccountView.nextCursor mkt
 
+  SolanaM.require ((← rawLoadU8 adp) == ABI.nonDupMarker &&
+                   (← rawLoadU8 admin) == ABI.nonDupMarker &&
+                   (← rawLoadU8 percProg) == ABI.nonDupMarker &&
+                   (← rawLoadU8 mkt) == ABI.nonDupMarker &&
+                   (← rawLoadU8 feed) == ABI.nonDupMarker) PErr.aliasedAccounts
   SolanaM.require (← AccountView.isSigner admin) Err.missingRequiredSignature
   SolanaM.require (← AccountView.isWritable adp) Err.invalidAccountData
   SolanaM.require (← pubkeyEq (AccountView.ownerPtr adp) progId) Err.illegalOwner
   SolanaM.require ((← AccountView.dataLen adp) == AdpOff.size) Err.invalidAccountData
   SolanaM.require ((← loadU32 (AccountView.dataPtr adp) 0) == 0) Err.accountAlreadyInitialized
-
-  SolanaM.require ((← rawLoadU8 admin) == ABI.nonDupMarker &&
-                   (← rawLoadU8 percProg) == ABI.nonDupMarker &&
-                   (← rawLoadU8 mkt) == ABI.nonDupMarker &&
-                   (← rawLoadU8 feed) == ABI.nonDupMarker) PErr.aliasedAccounts
   -- Pin adapter initialization strictly to the bound market's active `marketAdmin`
   -- (blocks unauthorized claim/hijack of an uninitialized adapter PDA bound to a market!).
   SolanaM.require (← pubkeyEq (AccountView.ownerPtr mkt) (AccountView.keyPtr percProg)) Err.illegalOwner
@@ -608,7 +608,8 @@ def handleCrank (input : Ptr) : SolanaM Unit := do
   let oracAuthPda ← AccountView.nextCursor feed
   let percProg    ← AccountView.nextCursor oracAuthPda
 
-  SolanaM.require ((← rawLoadU8 mkt) == ABI.nonDupMarker &&
+  SolanaM.require ((← rawLoadU8 adp) == ABI.nonDupMarker &&
+                   (← rawLoadU8 mkt) == ABI.nonDupMarker &&
                    (← rawLoadU8 feed) == ABI.nonDupMarker &&
                    (← rawLoadU8 oracAuthPda) == ABI.nonDupMarker &&
                    (← rawLoadU8 percProg) == ABI.nonDupMarker) PErr.aliasedAccounts
@@ -729,7 +730,8 @@ def handleInitEwma (input : Ptr) : SolanaM Unit := do
   SolanaM.require (ix.len >= 26) Err.invalidInstructionData
   let admin ← AccountView.nextCursor adp
 
-  SolanaM.require ((← rawLoadU8 admin) == ABI.nonDupMarker) PErr.aliasedAccounts
+  SolanaM.require ((← rawLoadU8 adp) == ABI.nonDupMarker &&
+                   (← rawLoadU8 admin) == ABI.nonDupMarker) PErr.aliasedAccounts
   SolanaM.require (← AccountView.isSigner admin) Err.missingRequiredSignature
   SolanaM.require (← AccountView.isWritable adp) Err.invalidAccountData
   SolanaM.require (← pubkeyEq (AccountView.ownerPtr adp) progId) Err.illegalOwner
@@ -768,7 +770,8 @@ def handlePushEwmaMark (input : Ptr) : SolanaM Unit := do
   SolanaM.require (ix.len >= 9) Err.invalidInstructionData
   let admin ← AccountView.nextCursor adp
 
-  SolanaM.require ((← rawLoadU8 admin) == ABI.nonDupMarker) PErr.aliasedAccounts
+  SolanaM.require ((← rawLoadU8 adp) == ABI.nonDupMarker &&
+                   (← rawLoadU8 admin) == ABI.nonDupMarker) PErr.aliasedAccounts
   SolanaM.require (← AccountView.isSigner admin) Err.missingRequiredSignature
   SolanaM.require (← AccountView.isWritable adp) Err.invalidAccountData
   SolanaM.require (← pubkeyEq (AccountView.ownerPtr adp) progId) Err.illegalOwner

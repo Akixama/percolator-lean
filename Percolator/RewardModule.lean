@@ -479,7 +479,7 @@ def handleInitReward (input : Ptr) : SolanaM Unit := do
   let targetEscrow  ← AccountView.nextCursor targetMint
   let targetTokProg ← AccountView.nextCursor targetEscrow
 
-  requireNonDup mktAdmin; requireNonDup percProg; requireNonDup dex
+  requireNonDup cfg; requireNonDup mktAdmin; requireNonDup percProg; requireNonDup dex
   requireNonDup mkt; requireNonDup rewAuthPda; requireNonDup quoteVault
   requireNonDup targetEscrow
   SolanaM.require (← AccountView.isSigner mktAdmin) Err.missingRequiredSignature
@@ -600,7 +600,7 @@ def handleStartEpoch (input : Ptr) : SolanaM Unit := do
   let quoteTokProg ← AccountView.nextCursor quoteVault
   let percProg     ← AccountView.nextCursor quoteTokProg
 
-  requireNonDup epochAcc; requireNonDup dex; requireNonDup mkt; requireNonDup rewAuthPda
+  requireNonDup cfg; requireNonDup epochAcc; requireNonDup dex; requireNonDup mkt; requireNonDup rewAuthPda
   requireNonDup quoteMint; requireNonDup dexVault; requireNonDup quoteVault
   requireNonDup quoteTokProg; requireNonDup percProg
   SolanaM.require (← AccountView.isWritable cfg) Err.invalidAccountData
@@ -691,7 +691,7 @@ def handleSubmitBid (input : Ptr) : SolanaM Unit := do
   let targetMint      ← AccountView.nextCursor targetEscrow
   let targetTokProg   ← AccountView.nextCursor targetMint
 
-  requireNonDup epochAcc; requireNonDup bidReceipt; requireNonDup bidder
+  requireNonDup cfg; requireNonDup epochAcc; requireNonDup bidReceipt; requireNonDup bidder
   requireNonDup bidderTargetTok; requireNonDup targetEscrow
   requireNonDup targetMint; requireNonDup targetTokProg
   SolanaM.require (← AccountView.isSigner bidder) Err.missingRequiredSignature
@@ -777,7 +777,7 @@ def handleSettleEpoch (input : Ptr) : SolanaM Unit := do
   let targetMint    ← AccountView.nextCursor targetEscrow
   let targetTokProg ← AccountView.nextCursor targetMint
 
-  requireNonDup epochAcc; requireNonDup rewAuthPda; requireNonDup targetEscrow
+  requireNonDup cfg; requireNonDup epochAcc; requireNonDup rewAuthPda; requireNonDup targetEscrow
   requireNonDup targetMint; requireNonDup targetTokProg
   SolanaM.require (← AccountView.isWritable cfg) Err.invalidAccountData
   SolanaM.require (← AccountView.isWritable epochAcc) Err.invalidAccountData
@@ -867,7 +867,7 @@ def handleClaimQuote (input : Ptr) : SolanaM Unit := do
   let quoteMint      ← AccountView.nextCursor bidderQuoteTok
   let quoteTokProg   ← AccountView.nextCursor quoteMint
 
-  requireNonDup epochAcc; requireNonDup bidReceipt; requireNonDup bidder
+  requireNonDup cfg; requireNonDup epochAcc; requireNonDup bidReceipt; requireNonDup bidder
   requireNonDup rewAuthPda; requireNonDup quoteVault; requireNonDup bidderQuoteTok
   requireNonDup quoteMint; requireNonDup quoteTokProg
   SolanaM.require (← AccountView.isSigner bidder) Err.missingRequiredSignature

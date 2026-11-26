@@ -9,3 +9,7 @@ import Percolator.OracleAdapter
 import Percolator.RewardModule
 import Percolator.HlpVault
 import Percolator.Refinement
+import Percolator.AbiProofs
+import Percolator.HandlerProofs
+import Percolator.LivenessProofs
+import Percolator.ExternalProofs

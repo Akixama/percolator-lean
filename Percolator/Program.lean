@@ -512,7 +512,7 @@ def settleAndRefreshLeg (dexData mktData pflData : Ptr) (slotIdx curSlot : UInt6
 /-! ### Instruction Handlers (All 19 Unified Instructions, Auto-Outlined by `lean-svm`) -/
 
 def handleInitDex (input : Ptr) : SolanaM Unit := do
-  let (dex, admin, mint, vaultPda, feeVault, tokProg, sysProg, ix, progId) ← parse7 input
+  let (dex, admin, mint, vaultPda, feeVault, tokProg, sysProg, ix, progId) ← parseStrict7 input PErr.aliasedAccounts
   SolanaM.require (ix.len >= 20) Err.invalidInstructionData
   requireSigner admin; requireWritable vaultPda
   checkFreshAccount dex progId DexOff.size
@@ -566,7 +566,7 @@ def handleUpdateCreateFee (input : Ptr) : SolanaM Unit := do
   SolanaM.require (n >= 2) Err.notEnoughAccountKeys
   SolanaM.require (ix.len >= 9) Err.invalidInstructionData
   let admin ← AccountView.nextCursor dex
-  requireNonDup admin
+  requireNonDup dex; requireNonDup admin
   requireSigner admin; requireWritable dex
   checkOwnedMagic dex progId DexOff.size MAGIC_DEX
   let dData := AccountView.dataPtr dex
@@ -576,14 +576,17 @@ def handleUpdateCreateFee (input : Ptr) : SolanaM Unit := do
   storeU64 dData DexOff.createFee newFee
   if n >= 3 then
     let newAdmin ← AccountView.nextCursor admin
-    let dup ← rawLoadU8 newAdmin
-    let effNewAdmin := if dup == ABI.nonDupMarker then newAdmin else admin
-    if dup != ABI.nonDupMarker then SolanaM.require (dup == 1) PErr.aliasedAccounts
+    let effNewAdmin ← AccountView.resolveDup newAdmin 1 admin PErr.aliasedAccounts
     SolanaM.require (!(← pubkeyIsZero (AccountView.keyPtr effNewAdmin))) PErr.invalidParams
     pubkeyCopy (dData + DexOff.admin) (AccountView.keyPtr effNewAdmin)
 
 def handleCreateMarket (input : Ptr) : SolanaM Unit := do
-  let (dex, mkt, mint, oracleAuth, creator, creatorTok, feeVaultTok, tokProg, ix, progId) ← parse8 input
+  let (dex, mkt, mint, oracleAuth, creatorRaw, creatorTok, feeVaultTokRaw, tokProg, ix, progId) ← parse8 input
+  requireNonDup dex; requireNonDup mkt; requireNonDup mint; requireNonDup oracleAuth
+  let creator ← AccountView.resolveDup creatorRaw 3 oracleAuth PErr.aliasedAccounts
+  requireNonDup creatorTok
+  let feeVaultTok ← AccountView.resolveDup feeVaultTokRaw 5 creatorTok PErr.aliasedAccounts
+  requireNonDup tokProg
   SolanaM.require (ix.len >= 92) Err.invalidInstructionData
   requireSigner creator; requireWritable dex
   checkOwnedMagic dex progId DexOff.size MAGIC_DEX
@@ -672,7 +675,7 @@ def handleUpdateMarketAuth (input : Ptr) : SolanaM Unit := do
   let (n, mkt, ix, progId) ← parseIxOnly input
   SolanaM.require (n >= 2) Err.notEnoughAccountKeys
   let admin ← AccountView.nextCursor mkt
-  requireNonDup admin
+  requireNonDup mkt; requireNonDup admin
   requireSigner admin; requireWritable mkt
   checkOwnedMagic mkt progId MktOff.size MAGIC_MARKET
   let mData := AccountView.dataPtr mkt
@@ -683,9 +686,7 @@ def handleUpdateMarketAuth (input : Ptr) : SolanaM Unit := do
   if role == 0 then
     if n >= 3 then
       let newAdmin ← AccountView.nextCursor admin
-      let dup ← rawLoadU8 newAdmin
-      let effNewAdmin := if dup == ABI.nonDupMarker then newAdmin else admin
-      if dup != ABI.nonDupMarker then SolanaM.require (dup == 1) PErr.aliasedAccounts
+      let effNewAdmin ← AccountView.resolveDup newAdmin 1 admin PErr.aliasedAccounts
       pubkeyCopy (mData + MktOff.marketAdmin) (AccountView.keyPtr effNewAdmin)
     else
       storeU64 mData (MktOff.marketAdmin + 0)  0
@@ -695,14 +696,12 @@ def handleUpdateMarketAuth (input : Ptr) : SolanaM Unit := do
   else
     SolanaM.require (n >= 3) Err.notEnoughAccountKeys
     let newOracle ← AccountView.nextCursor admin
-    let dup ← rawLoadU8 newOracle
-    let effNewOracle := if dup == ABI.nonDupMarker then newOracle else admin
-    if dup != ABI.nonDupMarker then SolanaM.require (dup == 1) PErr.aliasedAccounts
+    let effNewOracle ← AccountView.resolveDup newOracle 1 admin PErr.aliasedAccounts
     SolanaM.require (!(← pubkeyIsZero (AccountView.keyPtr effNewOracle))) PErr.invalidParams
     pubkeyCopy (mData + MktOff.oracleAuth) (AccountView.keyPtr effNewOracle)
 
 def handleUpdateOracle (input : Ptr) : SolanaM Unit := do
-  let (mkt, oracleAuth, ix, progId) ← parse2 input
+  let (mkt, oracleAuth, ix, progId) ← parseStrict2 input PErr.aliasedAccounts
   SolanaM.require (ix.len >= 18) Err.invalidInstructionData
   requireSigner oracleAuth; requireWritable mkt
   checkOwnedMagic mkt progId MktOff.size MAGIC_MARKET
@@ -759,7 +758,7 @@ def handleUpdateOracle (input : Ptr) : SolanaM Unit := do
   log64 EvtTag.oracle (← loadU64 mData MktOff.marketId) newPrice fundSign.toUInt64 fundE6
 
 def handleInitPortfolio (input : Ptr) : SolanaM Unit := do
-  let (dex, pfl, owner, _, progId) ← parse3 input
+  let (dex, pfl, owner, _, progId) ← parseStrict3 input PErr.aliasedAccounts
   requireSigner owner; requireWritable dex
   checkOwnedMagic dex progId DexOff.size MAGIC_DEX
   checkFreshAccount pfl progId PflOff.size
@@ -775,7 +774,7 @@ def handleInitPortfolio (input : Ptr) : SolanaM Unit := do
   pubkeyCopy (fData + PflOff.owner) (AccountView.keyPtr owner)
 
 def handleDepositCollateral (input : Ptr) : SolanaM Unit := do
-  let (dex, pfl, owner, ownerTok, mint, vaultPda, tokProg, ix, progId) ← parse7 input
+  let (dex, pfl, owner, ownerTok, mint, vaultPda, tokProg, ix, progId) ← parseStrict7 input PErr.aliasedAccounts
   SolanaM.require (ix.len >= 9) Err.invalidInstructionData
   requireSigner owner; requireWritable dex; requireWritable pfl
   checkOwnedMagic dex progId DexOff.size MAGIC_DEX
@@ -797,7 +796,7 @@ def handleDepositCollateral (input : Ptr) : SolanaM Unit := do
   log64 EvtTag.deposit (← loadU64 fData PflOff.portfolioId) amount (← loadU64 fData PflOff.capital) 0
 
 def handleWithdrawCollateral (input : Ptr) : SolanaM Unit := do
-  let (dex, pfl, owner, destTok, mint, vaultPda, tokProg, ix, progId) ← parse7 input
+  let (dex, pfl, owner, destTok, mint, vaultPda, tokProg, ix, progId) ← parseStrict7 input PErr.aliasedAccounts
   SolanaM.require (ix.len >= 9) Err.invalidInstructionData
   requireSigner owner; requireWritable dex; requireWritable pfl
   checkOwnedMagic dex progId DexOff.size MAGIC_DEX
@@ -833,6 +832,8 @@ def handleWithdrawCollateral (input : Ptr) : SolanaM Unit := do
 
 def handleDepositInsurance (input : Ptr) : SolanaM Unit := do
   let (dex, mkt, receipt, lp, lpTok, mint, vaultPda, tokProg, ix, progId) ← parse8 input
+  requireNonDup dex; requireNonDup mkt; requireNonDup lp; requireNonDup lpTok
+  requireNonDup mint; requireNonDup vaultPda; requireNonDup tokProg
   SolanaM.require (ix.len >= 9) Err.invalidInstructionData
   requireSigner lp; requireWritable dex; requireWritable mkt
   checkOwnedMagic dex progId DexOff.size MAGIC_DEX
@@ -857,6 +858,7 @@ def handleDepositInsurance (input : Ptr) : SolanaM Unit := do
     addU64At dData DexOff.totalInsurance amount
     addU64At mData MktOff.insurance      amount
   else
+    requireNonDup receipt
     requireWritable receipt
     requireKeyEq (AccountView.ownerPtr receipt) progId Err.illegalOwner
     SolanaM.require ((← AccountView.dataLen receipt) == InsOff.size) Err.invalidAccountData
@@ -905,7 +907,7 @@ def handleDepositInsurance (input : Ptr) : SolanaM Unit := do
     addU64At rData InsOff.shares         minted
 
 def handleWithdrawInsurance (input : Ptr) : SolanaM Unit := do
-  let (dex, mkt, receipt, lp, destTok, mint, vaultPda, tokProg, ix, progId) ← parse8 input
+  let (dex, mkt, receipt, lp, destTok, mint, vaultPda, tokProg, ix, progId) ← parseStrict8 input PErr.aliasedAccounts
   SolanaM.require (ix.len >= 9) Err.invalidInstructionData
   requireSigner lp; requireWritable dex; requireWritable mkt; requireWritable receipt
   checkOwnedMagic dex     progId DexOff.size MAGIC_DEX
@@ -953,7 +955,7 @@ def handleRefreshLeg (input : Ptr) : SolanaM Unit := do
   SolanaM.require (n >= 3) Err.notEnoughAccountKeys
   let mkt ← AccountView.nextCursor dex
   let pfl ← AccountView.nextCursor mkt
-  requireNonDup mkt; requireNonDup pfl
+  requireNonDup dex; requireNonDup mkt; requireNonDup pfl
   requireWritable dex; requireWritable mkt; requireWritable pfl
   checkOwnedMagic dex progId DexOff.size MAGIC_DEX
   checkOwnedMagic mkt progId MktOff.size MAGIC_MARKET
@@ -1314,7 +1316,9 @@ def legCloseCapU64 (mData pflData : Ptr) (mid : UInt64) (targetSide : UInt8) : S
     tradeCore dData mData fBuyer fSeller subArgs
 
 def handleTrade (input : Ptr) : SolanaM Unit := do
-  let (dex, mkt, pflL, ownerL, pflS, ownerS, ix, progId) ← parse6 input
+  let (dex, mkt, pflL, ownerL, pflS, ownerSRaw, ix, progId) ← parse6 input
+  requireNonDup dex; requireNonDup mkt; requireNonDup pflL; requireNonDup ownerL; requireNonDup pflS
+  let ownerS ← AccountView.resolveDup ownerSRaw 3 ownerL PErr.aliasedAccounts
   SolanaM.require (ix.len >= 10) Err.invalidInstructionData
   requireSigner ownerL; requireSigner ownerS
   requireWritable dex; requireWritable mkt; requireWritable pflL; requireWritable pflS
@@ -1361,7 +1365,8 @@ def handleLiquidate (input : Ptr) : SolanaM Unit := do
   let mint     ← AccountView.nextCursor liqTok
   let vaultPda ← AccountView.nextCursor mint
   let tokProg  ← AccountView.nextCursor vaultPda
-  requireNonDup mkt; requireNonDup pfl; requireNonDup liqTok
+  requireNonDup dex; requireNonDup mkt; requireNonDup pfl; requireNonDup liqTok
+  requireNonDup mint; requireNonDup vaultPda; requireNonDup tokProg
 
   let mode   ← loadOptU8  ix.ptr ix.len 1
   let reqQty ← loadOptU64 ix.ptr ix.len 2
@@ -1525,7 +1530,7 @@ def handleLiquidate (input : Ptr) : SolanaM Unit := do
   log64 EvtTag.liquidate ((mid <<< 8) ||| mode.toUInt64) rawClose liqFee shortfall
 
 def handleClearDeadLeg (input : Ptr) : SolanaM Unit := do
-  let (dex, mkt, pfl, _, progId) ← parse3 input
+  let (dex, mkt, pfl, _, progId) ← parseStrict3 input PErr.aliasedAccounts
   requireWritable dex; requireWritable mkt; requireWritable pfl
   checkOwnedMagic dex progId DexOff.size MAGIC_DEX
   checkOwnedMagic mkt progId MktOff.size MAGIC_MARKET
@@ -1568,7 +1573,7 @@ def handleClearDeadLeg (input : Ptr) : SolanaM Unit := do
   freeLegIfEmpty fData slotIdx
 
 def handleStartWindDown (input : Ptr) : SolanaM Unit := do
-  let (mkt, caller, _, progId) ← parse2 input
+  let (mkt, caller, _, progId) ← parseStrict2 input PErr.aliasedAccounts
   requireSigner caller; requireWritable mkt
   checkOwnedMagic mkt progId MktOff.size MAGIC_MARKET
   let mData := AccountView.dataPtr mkt
@@ -1588,7 +1593,7 @@ def handleStartWindDown (input : Ptr) : SolanaM Unit := do
   storeU64 mData MktOff.windDownSlot curSlot
 
 def handleForceClosePair (input : Ptr) : SolanaM Unit := do
-  let (dex, mkt, pflL, pflS, _, progId) ← parse4 input
+  let (dex, mkt, pflL, pflS, _, progId) ← parseStrict4 input PErr.aliasedAccounts
   requireWritable dex; requireWritable mkt; requireWritable pflL; requireWritable pflS
   requireKeyNe (AccountView.keyPtr pflL) (AccountView.keyPtr pflS) PErr.aliasedAccounts
   checkOwnedMagic dex  progId DexOff.size MAGIC_DEX
@@ -1674,7 +1679,7 @@ def handleForceClosePair (input : Ptr) : SolanaM Unit := do
   log64 EvtTag.forceClose mid q oiL' curSlot
 
 def handleResolveMarket (input : Ptr) : SolanaM Unit := do
-  let (dex, mkt, _, progId) ← parse2 input
+  let (dex, mkt, _, progId) ← parseStrict2 input PErr.aliasedAccounts
   requireWritable dex; requireWritable mkt
   checkOwnedMagic dex progId DexOff.size MAGIC_DEX
   checkOwnedMagic mkt progId MktOff.size MAGIC_MARKET
@@ -1696,7 +1701,7 @@ def handleResolveMarket (input : Ptr) : SolanaM Unit := do
   log64 EvtTag.resolve (← loadU64 mData MktOff.marketId) resNum totPnl 0
 
 def handleClaimResolved (input : Ptr) : SolanaM Unit := do
-  let (dex, mkt, pfl, _, progId) ← parse3 input
+  let (dex, mkt, pfl, _, progId) ← parseStrict3 input PErr.aliasedAccounts
   requireWritable dex; requireWritable mkt; requireWritable pfl
   checkOwnedMagic dex progId DexOff.size MAGIC_DEX
   checkOwnedMagic mkt progId MktOff.size MAGIC_MARKET
@@ -1731,7 +1736,7 @@ def handleClaimResolved (input : Ptr) : SolanaM Unit := do
   sweepResolvedDust dData mData
 
 def handleTombstoneMarket (input : Ptr) : SolanaM Unit := do
-  let (mkt, _, progId) ← parse1 input
+  let (mkt, _, progId) ← parseStrict1 input PErr.aliasedAccounts
   requireWritable mkt
   checkOwnedMagic mkt progId MktOff.size MAGIC_MARKET
   let mData := AccountView.dataPtr mkt
@@ -1748,7 +1753,9 @@ def handleTombstoneMarket (input : Ptr) : SolanaM Unit := do
     lamports so a closed account can NEVER be revived (neither as initialized nor as fresh `magic == 0`)
     even if rent lamports are refunded in the same transaction! -/
 def handleCloseAccount (input : Ptr) : SolanaM Unit := do
-  let (acc, authority, dest, _, progId) ← parse3 input
+  let (acc, authority, destRaw, _, progId) ← parse3 input
+  requireNonDup acc; requireNonDup authority
+  let dest ← AccountView.resolveDup destRaw 1 authority PErr.aliasedAccounts
   requireSigner authority; requireWritable acc; requireWritable dest
   requireKeyNe (AccountView.keyPtr acc) (AccountView.keyPtr dest) PErr.aliasedAccounts
   requireKeyEq (AccountView.ownerPtr acc) progId Err.illegalOwner
@@ -1789,7 +1796,7 @@ def handleCloseAccount (input : Ptr) : SolanaM Unit := do
     User capital (`C`), insurance (`I`), and realized pools (`R`) are 100% untouchable,
     and `V == C + I + R + S` holds bit-for-bit (`V -= sweepAmt`, `S -= sweepAmt`)! -/
 def handleSweepSurplus (input : Ptr) : SolanaM Unit := do
-  let (dex, admin, mint, vaultPda, feeVaultTok, tokProg, ix, progId) ← parse6 input
+  let (dex, admin, mint, vaultPda, feeVaultTok, tokProg, ix, progId) ← parseStrict6 input PErr.aliasedAccounts
   SolanaM.require (ix.len >= 9) Err.invalidInstructionData
   requireSigner admin; requireWritable dex; requireWritable vaultPda; requireWritable feeVaultTok
   checkOwnedMagic dex progId DexOff.size MAGIC_DEX
@@ -1817,7 +1824,7 @@ def handleSweepSurplus (input : Ptr) : SolanaM Unit := do
     may sign! User capital (`C`), insurance (`I`), realized pools (`R`), protocol surplus (`S`), and EVERY
     other market's `F_{m'}` are 100% untouchable (`V -= claimAmt`, `F_tot -= claimAmt`, `F_m -= claimAmt`)! -/
 def handleClaimReward (input : Ptr) : SolanaM Unit := do
-  let (dex, mkt, rewAuth, mint, vaultPda, destTok, tokProg, ix, progId) ← parse7 input
+  let (dex, mkt, rewAuth, mint, vaultPda, destTok, tokProg, ix, progId) ← parseStrict7 input PErr.aliasedAccounts
   SolanaM.require (ix.len >= 9) Err.invalidInstructionData
   requireSigner rewAuth; requireWritable dex; requireWritable mkt
   requireWritable vaultPda; requireWritable destTok
@@ -1853,7 +1860,7 @@ def handleSetPortfolioMatcher (input : Ptr) : SolanaM Unit := do
   let (n, pfl, _, progId) ← parseIxOnly input
   SolanaM.require (n >= 2) Err.notEnoughAccountKeys
   let owner ← AccountView.nextCursor pfl
-  requireNonDup owner
+  requireNonDup pfl; requireNonDup owner
   requireSigner owner; requireWritable pfl
   checkOwnedMagic pfl progId PflOff.size MAGIC_PORTFOLIO
   let fData := AccountView.dataPtr pfl
@@ -2055,7 +2062,7 @@ def handleTradeWithMatcher (input : Ptr) : SolanaM Unit := do
   let matcherCtx  ← AccountView.nextCursor matcherProg
   let mkt0        ← AccountView.nextCursor matcherCtx
 
-  requireNonDup takerPfl; requireNonDup takerOwner; requireNonDup lpPfl
+  requireNonDup dex; requireNonDup takerPfl; requireNonDup takerOwner; requireNonDup lpPfl
   requireNonDup matcherProg; requireNonDup matcherCtx
   requireSigner takerOwner
   requireWritable dex; requireWritable takerPfl

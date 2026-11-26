@@ -193,7 +193,7 @@ decreasing_by
     Ix data (`28 + 8 * nAllowed` B):
       `[0, paused:u8, nAllowed:u8, pad:u8, halfSpreadBps:u64, impactBps:u64, maxFillQty:u64, mid_0..mid_{n-1}:u64]`. -/
 def handleInitPropAmm (input : Ptr) : SolanaM Unit := do
-  let (ctx, owner, ix, progId) ← parse2 input
+  let (ctx, owner, ix, progId) ← parseStrict2 input PErr.aliasedAccounts
   SolanaM.require (ix.len >= 36) Err.invalidInstructionData
   SolanaM.require (← AccountView.isSigner owner) Err.missingRequiredSignature
   SolanaM.require (← AccountView.isWritable ctx) Err.invalidAccountData
@@ -224,7 +224,7 @@ def handleInitPropAmm (input : Ptr) : SolanaM Unit := do
     Accounts: `0. ctx (W)`, `1. owner (S)`.
     Ix data (28B): `[1, paused:u8, pad:u16, halfSpreadBps:u64, impactBps:u64, maxFillQty:u64]`. -/
 def handleUpdatePropAmm (input : Ptr) : SolanaM Unit := do
-  let (ctx, owner, ix, progId) ← parse2 input
+  let (ctx, owner, ix, progId) ← parseStrict2 input PErr.aliasedAccounts
   SolanaM.require (ix.len >= 28) Err.invalidInstructionData
   SolanaM.require (← AccountView.isSigner owner) Err.missingRequiredSignature
   SolanaM.require (← AccountView.isWritable ctx) Err.invalidAccountData
@@ -311,6 +311,7 @@ decreasing_by
 def handlePropAmmQuote (input : Ptr) : SolanaM Unit := do
   let (n, ctx, ix, progId) ← parseIxOnly input
   SolanaM.require (n >= 1 && ix.len >= 80) Err.invalidInstructionData
+  AccountView.requireNonDup ctx PErr.aliasedAccounts
   SolanaM.require (← AccountView.isWritable ctx) Err.invalidAccountData
   SolanaM.require (← pubkeyEq (AccountView.ownerPtr ctx) progId) Err.illegalOwner
   SolanaM.require ((← AccountView.dataLen ctx) == PropOff.size) Err.invalidAccountData
