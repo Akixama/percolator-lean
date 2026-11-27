@@ -26,6 +26,6 @@ LEAN_PATH=../lean-svm/.lake/build/lib/lean:.lake/build/lib/lean \
 LEAN_PATH=../lean-svm/.lake/build/lib/lean:.lake/build/lib/lean \
   ../lean-svm/.lake/build/bin/lean-svm build Percolator.EvilMatcher Percolator.EvilMatcher.entrypoint -o build/evil_matcher.so
 
-echo "=== 3. Execute all 15 LiteSVM verification, boring exchange, 8-leg CU stress, reward buy-and-burn, adversarial PropAMM, flip, HLP vault & fuzz suites (Agave 3.1.3) ==="
+echo "=== 3. Execute all 17 LiteSVM verification, boring exchange, 8-leg CU stress, reward buy-and-burn, adversarial PropAMM, flip, HLP vault & fuzz suites (sBPF v3 / Agave 4.x) ==="
 cargo run --manifest-path svm-runner/Cargo.toml --release -- \
   build/percolator.so build/matcher.so build/oracle_adapter.so build/reward_module.so build/evil_matcher.so build/hlp_vault.so
